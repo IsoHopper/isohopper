@@ -1,0 +1,15 @@
+# Offline references and local work
+.local/
+.DS_Store
+# Build and test output
+build/
+dist/
+node_modules/
+coverage/
+playwright-report/
+test-results/
+target/
+*.test
+*.img
+*.iso
+*.qcow2
