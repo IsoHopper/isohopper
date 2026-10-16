@@ -13,3 +13,7 @@ target/
 *.img
 *.iso
 *.qcow2
+
+__pycache__/
+*.pyc
+studio/src-tauri/gen/
