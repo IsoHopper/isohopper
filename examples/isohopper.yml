@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# yaml-language-server: $schema=../schema/isohopper.schema.json
+# Preferences for the developing application; not a claim of boot support.
+boot:
+  netboot_xyz: true
+  secure_boot_policy: enforce
+  timeout: 10
+  default: last
+launcher:
+  system_info: true
+  warn_multi_disk: true
+  theme: midnight
+images:
+  verify_hash: true
+  verify_signature: prefer
+safety:
+  risky_size_gb: 256
+  flag_nvme: true
+extras:
+  memtest86plus: true
+overrides:
+  ISOs/windows/Windows.iso:
+    strategy: windows
+    unattend: templates/windows.xml
+    drivers: [drivers/storage/]
+    bypass_tpm_check: false

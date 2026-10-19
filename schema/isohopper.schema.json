@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://isohopper.invalid/schema/isohopper.schema.json",
+  "title": "IsoHopper configuration",
+  "description": "Configuration preferences. Accepting a setting does not establish implementation or platform support for that feature.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "boot": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "netboot_xyz": {"type": "boolean", "default": true},
+        "secure_boot_policy": {"type": "string", "enum": ["enforce", "prompt", "off"], "default": "enforce"},
+        "timeout": {"type": "integer", "minimum": 0, "maximum": 3600, "default": 10},
+        "default": {"type": "string", "minLength": 1, "maxLength": 4096, "default": "last"}
+      }
+    },
+    "launcher": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "system_info": {"type": "boolean", "default": true},
+        "warn_multi_disk": {"type": "boolean", "default": true},
+        "theme": {"type": "string", "minLength": 1, "maxLength": 128, "default": "midnight"},
+        "power": {
+          "type": "object", "additionalProperties": false,
+          "description": "Firmware action visibility preferences; these do not execute host power commands.",
+          "properties": {
+            "reboot": {"type": "boolean", "default": true},
+            "shutdown": {"type": "boolean", "default": true},
+            "firmware_setup": {"type": "boolean", "default": true}
+          }
+        }
+      }
+    },
+    "images": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "verify_hash": {"type": "boolean", "default": true},
+        "verify_signature": {"type": "string", "enum": ["require", "prefer", "off"], "default": "prefer"}
+      }
+    },
+    "safety": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "risky_size_gb": {"type": "integer", "minimum": 1, "maximum": 1048576, "default": 256},
+        "flag_nvme": {"type": "boolean", "default": true}
+      }
+    },
+    "extras": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"memtest86plus": {"type": "boolean", "default": true}}
+    },
+    "overrides": {
+      "type": "object", "maxProperties": 4096,
+      "propertyNames": {"$ref": "#/$defs/relativePath"},
+      "additionalProperties": {
+        "type": "object", "additionalProperties": false,
+        "properties": {
+          "strategy": {"type": "string", "enum": ["auto", "native", "linux", "windows", "wimboot", "grub2", "memdisk"]},
+          "unattend": {"$ref": "#/$defs/relativePath"},
+          "drivers": {"type": "array", "maxItems": 128, "uniqueItems": true, "items": {"$ref": "#/$defs/relativePath"}},
+          "bypass_tpm_check": {"type": "boolean", "default": false}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "relativePath": {
+      "type": "string", "minLength": 1, "maxLength": 4096,
+      "pattern": "^[^/\\\\:\u0000-\u001f]+(?:/[^/\\\\:\u0000-\u001f]+)*/?$",
+      "not": {"pattern": "(^|/)\\.\\.?(/|$)"}
+    }
+  }
+}
