@@ -1,0 +1,22 @@
+[
+  {
+    "family": "ubuntu-live",
+    "filename_prefix": "ubuntu-",
+    "filename_markers": ["-desktop-", "-live-server-"],
+    "label_prefixes": ["ubuntu "],
+    "kernel_candidates": ["/casper/vmlinuz", "/casper/vmlinuz.efi"],
+    "initrd_candidates": ["/casper/initrd", "/casper/initrd.lz", "/casper/initrd.gz"],
+    "arguments": ["boot=casper", "iso-scan/filename={image}"],
+    "source": "https://manpages.ubuntu.com/manpages/resolute/man7/casper.7.html"
+  },
+  {
+    "family": "debian-live",
+    "filename_prefix": "debian-live-",
+    "filename_markers": [],
+    "label_prefixes": ["debian live ", "d-live "],
+    "kernel_candidates": ["/live/vmlinuz", "/live/vmlinuz1"],
+    "initrd_candidates": ["/live/initrd.img", "/live/initrd1.img"],
+    "arguments": ["boot=live", "components", "findiso={image}"],
+    "source": "https://manpages.debian.org/testing/live-boot-doc/live-boot.7.en.html"
+  }
+]
