@@ -1,0 +1,29 @@
+[package]
+name = "isohopper-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "isohopper"
+path = "src/main.rs"
+
+[dependencies]
+isohopper-core = { path = "../core" }
+isohopper-config = { path = "../config" }
+isohopper-helper = { path = "../helper" }
+isohopper-inventory = { path = "../inventory" }
+isohopper-media = { path = "../media" }
+same-file = "1"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+clap = { version = "4.5", features = ["derive"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+ed25519-dalek = "=3.0.0"
+tempfile.workspace = true
