@@ -1,0 +1,16 @@
+[package]
+name = "isohopper-launcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+uefi = { version = "=0.41.0", features = ["panic_handler", "logger"], optional = true }
+
+[features]
+firmware = ["dep:uefi"]
+
+[[bin]]
+name = "isohopper-launcher"
+path = "src/main.rs"
+required-features = ["firmware"]
