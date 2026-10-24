@@ -1,0 +1,23 @@
+{
+  "name": "isohopper-studio",
+  "private": true,
+  "version": "0.1.0",
+  "license": "GPL-3.0-or-later",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "test": "vitest run",
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.57.0",
+    "typescript": "5.9.3",
+    "vite": "8.3.5",
+    "vitest": "5.0.5"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}
