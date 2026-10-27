@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: 2026 S33G
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: Manual native Studio checks
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-studio-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Native Studio on Linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CI: true
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Tauri Linux prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22.22.1'
+          cache: npm
+          cache-dependency-path: studio/frontend/package-lock.json
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+
+      - name: Cache native Rust dependencies and build
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            studio/src-tauri/target
+          key: native-${{ runner.os }}-rust-nodebug-${{ hashFiles('studio/src-tauri/Cargo.lock', 'Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            native-${{ runner.os }}-rust-nodebug-
+
+      - name: Build frontend assets
+        run: |
+          npm --prefix studio/frontend ci --no-audit --no-fund
+          npm --prefix studio/frontend run build
+
+      - name: Check native formatting
+        run: cargo fmt --manifest-path studio/src-tauri/Cargo.toml -- --check
+
+      - name: Lint native backend
+        run: cargo clippy --manifest-path studio/src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Test native backend
+        run: cargo test --manifest-path studio/src-tauri/Cargo.toml --all-targets --locked

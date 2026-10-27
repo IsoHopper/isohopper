@@ -1,0 +1,105 @@
+# SPDX-FileCopyrightText: 2026 S33G
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: Manual firmware smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firmware-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  firmware:
+    name: x64 UEFI entry and power requests in QEMU
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: 2
+      SMOKE_ROOT: ${{ runner.temp }}/isohopper-firmware-smoke
+      OVMF_CODE: /usr/share/OVMF/OVMF_CODE_4M.fd
+      OVMF_VARS: /usr/share/OVMF/OVMF_VARS_4M.fd
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install emulator and firmware
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y qemu-system-x86 ovmf
+          test -f "$OVMF_CODE"
+          test -f "$OVMF_VARS"
+          mkdir "$SMOKE_ROOT"
+          mkdir "$SMOKE_ROOT/evidence"
+          qemu-system-x86_64 --version > "$SMOKE_ROOT/evidence/tool-versions.txt"
+          dpkg-query -W qemu-system-x86 ovmf >> "$SMOKE_ROOT/evidence/tool-versions.txt"
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal --target x86_64-unknown-uefi
+
+      - name: Check harness and power policy tests
+        run: |
+          python3 -m unittest discover -s scripts -p test_firmware_smoke.py
+          cargo test --locked -p isohopper-launcher --lib
+
+      - name: Build CLI and firmware
+        run: |
+          cargo build --locked --release -p isohopper-cli
+          cargo build --locked --release -p isohopper-launcher --features firmware --target x86_64-unknown-uefi
+          rustc --version >> "$SMOKE_ROOT/evidence/tool-versions.txt"
+          sha256sum "$OVMF_CODE" "$OVMF_VARS" target/x86_64-unknown-uefi/release/isohopper-launcher.efi > "$SMOKE_ROOT/evidence/input-sha256.txt"
+
+      - name: Create and verify isolated virtual disk
+        run: |
+          target/release/isohopper image create "$SMOKE_ROOT/usb.img" --size-mib 256 --efi target/x86_64-unknown-uefi/release/isohopper-launcher.efi > "$SMOKE_ROOT/evidence/create.json"
+          target/release/isohopper image verify "$SMOKE_ROOT/usb.img" --efi target/x86_64-unknown-uefi/release/isohopper-launcher.efi > "$SMOKE_ROOT/evidence/verify.json"
+
+      - name: Exercise entry and confirmed guest power requests
+        shell: bash
+        run: |
+          failed=0
+          for action in entry shutdown reboot firmware-setup; do
+            action_args=()
+            if [[ "$action" != entry ]]; then
+              action_args=(--action "$action")
+            fi
+            if ! timeout --signal=TERM --kill-after=5s 100s \
+              python3 scripts/firmware-smoke.py \
+                --image "$SMOKE_ROOT/usb.img" \
+                --code "$OVMF_CODE" \
+                --vars "$OVMF_VARS" \
+                --timeout 90 \
+                --log "$SMOKE_ROOT/evidence/$action.log" \
+                "${action_args[@]}" \
+                > "$SMOKE_ROOT/evidence/$action.json" \
+                2> "$SMOKE_ROOT/evidence/$action.stderr"; then
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+      - name: Record scope of evidence
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          x64 UEFI tests use QEMU TCG and an emulated USB disk with fresh OVMF variables per run.
+          Entry means the launcher reported its entry marker.
+          Power results cover confirmed guest requests and emulator exit. Firmware setup is a request/reset test; the next firmware UI is not inspected.
+          These tests do not validate OS boot, physical hardware, Secure Boot enforcement, or signed release artifacts.
+          The data partition remains unformatted. Logs and input hashes are retained below; disk images are not uploaded.
+          EOF
+
+      - name: Save smoke evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: firmware-smoke-evidence
+          path: ${{ env.SMOKE_ROOT }}/evidence
+          if-no-files-found: warn
+          retention-days: 7
