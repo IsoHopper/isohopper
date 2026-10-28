@@ -8,8 +8,9 @@ fn capabilities() -> serde_json::Value {
         "platform": std::env::consts::OS,
         "file_import": true,
         "host_inventory": cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux")),
+        "helper_probe": cfg!(windows),
         "physical_preparation": false,
-        "preparation_unavailable_reason": "Physical preparation is unavailable. The privileged helper is not connected."
+        "preparation_unavailable_reason": "Physical preparation is unavailable. Disk preparation and OS boot integration are unfinished."
     })
 }
 #[tauri::command]
@@ -19,6 +20,8 @@ fn check_config(text: String, format: String) -> serde_json::Value {
         Err(error) => serde_json::json!({"valid":false,"error":error.to_string()}),
     }
 }
+#[cfg(any(windows, test))]
+mod elevation;
 mod imports;
 #[tauri::command]
 fn release_sources(ids: Vec<String>) -> Result<(), String> {
@@ -30,6 +33,7 @@ fn list_sources() -> Result<Vec<imports::ImportedImage>, String> {
 }
 use std::sync::atomic::{AtomicBool, Ordering};
 static NATIVE_JOB_ACTIVE: AtomicBool = AtomicBool::new(false);
+static HELPER_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
 struct NativeJob;
 impl NativeJob {
     fn begin() -> Result<Self, String> {
@@ -42,6 +46,73 @@ impl NativeJob {
 impl Drop for NativeJob {
     fn drop(&mut self) {
         NATIVE_JOB_ACTIVE.store(false, Ordering::Release);
+    }
+}
+#[cfg(windows)]
+struct HelperProbeGuard {
+    _native: NativeJob,
+}
+#[cfg(windows)]
+impl HelperProbeGuard {
+    fn begin() -> Result<Self, String> {
+        let native = NativeJob::begin()?;
+        HELPER_PROBE_ACTIVE.store(true, Ordering::Release);
+        Ok(Self { _native: native })
+    }
+}
+#[cfg(windows)]
+impl Drop for HelperProbeGuard {
+    fn drop(&mut self) {
+        HELPER_PROBE_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+#[tauri::command]
+async fn probe_helper(window: tauri::WebviewWindow) -> Result<serde_json::Value, String> {
+    #[cfg(windows)]
+    {
+        use tauri::Manager;
+        if window.label() != "main" {
+            return Err("Helper probe requires the main Studio window".into());
+        }
+        let guard = HelperProbeGuard::begin()?;
+        let directory = window
+            .app_handle()
+            .path()
+            .resource_dir()
+            .map_err(|e| e.to_string())?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let owner = window.clone();
+        window
+            .run_on_main_thread(move || {
+                let _ = sender.send(
+                    owner
+                        .hwnd()
+                        .map(|hwnd| hwnd.0 as usize)
+                        .map_err(|e| e.to_string()),
+                );
+            })
+            .map_err(|e| e.to_string())?;
+        tauri::async_runtime::spawn_blocking(move || {
+            let _guard = guard;
+            let hwnd = receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .map_err(|_| "Could not obtain Studio owner window")??;
+            // A fresh thread guarantees this operation controls its COM apartment.
+            let outcome = std::thread::spawn(move || {
+                elevation::run(hwnd, &directory, env!("ISOHOPPER_HELPER_SHA256"))
+            })
+            .join()
+            .map_err(|_| "Helper launch thread failed")??;
+            serde_json::to_value(outcome).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        Err("Elevated helper probe is available only on Windows".into())
     }
 }
 #[tauri::command]
@@ -96,10 +167,25 @@ fn main() {
             pick_directory,
             release_sources,
             list_sources,
-            inspect_devices
+            inspect_devices,
+            probe_helper
         ])
-        .run(tauri::generate_context!())
-        .expect("could not start IsoHopper Studio");
+        .on_window_event(|_, event| {
+            if HELPER_PROBE_ACTIVE.load(Ordering::Acquire)
+                && let tauri::WindowEvent::CloseRequested { api, .. } = event
+            {
+                api.prevent_close();
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("could not start IsoHopper Studio")
+        .run(|_, event| {
+            if HELPER_PROBE_ACTIVE.load(Ordering::Acquire)
+                && let tauri::RunEvent::ExitRequested { api, .. } = event
+            {
+                api.prevent_exit();
+            }
+        });
 }
 
 #[cfg(test)]

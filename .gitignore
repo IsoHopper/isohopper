@@ -17,3 +17,4 @@ target/
 __pycache__/
 *.pyc
 studio/src-tauri/gen/
+studio/src-tauri/binaries/

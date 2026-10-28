@@ -118,6 +118,12 @@ jobs:
           ./target/release/isohopper --version
           ./target/release/isohopper --help
           ./target/release/isohopper list --demo
+      - name: Build and stage the Windows helper
+        if: runner.os == 'Windows'
+        run: |
+          cargo build --release --locked -p isohopper-helper
+          ./target/release/isohopper-helper.exe --version
+          python3 scripts/stage-windows-helper.py --source target/release/isohopper-helper.exe
       - name: Test native backend
         run: |
           npm --prefix studio/frontend run build
