@@ -566,7 +566,7 @@ mod tests {
             make_root(),
             &plan,
             &payloads,
-            geometry,
+            geometry.clone(),
             inputs,
             &AtomicBool::new(false),
             |p| phases.push(p.phase),
@@ -606,6 +606,42 @@ mod tests {
         let directory = sealed.owner.directory.clone();
         coordinator_test::exercise(sealed, make_root(), entries);
         assert!(!directory.exists());
+        // A bootable blank library follows the same formatter/export path.
+        // No source file or synthetic placeholder is required.
+        let mut empty = build_under(
+            make_root(),
+            &plan,
+            &payloads,
+            geometry,
+            Vec::new(),
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        let empty_fingerprint = empty.fingerprint.clone();
+        assert_eq!(
+            hash(
+                &mut empty.reader,
+                empty_fingerprint.bytes,
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
+            empty_fingerprint.sha256
+        );
+        empty
+            .seek(SeekFrom::Start(
+                plan.layout().partitions[0].start_lba * 512 + 3,
+            ))
+            .unwrap();
+        let mut filesystem = [0; 8];
+        empty.read_exact(&mut filesystem).unwrap();
+        assert_eq!(&filesystem, b"EXFAT   ");
+        let empty_directory = empty.owner.directory.clone();
+        drop(empty);
+        assert!(!empty_directory.exists());
+        println!(
+            "OWNED_EMPTY_STAGE_OK sources=0 exfat=true persisted_raw_sha256=true physical_write=false"
+        );
         drop(handle);
         std::fs::remove_dir(&path).unwrap();
         assert_eq!(super::super::tests::modified_id(), token_stamp);

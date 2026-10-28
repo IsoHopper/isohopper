@@ -63,7 +63,7 @@ fn malformed_nonce_handle_source_and_version_are_rejected() {
         source(0, "Windows/CON.iso"),
         ClientMessage::Begin {
             target_selector: "x".into(),
-            source_count: 0,
+            source_count: MAX_SOURCES + 1,
         },
         ClientMessage::Archive {
             remote_handle: u64::MAX,
@@ -119,6 +119,22 @@ fn source_collection_rejects_duplicate_ids_paths_and_wrong_order() {
     sources.push(&source(1, "Mac/MacOS.img")).unwrap();
     assert!(sources.finish().is_ok());
     assert!(sources.push(&source(2, "other.iso")).is_err());
+}
+
+#[test]
+fn empty_media_accepts_zero_sources_and_refuses_unsolicited_files() {
+    let message = client(ClientMessage::Begin {
+        target_selector: "selected-device".into(),
+        source_count: 0,
+    });
+    assert_eq!(
+        ClientFrame::decode(&message.encode().unwrap()).unwrap(),
+        message
+    );
+    let mut sources = SourceList::new(0).unwrap();
+    sources.finish().unwrap();
+    assert!(sources.push(&source(0, "unexpected.iso")).is_err());
+    assert!(SourceList::new(MAX_SOURCES + 1).is_err());
 }
 
 #[test]

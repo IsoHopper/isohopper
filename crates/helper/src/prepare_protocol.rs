@@ -291,7 +291,7 @@ impl ClientMessage {
             Self::Begin {
                 target_selector,
                 source_count,
-            } if !text(target_selector, 32768) || !(1..=MAX_SOURCES).contains(source_count) => {
+            } if !text(target_selector, 32768) || *source_count > MAX_SOURCES => {
                 return Err(ProtocolError("target selector or source count"));
             }
             Self::Archive {
@@ -417,7 +417,7 @@ impl ServerMessage {
                 decode_sha256(description_digest)?;
                 if *image_bytes != target.size_bytes
                     || !text(challenge, 4128)
-                    || !(1..=MAX_SOURCES).contains(source_count)
+                    || *source_count > MAX_SOURCES
                     || !*original_handles_closed
                 {
                     return Err(ProtocolError("prepared description"));
@@ -461,7 +461,7 @@ pub struct SourceList {
 }
 impl SourceList {
     pub fn new(expected: u16) -> Result<Self, ProtocolError> {
-        if !(1..=MAX_SOURCES).contains(&expected) {
+        if expected > MAX_SOURCES {
             return Err(ProtocolError("source count"));
         }
         Ok(Self {

@@ -16,6 +16,13 @@ fn entry(path: &str, bytes: &[u8]) -> CopyEntry {
 }
 
 #[test]
+fn empty_media_manifest_uses_no_space_but_still_validates_allocation_unit() {
+    assert_eq!(validate_manifest(&[], 0, 4096).unwrap(), 0);
+    assert!(validate_manifest(&[], 4096, 0).is_err());
+    assert!(validate_manifest(&[], 4096, 513).is_err());
+}
+
+#[test]
 fn nested_images_preserve_bytes_paths_and_report_verified_progress() {
     let input = tempfile::tempdir().unwrap();
     let output = tempfile::tempdir().unwrap();

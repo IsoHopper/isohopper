@@ -124,8 +124,7 @@ pub fn validate_manifest(
     allocation_unit: u64,
 ) -> Result<u64, CopyError> {
     let validate = || -> io::Result<u64> {
-        if entries.is_empty()
-            || entries.len() > 10_000
+        if entries.len() > 10_000
             || !(512..=2 * 1024 * 1024).contains(&allocation_unit)
             || !allocation_unit.is_power_of_two()
         {

@@ -33,7 +33,6 @@ pub(super) fn admit(
     if plan.layout().size_bytes != geometry.size_bytes
         || plan.layout().logical_sector_size != u64::from(geometry.logical_sector_size)
         || geometry.size_bytes > 64u64 << 40
-        || entries.is_empty()
         || entries.len() > 132
     {
         return Err(StageError::Invalid("stage plan or input count"));
@@ -257,6 +256,15 @@ mod tests {
         let mut bad = entry;
         bad.bytes = u64::MAX;
         assert!(admit(&plan, &geometry, &[bad]).is_err());
+    }
+
+    #[test]
+    fn empty_media_still_requires_valid_stage_geometry() {
+        let (plan, _, coverage) = fixture();
+        let mut geometry = coverage.device.geometry;
+        admit(&plan, &geometry, &[]).unwrap();
+        geometry.size_bytes += 512;
+        assert!(admit(&plan, &geometry, &[]).is_err());
     }
     #[test]
     fn formatter_requires_bounded_exact_typed_success() {

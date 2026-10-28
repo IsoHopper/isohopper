@@ -82,6 +82,7 @@ fn description() -> PreparedRawImage {
 struct Backend {
     events: Arc<Mutex<Vec<&'static str>>>,
     wait_cancel: bool,
+    source_count: usize,
 }
 impl Executor for Backend {
     type Ready = Arc<Mutex<Vec<&'static str>>>;
@@ -92,7 +93,7 @@ impl Executor for Backend {
         _: &SyncSender<ServerMessage>,
     ) -> Result<Ready<Self::Ready>, JobFailure> {
         assert_eq!(inputs.selector, "selector");
-        assert_eq!(inputs.sources.len(), 1);
+        assert_eq!(inputs.sources.len(), self.source_count);
         assert!(inputs.archive.metadata().unwrap().is_file());
         drop(inputs);
         if self.wait_cancel {
@@ -170,6 +171,7 @@ fn release_and_exact_confirmation_precede_write() {
         &mut wire,
         Backend {
             events: events.clone(),
+            source_count: 1,
             wait_cancel: false,
         },
     )
@@ -208,6 +210,7 @@ fn missing_release_or_changed_confirmation_never_writes() {
             &mut wire,
             Backend {
                 events: events.clone(),
+                source_count: 1,
                 wait_cancel: false,
             },
         );
@@ -224,6 +227,7 @@ fn disconnected_pipe_cancels_and_joins_worker_before_return() {
             &mut wire,
             Backend {
                 events: events.clone(),
+                source_count: 1,
                 wait_cancel: true
             }
         )
@@ -283,6 +287,7 @@ fn cancellation_waits_for_write_cleanup_and_preserves_incomplete_counts() {
         &mut wire,
         WaitingWrite(Backend {
             events: events.clone(),
+            source_count: 1,
             wait_cancel: false,
         }),
     )
@@ -329,6 +334,7 @@ fn losing_pipe_after_confirmation_joins_the_writer_before_return() {
             &mut wire,
             WaitingWrite(Backend {
                 events: events.clone(),
+                source_count: 1,
                 wait_cancel: false
             })
         )
@@ -336,4 +342,48 @@ fn losing_pipe_after_confirmation_joins_the_writer_before_return() {
     );
     assert!(events.lock().unwrap().contains(&"write_finished"));
     assert!(wire.terminal.is_none());
+}
+
+#[test]
+fn empty_media_still_requires_release_and_exact_confirmation_before_write() {
+    for confirm in [false, true] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let d = description();
+        let last = if confirm {
+            vec![
+                ClientMessage::SourcesReleased,
+                ClientMessage::Confirm {
+                    description_digest: hex::encode(d.digest()),
+                    challenge: d.challenge().into(),
+                },
+            ]
+        } else {
+            vec![ClientMessage::Cancel]
+        };
+        let mut wire = wire(events.clone(), last);
+        wire.replies[0] = ClientMessage::Begin {
+            target_selector: "selector".into(),
+            source_count: 0,
+        };
+        wire.replies.remove(2); // No source handle is requested or transferred.
+        run(
+            &mut wire,
+            Backend {
+                events: events.clone(),
+                wait_cancel: false,
+                source_count: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(events.lock().unwrap().contains(&"write"), confirm);
+        assert!(
+            matches!(
+                wire.terminal,
+                Some(ServerMessage::Terminal {
+                    outcome: Outcome::Succeeded,
+                    ..
+                })
+            ) == confirm
+        );
+    }
 }
