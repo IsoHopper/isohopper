@@ -165,6 +165,219 @@ fn wof_observation(hresult: i32, version: u32) -> serde_json::Value {
     })
 }
 
+// Test-only observations: never serialized, and never used by production to
+// authorize a source. Access time is excluded because observation can affect it.
+#[derive(Clone, PartialEq, Eq)]
+struct ReopenSnapshot {
+    volume: u64,
+    id: [u8; 16],
+    bytes: i64,
+    allocated: i64,
+    created: i64,
+    written: i64,
+    changed: i64,
+    attributes: u32,
+    links: u32,
+    delete_pending: bool,
+    directory: bool,
+}
+
+impl ReopenSnapshot {
+    fn fixture() -> Self {
+        Self {
+            volume: 1,
+            id: [1; 16],
+            bytes: 1,
+            allocated: 4096,
+            created: 1,
+            written: 1,
+            changed: 1,
+            attributes: 0,
+            links: 1,
+            delete_pending: false,
+            directory: false,
+        }
+    }
+}
+
+fn diagnostic_error(stage: &'static str, error: &io::Error) -> serde_json::Value {
+    serde_json::json!({
+        "status":"error", "stage":stage,
+        "win32_error":error.raw_os_error().map(|code| code as u32),
+        "mapping_remains_blocked":true,
+    })
+}
+
+fn compare_reopened(
+    before: &ReopenSnapshot,
+    mut snapshot: impl FnMut(bool) -> io::Result<ReopenSnapshot>,
+    mut query: impl FnMut(bool) -> serde_json::Value,
+) -> serde_json::Value {
+    let mut result = serde_json::json!({
+        "status":"observed", "mapping_remains_blocked":true,
+        "identity_matches":true, "sentinels_match":true,
+    });
+    for stage in ["before_query", "after_query"] {
+        for reopened in [true, false] {
+            let observed = match snapshot(reopened) {
+                Ok(value) => value,
+                Err(error) => return diagnostic_error(stage, &error),
+            };
+            if &observed != before {
+                result["status"] = "changed".into();
+                result["stage"] = stage.into();
+                result["identity_matches"] =
+                    (observed.volume == before.volume && observed.id == before.id).into();
+                result["sentinels_match"] = false.into();
+                return result;
+            }
+        }
+        if stage == "before_query" {
+            result["original"] = query(false);
+            result["reopened"] = query(true);
+        }
+    }
+    result
+}
+
+fn backing_result(
+    status: Result<(), Option<u32>>,
+    returned: u32,
+    bytes: &[u8; 256],
+) -> serde_json::Value {
+    if let Err(code) = status {
+        // No output field, including byte count, is evidence after failure.
+        return serde_json::json!({"status":"error", "win32_error":code});
+    }
+    if !(8..=256).contains(&returned) {
+        return serde_json::json!({"status":"invalid", "returned_bytes":returned});
+    }
+    serde_json::json!({
+        "status":"success", "returned_bytes":returned,
+        "version":u32::from_le_bytes(bytes[..4].try_into().unwrap()),
+        "provider":u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+    })
+}
+
+#[cfg(windows)]
+fn reopen_snapshot(file: &File) -> io::Result<ReopenSnapshot> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_BASIC_INFO, FILE_ID_INFO, FILE_STANDARD_INFO, FileBasicInfo, FileIdInfo,
+        FileStandardInfo, GetFileInformationByHandleEx,
+    };
+    let mut id = FILE_ID_INFO::default();
+    let mut basic = FILE_BASIC_INFO::default();
+    let mut standard = FILE_STANDARD_INFO::default();
+    for (class, output, length) in [
+        (
+            FileIdInfo,
+            (&mut id as *mut FILE_ID_INFO).cast(),
+            size_of::<FILE_ID_INFO>(),
+        ),
+        (
+            FileBasicInfo,
+            (&mut basic as *mut FILE_BASIC_INFO).cast(),
+            size_of::<FILE_BASIC_INFO>(),
+        ),
+        (
+            FileStandardInfo,
+            (&mut standard as *mut FILE_STANDARD_INFO).cast(),
+            size_of::<FILE_STANDARD_INFO>(),
+        ),
+    ] {
+        // SAFETY: live retained file and initialized, correctly typed SDK
+        // output for each exact class/size. These are synchronous metadata reads.
+        if unsafe {
+            GetFileInformationByHandleEx(file.as_raw_handle(), class, output, length as u32)
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    if standard.EndOfFile < 0 || standard.AllocationSize < 0 || standard.Directory {
+        return Err(invalid("unsupported reopened file metadata"));
+    }
+    Ok(ReopenSnapshot {
+        volume: id.VolumeSerialNumber,
+        id: id.FileId.Identifier,
+        bytes: standard.EndOfFile,
+        allocated: standard.AllocationSize,
+        created: basic.CreationTime,
+        written: basic.LastWriteTime,
+        changed: basic.ChangeTime,
+        attributes: basic.FileAttributes,
+        links: standard.NumberOfLinks,
+        delete_pending: standard.DeletePending,
+        directory: standard.Directory,
+    })
+}
+
+#[cfg(windows)]
+fn reopened_backing_diagnostic(original: &File) -> serde_json::Value {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::{
+        Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, ReOpenFile},
+        System::Ioctl::FSCTL_GET_EXTERNAL_BACKING,
+    };
+    let before = match reopen_snapshot(original) {
+        Ok(value) => value,
+        Err(error) => return diagnostic_error("initial_metadata", &error),
+    };
+    // SAFETY: original is a retained synchronous File::open object. ReOpenFile
+    // acts on that object, never a pathname. Request only read access, share
+    // read, and no OVERLAPPED flag, so both later FSCTL calls are synchronous.
+    // This flag is documented as ignored when the file is not a reparse point.
+    // https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-reopenfile
+    let raw = unsafe {
+        ReOpenFile(
+            original.as_raw_handle(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return diagnostic_error("reopen", &io::Error::last_os_error());
+    }
+    if raw.is_null() {
+        return diagnostic_error("reopen", &invalid("invalid reopened handle"));
+    }
+    // SAFETY: successful ReOpenFile transfers one new owned file handle.
+    let reopened = unsafe { File::from_raw_handle(raw) };
+    let handle = |is_reopened| if is_reopened { &reopened } else { original };
+    compare_reopened(
+        &before,
+        |which| reopen_snapshot(handle(which)),
+        |which| {
+            let mut bytes = [0u8; 256];
+            let mut returned = 0;
+            // SAFETY: both handles are live synchronous files. Bounded initialized
+            // output and count remain live through completion; no input is supplied.
+            let status = unsafe {
+                DeviceIoControl(
+                    handle(which).as_raw_handle(),
+                    FSCTL_GET_EXTERNAL_BACKING,
+                    ptr::null(),
+                    0,
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len() as u32,
+                    &mut returned,
+                    ptr::null_mut(),
+                )
+            };
+            let status = if status != 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error()
+                    .raw_os_error()
+                    .map(|code| code as u32))
+            };
+            backing_result(status, returned, &bytes)
+        },
+    )
+}
+
 #[cfg(windows)]
 fn backing_diagnostic(role: ImageRole, retained: Result<&File, &io::Error>) -> serde_json::Value {
     use serde_json::json;
@@ -184,6 +397,7 @@ fn backing_diagnostic(role: ImageRole, retained: Result<&File, &io::Error>) -> s
         "file": { "status": "not_queried" },
         "wof_wim": { "status": "not_queried" },
         "wof_file": { "status": "not_queried" },
+        "same_object_reopen": { "status": "not_queried" },
     });
     let file = match retained {
         Ok(file) => file,
@@ -250,6 +464,7 @@ fn backing_diagnostic(role: ImageRole, retained: Result<&File, &io::Error>) -> s
         let status = unsafe { WofGetDriverVersion(file.as_raw_handle(), provider, &mut version) };
         result[key] = wof_observation(status, version);
     }
+    result["same_object_reopen"] = reopened_backing_diagnostic(file);
     result
 }
 
@@ -286,6 +501,101 @@ fn backing_diagnostic_preserves_hresult_and_never_reports_failed_output_as_versi
     assert_eq!(success["hresult"], 0);
     assert_eq!(success["version"], 0x0a00_1234);
     assert!(failure.to_string().len() < 128);
+    assert!(success.to_string().len() < 128);
+}
+
+#[test]
+fn reopened_diagnostic_refuses_changed_identity_or_sentinels_before_queries() {
+    let before = ReopenSnapshot::fixture();
+    for changed in [
+        ReopenSnapshot {
+            volume: 2,
+            ..before.clone()
+        },
+        ReopenSnapshot {
+            id: [2; 16],
+            ..before.clone()
+        },
+        ReopenSnapshot {
+            bytes: 2,
+            ..before.clone()
+        },
+        ReopenSnapshot {
+            changed: 2,
+            ..before.clone()
+        },
+    ] {
+        let mut queries = 0;
+        let result = compare_reopened(
+            &before,
+            |_| Ok(changed.clone()),
+            |_| {
+                queries += 1;
+                serde_json::Value::Null
+            },
+        );
+        assert_eq!(result["status"], "changed");
+        assert_eq!(result["stage"], "before_query");
+        assert_eq!(queries, 0);
+    }
+}
+
+#[test]
+fn reopened_diagnostic_checks_both_handles_after_observing_backing() {
+    let before = ReopenSnapshot::fixture();
+    let mut snapshots = 0;
+    let mut queried = Vec::new();
+    let result = compare_reopened(
+        &before,
+        |_| {
+            snapshots += 1;
+            Ok(ReopenSnapshot {
+                bytes: if snapshots == 4 { 2 } else { before.bytes },
+                ..before.clone()
+            })
+        },
+        |reopened| {
+            queried.push(reopened);
+            serde_json::json!({"status":"error", "win32_error":1})
+        },
+    );
+    assert_eq!(queried, [false, true]);
+    assert_eq!(result["status"], "changed");
+    assert_eq!(result["stage"], "after_query");
+    assert_eq!(result["mapping_remains_blocked"], true);
+
+    let stable = compare_reopened(
+        &before,
+        |_| Ok(before.clone()),
+        |reopened| backing_result(Err(Some(if reopened { 342 } else { 1 })), 0, &[0; 256]),
+    );
+    assert_eq!(stable["status"], "observed");
+    assert_eq!(stable["original"]["win32_error"], 1);
+    assert_eq!(stable["reopened"]["win32_error"], 342);
+    assert_eq!(stable["mapping_remains_blocked"], true);
+    assert!(stable.to_string().len() < 512);
+}
+
+#[test]
+fn backing_result_ignores_failed_output_and_bounds_successful_prefix() {
+    let failed = backing_result(Err(Some(1)), u32::MAX, &[255; 256]);
+    assert_eq!(
+        failed,
+        serde_json::json!({"status":"error", "win32_error":1})
+    );
+    let explicit_negative = backing_result(Err(Some(342)), 256, &[255; 256]);
+    assert_eq!(explicit_negative["win32_error"], 342);
+    for returned in [0, 7, 257, u32::MAX] {
+        assert_eq!(
+            backing_result(Ok(()), returned, &[0; 256])["status"],
+            "invalid"
+        );
+    }
+    let mut bytes = [0; 256];
+    bytes[..8].copy_from_slice(&[1, 0, 0, 0, 2, 0, 0, 0]);
+    let success = backing_result(Ok(()), 8, &bytes);
+    assert_eq!(success["version"], 1);
+    assert_eq!(success["provider"], 2);
     assert!(success.to_string().len() < 128);
 }
 
