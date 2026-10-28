@@ -4,6 +4,12 @@ name: Manual firmware smoke
 
 on:
   workflow_dispatch:
+    inputs:
+      secure_boot:
+        description: Test signed, unsigned, tampered, and revoked EFI utilities with disposable keys
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -46,7 +52,7 @@ jobs:
 
       - name: Check harness and power policy tests
         run: |
-          python3 -m unittest discover -s scripts -p test_firmware_smoke.py
+          python3 -m unittest discover -s scripts -p 'test_*.py'
           cargo test --locked -p isohopper-launcher --lib
           cargo test --locked -p isohopper-launcher --features firmware --bin isohopper-launcher
 
@@ -87,17 +93,49 @@ jobs:
           done
           exit "$failed"
 
+      - name: Install optional Secure Boot test tools
+        if: inputs.secure_boot
+        run: |
+          sudo apt-get install --no-install-recommends -y openssl sbsigntool python3-venv
+          python3 -m venv "$SMOKE_ROOT/secure-boot-venv"
+          "$SMOKE_ROOT/secure-boot-venv/bin/python" -m pip install --disable-pip-version-check --retries 0 --timeout 30 'virt-firmware==26.9'
+          test -f /usr/share/OVMF/OVMF_CODE_4M.secboot.fd
+          dpkg-query -W openssl sbsigntool >> "$SMOKE_ROOT/evidence/tool-versions.txt"
+          "$SMOKE_ROOT/secure-boot-venv/bin/python" -m pip freeze >> "$SMOKE_ROOT/evidence/tool-versions.txt"
+
+      - name: Exercise optional Secure Boot acceptance and rejection
+        if: inputs.secure_boot
+        run: |
+          export PATH="$SMOKE_ROOT/secure-boot-venv/bin:$PATH"
+          timeout --signal=TERM --kill-after=5s 550s \
+            python3 scripts/secure-boot-smoke.py \
+              --cli target/release/isohopper \
+              --launcher target/x86_64-unknown-uefi/release/isohopper-launcher.efi \
+              --utility target/x86_64-unknown-uefi/release/isohopper-test-utility.efi \
+              --code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+              --vars "$OVMF_VARS" \
+              --output "$SMOKE_ROOT/evidence/secure-boot" \
+              --timeout 90
+
       - name: Record scope of evidence
         if: always()
+        env:
+          SECURE_BOOT_REQUESTED: ${{ inputs.secure_boot }}
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
           x64 UEFI tests use QEMU TCG and an emulated USB disk with fresh OVMF variables per run.
           Entry means the launcher reported its entry marker.
           Power results cover confirmed guest requests and emulator exit. Firmware setup is a request/reset test; the next firmware UI is not inspected.
           Utility results require ordered launcher-start, test-utility-entry, and launcher-return markers. The utility is a tiny source-built test program.
-          These tests do not validate OS boot, physical hardware, Secure Boot enforcement, or signed release artifacts.
+          The base tests do not validate Secure Boot enforcement. The optional Secure Boot cases use disposable local test certificates, not production release keys.
+          These tests do not validate OS boot, physical hardware, or signed release artifacts.
           The data partition remains unformatted. Logs and input hashes are retained below; disk images are not uploaded.
           EOF
+          if [[ "$SECURE_BOOT_REQUESTED" == true ]]; then
+            echo 'Secure Boot cases were requested. Read secure-boot/summary.json for results; private keys, signed test binaries, and variable stores are excluded from artifacts.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Secure Boot cases were not requested and were skipped.' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Save smoke evidence
         if: always()
