@@ -12,6 +12,7 @@ pub mod windows_identity;
 pub mod windows_lock;
 pub mod windows_protected;
 pub mod windows_sources;
+pub mod windows_target;
 pub mod writer;
 
 type HmacSha256 = Hmac<Sha256>;
