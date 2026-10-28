@@ -14,6 +14,28 @@ fn main() {
         println!("isohopper-helper {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--installer-apply-v1")
+    {
+        if args.len() != 2 {
+            eprintln!("Installer mode requires exactly one protected payload directory.");
+            std::process::exit(3);
+        }
+        #[cfg(windows)]
+        match isohopper_helper::windows_installation::installer::apply(&args[1]) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(error.code());
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            eprintln!("Installer mode is Windows-only.");
+            std::process::exit(3);
+        }
+    }
     if args.first().is_some_and(|arg| arg == "--prepare-broker-v1") {
         let args = match isohopper_helper::prepare_protocol::PrepareArgs::parse(&args) {
             Ok(args) => args,

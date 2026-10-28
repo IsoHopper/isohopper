@@ -40,6 +40,9 @@ use windows_sys::Win32::{
     UI::Shell::{FOLDERID_ProgramFiles, KF_FLAG_DEFAULT_PATH, SHGetKnownFolderPath},
 };
 
+#[path = "installer_native.rs"]
+pub(super) mod installer;
+
 fn error(stage: &str) -> String {
     format!("{stage}: {}", io::Error::last_os_error())
 }

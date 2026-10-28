@@ -14,6 +14,8 @@ pub enum InstalledRole {
     Helper,
 }
 
+pub mod installer;
+
 impl InstalledRole {
     pub fn filename(self) -> &'static str {
         match self {
