@@ -141,11 +141,11 @@ def notes(tag, revision, run_url, scopes):
 {windows}
 macOS and Linux provide local image imports, streaming SHA-256 and read-only device inspection. They cannot prepare physical USB devices. Nested image paths are retained.
 
-This build adds verified in-app engine download and session restore, allows preparing an empty image library, and fixes the Windows canonical installation-path check. Large candidates are hidden by default; suitable small USB/SD candidates can be suggested, with exact write confirmation still required.
+This build fixes Windows installation and upgrades: run setup over an existing release to upgrade or repair it while preserving user settings and the engine cache. Setup refuses to replace files used by an active app/helper. Verified engine download, session restore, empty image libraries and conservative USB/SD suggestions remain available.
 
 | Download | Scope |
 | --- | --- |
-| `windows-x64-setup.exe` | Windows x64; fresh machine installation in Program Files required for the privileged helper. WebView2 may download during setup. |
+| `windows-x64-setup.exe` | Windows x64; installs, upgrades or repairs the protected Program Files installation. WebView2 may download during setup. |
 | `macos-arm64.dmg` / `macos-x64.dmg` | Apple Silicon / Intel Mac inspection and local hashing. |
 | `linux-x64.AppImage` / `.deb` | Linux x64 inspection and local hashing; built on Ubuntu 22.04. |
 | `isohopper-cli-*` | Standalone CLI, license and build information. |

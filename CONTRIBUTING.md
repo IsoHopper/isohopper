@@ -28,7 +28,7 @@ cargo build --locked -p isohopper-helper
 python scripts/stage-windows-helper.py --source target/debug/isohopper-helper.exe
 ```
 
-Stage the release helper instead when packaging a release build. Studio embeds its checksum. The experimental elevation check requires a fresh machine-wide NSIS installation in `Program Files\IsoHopper` on the Windows system drive; portable builds cannot run it. It performs a read-only connection test, never disk preparation. Interactive UAC remains unvalidated. Windows Studio CI tests installation and existing-install refusal only on a disposable runner.
+Stage the release helper instead when packaging a release build. Studio embeds its checksum. The experimental elevation check requires the protected machine-wide NSIS installation in `Program Files\IsoHopper` on the Windows system drive; portable builds cannot run it. The installer supports upgrades and repair without removing user settings. It stages the new executables before replacing installed files and refuses replacement while Studio or its helper retains them. The elevation check tests the connection without accessing disks. Interactive UAC remains unvalidated. Windows Studio CI tests fresh installation, upgrading the pinned previous release, repeated silent/passive repair, preserved user data, and busy-file refusal on a disposable runner.
 
 ## Firmware tests
 

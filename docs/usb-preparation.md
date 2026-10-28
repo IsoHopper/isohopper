@@ -6,7 +6,8 @@ Use a spare USB drive or SD card whose entire contents may be erased. Back up an
 
 ## Before starting
 
-- Install the Windows x64 package in its fixed machine location, `Program Files\IsoHopper`. Sign in with an administrator account and UAC enabled. Launch Studio normally, not **Run as administrator**; approve the bundled helper's UAC request using that same account. Portable copies and elevation under a different account are unsupported. **Check elevated helper** tests the connection without accessing disks.
+- Run the Windows x64 installer; it installs, upgrades or repairs the fixed machine location, `Program Files\IsoHopper`. From `v0.1.0-experimental.4`, you do not need to uninstall an earlier release first. Saved settings, the image library and cached engine remain in your user profile. Close Studio after any active preparation finishes, then retry if setup reports that files are in use.
+- Sign in with an administrator account and UAC enabled. Launch Studio normally, not **Run as administrator**; approve the bundled helper's UAC request using that same account. Portable copies and elevation under a different account are unsupported. **Check elevated helper** tests the connection without accessing disks.
 - Keep at least **2 × the target's exact capacity + 256 MiB** free on the installation volume for temporary staging. This budget is based on the whole device, not the size of selected images; other applications may consume additional space.
 - Target support is limited to USB/SD devices with 512-byte logical sectors and 512- or 4096-byte physical sectors. Listing a candidate does not establish eligibility. The helper requires complete native identity, partition, storage-pool, encryption, protected-storage and locking evidence. Unknown or conflicting evidence blocks preparation; do not bypass a refusal. Some USB/SD devices may be refused when Windows reports partial storage use or incomplete safety evidence.
 
