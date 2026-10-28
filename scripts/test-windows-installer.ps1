@@ -29,16 +29,31 @@ $expected = @{
 }
 $registry = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\IsoHopper'
 $skipCleanup = $false
+$installerInvocation = 0
 
 function Invoke-Installer([string]$Path, [string]$Mode, [int]$ExpectedExit = 0) {
-    $process = Start-Process -FilePath $Path -ArgumentList $Mode -PassThru
+    $script:installerInvocation++
+    $label = "#$script:installerInvocation $([IO.Path]::GetFileName($Path)) $Mode"
+    $stderrPath = Join-Path $temporary ("installer-$script:installerInvocation.stderr.txt")
+    Write-Output "Running installer $label; expected exit $ExpectedExit."
+    # The parent owns this output file. Elevated setup only receives an inherited
+    # standard handle; it never opens a caller-supplied diagnostic file path.
+    $process = Start-Process -FilePath $Path -ArgumentList $Mode -RedirectStandardError $stderrPath -PassThru
     if (-not $process.WaitForExit(180000)) {
         $script:skipCleanup = $true
         $process.Kill($true)
-        throw "Installer timed out: $Mode; defer cleanup to runner disposal."
+        throw "Installer timed out: $label; defer cleanup to runner disposal."
     }
+    $process.WaitForExit()
+    $reader = [IO.StreamReader]::new($stderrPath, [Text.Encoding]::UTF8)
+    try {
+        $buffer = [char[]]::new(2400)
+        $count = $reader.ReadBlock($buffer, 0, $buffer.Length)
+        $diagnostic = [string]::new($buffer, 0, $count)
+    } finally { $reader.Dispose() }
+    if ($diagnostic) { Write-Output "Installer $label stderr: $diagnostic" }
     if ($process.ExitCode -ne $ExpectedExit) {
-        throw "Installer $Mode returned $($process.ExitCode); expected $ExpectedExit."
+        throw "Installer $label returned $($process.ExitCode); expected $ExpectedExit. $diagnostic"
     }
 }
 
