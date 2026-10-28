@@ -31,6 +31,9 @@ class PackageReleaseTests(unittest.TestCase):
     def fixture(self, root, platform):
         for name in ['LICENSE', 'CONTRIBUTORS.md']:
             (root / name).write_text(f'{name} fixture\n')
+        native = root / 'studio/src-tauri/src/main.rs'
+        native.parent.mkdir(parents=True, exist_ok=True)
+        native.write_text('const PHYSICAL_PREPARATION_ENABLED: bool = false;\n')
         binary = root / 'target/release' / ('isohopper.exe' if platform == 'windows-x64' else 'isohopper')
         binary.parent.mkdir(parents=True)
         binary.write_bytes(b'cli fixture\x00\xff')
@@ -54,7 +57,10 @@ class PackageReleaseTests(unittest.TestCase):
                 self.assertEqual(manifest['source_revision'], REVISION)
                 self.assertEqual(manifest['platform'], platform)
                 self.assertEqual(manifest['tag'], TAG)
-                self.assertEqual(manifest['schema_version'], 1)
+                self.assertEqual(manifest['schema_version'], 2)
+                self.assertEqual(manifest['capabilities']['physical_preparation'], False)
+                self.assertEqual(manifest['capabilities']['preparation_staging'], platform == 'windows-x64')
+                self.assertFalse(manifest['capabilities']['engine_payloads_bundled'])
                 self.assertEqual(len(manifest['artifacts']), 3 if platform == 'linux-x64' else 2)
                 self.assertEqual(json.loads((output / f'manifest-{platform}.json').read_text()), manifest)
                 for item in manifest['artifacts']:
@@ -78,6 +84,27 @@ class PackageReleaseTests(unittest.TestCase):
                 self.assertIn(REVISION.encode(), contents['BUILD-INFO.txt'])
                 self.assertIn(b'Physical disk writes are disabled', contents['BUILD-INFO.txt'])
                 self.assertIn(b'not publisher authentication', contents['BUILD-INFO.txt'])
+
+    def test_windows_manifest_and_build_info_follow_the_native_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root, 'windows-x64')
+            (root / 'studio/src-tauri/src/main.rs').write_text('const PHYSICAL_PREPARATION_ENABLED: bool = true;\n')
+            result = package.package_release(root, root / 'dist', 'windows-x64', TAG, REVISION)
+            self.assertTrue(result['capabilities']['physical_preparation'])
+            with zipfile.ZipFile(root / 'dist' / next(item['name'] for item in result['artifacts'] if item['kind'] == 'cli')) as archive:
+                info = archive.read('BUILD-INFO.txt')
+            self.assertIn(b'Windows USB preparation is experimental', info)
+            self.assertNotIn(b'Physical disk writes are disabled', info)
+
+    def test_ambiguous_native_gate_refuses_before_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root, 'windows-x64')
+            (root / 'studio/src-tauri/src/main.rs').write_text('const PHYSICAL_PREPARATION_ENABLED: bool = unavailable;\n')
+            with self.assertRaisesRegex(ValueError, 'physical preparation gate'):
+                package.package_release(root, root / 'dist', 'windows-x64', TAG, REVISION)
+            self.assertFalse((root / 'dist').exists())
 
     def test_existing_output_is_never_replaced(self):
         with tempfile.TemporaryDirectory() as directory:

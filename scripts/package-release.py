@@ -15,6 +15,8 @@ import tarfile
 import tempfile
 import zipfile
 
+from release_metadata import capabilities, scope_description
+
 MAX_BINARY = 2 * 1024 * 1024 * 1024
 MAX_DOCUMENT = 2 * 1024 * 1024
 PLATFORMS = {
@@ -80,7 +82,7 @@ class OpenedFile:
         self.finish()
 
 
-def build_info(platform, tag, revision):
+def build_info(platform, tag, revision, capability):
     runtime = {
         'linux-x64': 'Linux x64. Studio needs compatible glibc, GTK 3 and WebKitGTK 4.1; distribution compatibility is not guaranteed.',
         'windows-x64': 'Windows x64. Studio needs WebView2 Runtime; its installer may download that runtime. Windows artifacts are not publisher-signed.',
@@ -90,7 +92,8 @@ def build_info(platform, tag, revision):
     return (f'IsoHopper {tag}\nPlatform: {platform}\nSource revision: {revision}\n'
             f'Source: https://github.com/IsoHopper/isohopper/tree/{revision}\n\n'
             'Experimental build, pending human hardware testing.\n'
-            'Physical disk writes are disabled. Host disk inventory is read-only.\n'
+            f'{scope_description(capability)}'
+            'Host disk inventory is read-only. No upstream engine archive or OS image is bundled.\n'
             'General OS installation and physical hardware compatibility are unvalidated.\n'
             'Production Secure Boot signing is unavailable.\n'
             f'{runtime}\n\n'
@@ -146,6 +149,7 @@ def package_release(root, output, platform, tag, revision):
         raise ValueError('Expected the full 40-character source revision')
     revision = revision.lower()
     root, output = Path(root), Path(output)
+    capability = capabilities(root, platform)
     bundle = root / 'studio/src-tauri/target/release/bundle'
     sources = []
     for folder, pattern, suffix in PLATFORMS[platform]:
@@ -179,9 +183,10 @@ def package_release(root, output, platform, tag, revision):
                     (stage / name).chmod(0o755)
                 artifacts.append(inventory(stage / name, 'studio-installer'))
             cli_archive(stage / archive_name, platform, binary, documents,
-                        build_info(platform, tag, revision))
+                        build_info(platform, tag, revision, capability))
             artifacts.append(inventory(stage / archive_name, 'cli'))
-            manifest = {'schema_version': 1, 'tag': tag, 'platform': platform,
+            manifest = {'schema_version': 2, 'tag': tag, 'platform': platform,
+                        'capabilities': capability,
                         'source_revision': revision, 'artifacts': sorted(artifacts, key=lambda item: item['name'])}
             (stage / manifest_name).write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
             published = []
