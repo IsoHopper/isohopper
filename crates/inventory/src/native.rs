@@ -17,7 +17,8 @@ fn allowed(program: &str, args: &[&str]) -> bool {
         || (program == windows::POWERSHELL
             && (args == windows::ARGS
                 || args == crate::windows_encryption::ARGS
-                || args == crate::windows_pagefiles::ARGS))
+                || args == crate::windows_pagefiles::ARGS
+                || args == crate::windows_pools::ARGS))
 }
 
 impl CommandRunner for NativeCommandRunner {
@@ -196,6 +197,7 @@ mod tests {
             windows::ARGS,
             crate::windows_encryption::ARGS,
             crate::windows_pagefiles::ARGS,
+            crate::windows_pools::ARGS,
         ] {
             assert!(allowed(windows::POWERSHELL, args));
             let mut changed = args.to_vec();
