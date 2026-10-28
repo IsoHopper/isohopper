@@ -3,9 +3,11 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import tarfile
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -19,6 +21,13 @@ REVISION = 'a' * 40
 
 
 class PackageReleaseTests(unittest.TestCase):
+    def windows_stat(self, info, **changes):
+        fields = {name: getattr(info, name) for name in
+                  ['st_mode', 'st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns']}
+        fields['st_birthtime_ns'] = 123
+        fields.update(changes)
+        return SimpleNamespace(**fields)
+
     def fixture(self, root, platform):
         for name in ['LICENSE', 'CONTRIBUTORS.md']:
             (root / name).write_text(f'{name} fixture\n')
@@ -54,7 +63,7 @@ class PackageReleaseTests(unittest.TestCase):
                     self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), item['sha256'])
                     self.assertIn(TAG, item['name'])
                     self.assertIn(platform, item['name'])
-                    if item['name'].endswith('.AppImage'):
+                    if os.name == 'posix' and item['name'].endswith('.AppImage'):
                         self.assertTrue(path.stat().st_mode & 0o111)
                 archive = output / next(item['name'] for item in manifest['artifacts'] if item['kind'] == 'cli')
                 if platform == 'windows-x64':
@@ -117,6 +126,50 @@ class PackageReleaseTests(unittest.TestCase):
                 with self.subTest(changed=changed), package.OpenedFile(path, max_size=10) as opened:
                     path.write_bytes(changed)
                     with self.assertRaises(ValueError):
+                        opened.copy_to(io.BytesIO())
+
+    def test_windows_path_and_handle_ctime_can_differ_for_unchanged_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'input'
+            path.write_bytes(b'unchanged bytes')
+            info = path.stat()
+            by_path = self.windows_stat(info, st_ctime_ns=123)
+            by_handle = self.windows_stat(info, st_ctime_ns=456)
+            with patch.object(package.os, 'name', 'nt'), \
+                    patch.object(type(path), 'lstat', return_value=by_path), \
+                    patch.object(package.os, 'fstat', return_value=by_handle):
+                with package.OpenedFile(path) as opened:
+                    output = io.BytesIO()
+                    opened.copy_to(output)
+                    self.assertEqual(output.getvalue(), b'unchanged bytes')
+
+    def test_windows_opening_still_rejects_identity_size_and_timestamp_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'input'
+            path.write_bytes(b'unchanged bytes')
+            info = self.windows_stat(path.stat())
+            for field in ['st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_birthtime_ns']:
+                changed = self.windows_stat(info, **{field: getattr(info, field) + 1})
+                with self.subTest(field=field), patch.object(package.os, 'name', 'nt'), \
+                        patch.object(type(path), 'lstat', return_value=info), \
+                        patch.object(package.os, 'fstat', return_value=changed):
+                    with self.assertRaisesRegex(ValueError, 'Source changed while opening'):
+                        with package.OpenedFile(path):
+                            pass
+
+    def test_windows_same_handle_ctime_change_is_rejected_during_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'input'
+            path.write_bytes(b'unchanged bytes')
+            info = path.stat()
+            by_path = self.windows_stat(info, st_ctime_ns=123)
+            by_handle = self.windows_stat(info, st_ctime_ns=456)
+            changed = self.windows_stat(info, st_ctime_ns=789)
+            with patch.object(package.os, 'name', 'nt'), \
+                    patch.object(type(path), 'lstat', return_value=by_path), \
+                    patch.object(package.os, 'fstat', side_effect=[by_handle, changed]):
+                with package.OpenedFile(path) as opened:
+                    with self.assertRaisesRegex(ValueError, 'Source grew or changed'):
                         opened.copy_to(io.BytesIO())
 
     def test_publish_race_preserves_competing_file_and_removes_only_own_outputs(self):

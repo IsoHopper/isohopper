@@ -29,6 +29,16 @@ def metadata(info):
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
 
 
+def opening_metadata(info):
+    if os.name != 'nt':
+        return metadata(info)
+    # Windows CPython can return birth time in lstat().st_ctime_ns but change
+    # time in fstat().st_ctime_ns (cpython#157671). Compare compatible fields
+    # across these APIs; finish() still compares full fstat metadata.
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+            getattr(info, 'st_birthtime_ns', None))
+
+
 class OpenedFile:
     """Retain the checked inode and reject changes while collecting its bytes."""
     def __init__(self, path, max_size=MAX_BINARY):
@@ -40,7 +50,7 @@ class OpenedFile:
         fd = os.open(path, flags)
         try:
             opened = os.fstat(fd)
-            if not stat.S_ISREG(opened.st_mode) or metadata(before) != metadata(opened):
+            if not stat.S_ISREG(opened.st_mode) or opening_metadata(before) != opening_metadata(opened):
                 raise ValueError(f'Source changed while opening: {path.name}')
             self.file = os.fdopen(fd, 'rb')
         except BaseException:
