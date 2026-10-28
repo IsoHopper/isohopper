@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 S33G
 use clap::{Parser, Subcommand};
-use isohopper_core::{layout, virtualdisk};
+use isohopper_core::{engine, layout, virtualdisk};
 use isohopper_media::{ImageEntry, recipes::LinuxRecipe};
 use same_file::Handle;
 use serde::Serialize;
@@ -92,6 +92,15 @@ enum Command {
 }
 #[derive(Subcommand)]
 enum ImageCommand {
+    /// Build a pinned engine image in a new regular file; data remains unformatted.
+    Engine {
+        path: PathBuf,
+        #[arg(long)]
+        size_mib: u64,
+        /// Exact supported upstream .tar.gz archive, supplied offline.
+        #[arg(long)]
+        archive: PathBuf,
+    },
     Create {
         path: PathBuf,
         #[arg(long)]
@@ -410,6 +419,40 @@ fn create_image(
         )
     }
 }
+
+fn create_engine_image(path: &Path, size_mib: u64, archive: &Path) -> Result<(), String> {
+    let size = size_mib
+        .checked_mul(1024 * 1024)
+        .ok_or("image capacity overflows u64")?;
+    let plan = engine::Plan::new(size, 512).map_err(|e| e.to_string())?;
+    let bytes = read_binary(archive, engine::archive::ARCHIVE_BYTES)?;
+    let imported = engine::archive::import(&bytes).map_err(|e| e.to_string())?;
+    let receipt = engine::create(path, &plan, &imported.payloads()).map_err(|e| e.to_string())?;
+    let ids = receipt.identifiers();
+    print_json(&serde_json::json!({
+        "path": path,
+        "status": "verified-engine-image",
+        "engine": "Ventoy",
+        "engine_version": engine::VERSION,
+        "archive_sha256": engine::archive::ARCHIVE_SHA256,
+        "payload_sha256": {
+            "boot": engine::BOOT_SHA256,
+            "core": engine::CORE_SHA256,
+            "firmware": engine::FIRMWARE_SHA256
+        },
+        "capacity_bytes": size,
+        "logical_sector_bytes": 512,
+        "guid_encoding": "GPT on-disk bytes, hexadecimal",
+        "disk_guid": hex::encode(ids.disk_guid),
+        "partition_guids": ids.partition_guids.iter().map(hex::encode).collect::<Vec<_>>(),
+        "layout": plan.layout(),
+        "verification": "gpt-and-complete-engine-payloads",
+        "data_partition": "unformatted",
+        "os_boot_tested": false,
+        "secure_boot_verified": false
+    }))
+}
+
 fn utility_evidence(path: &Path) -> serde_json::Value {
     serde_json::json!({"source":path,"boot_path":"\\IHUTIL.EFI","signature_verified":false,"execution_policy":"firmware-load-image"})
 }
@@ -455,6 +498,7 @@ fn run(cli: Cli) -> Result<(), (u8, String)> {
         Command::Manifest { command } => match command { ManifestCommand::Verify { path, signature, public_key } => verify_manifest(&path, &signature, &public_key) },
         Command::Plan { size_mib, sector_size, legacy } => plan(size_mib, sector_size, legacy).and_then(|layout| print_json(&layout)),
         Command::Image { command } => match command {
+            ImageCommand::Engine { path, size_mib, archive } => create_engine_image(&path, size_mib, &archive),
             ImageCommand::Create { path, size_mib, sector_size, legacy, efi, config, utility } => create_image(&path, size_mib, sector_size, legacy, efi.as_deref(), config.as_deref(), utility.as_deref()),
             ImageCommand::Verify { path, efi, utility } => verify_image(&path, efi.as_deref(), utility.as_deref()),
         },
