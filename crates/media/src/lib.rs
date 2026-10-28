@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded image inspection, candidate boot recipes and signed manifest validation.
+pub mod copy;
 pub mod iso;
 mod library;
 pub mod manifest;
