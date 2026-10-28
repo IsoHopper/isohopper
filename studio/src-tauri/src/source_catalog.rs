@@ -521,6 +521,44 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn retained_windows_source_refuses_an_existing_writer_without_fallback() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("boot.iso");
+        std::fs::write(&path, b"abc").unwrap();
+        // Allow subsequent opens on this writer so the rejection specifically
+        // comes from the retained source's refusal to share existing write access.
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&path)
+            .unwrap();
+        let opened = isohopper_media::open_image(root.path(), "boot.iso").unwrap();
+        let error = match PreparedSource::new(opened, "boot.iso") {
+            Ok(_) => panic!("retained a source while a conflicting writer was open"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Cannot retain source without write sharing"));
+        drop(writer);
+
+        let source = PreparedSource::new(
+            isohopper_media::open_image(root.path(), "boot.iso").unwrap(),
+            "boot.iso",
+        )
+        .unwrap();
+        assert_eq!(source.0.info.bytes, 3);
+        assert_eq!(
+            source.0.info.verification.digest,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
     #[test]
     fn capacity_failure_is_atomic_and_never_evicts_an_existing_source() {
         let root = tempfile::tempdir().unwrap();

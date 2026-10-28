@@ -815,6 +815,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "isohopper-source-catalog-tests"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "isohopper-config",
+ "isohopper-media",
+ "same-file",
+ "serde",
+ "tempfile",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

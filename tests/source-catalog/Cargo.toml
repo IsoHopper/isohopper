@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2026 S33G
+# SPDX-License-Identifier: GPL-3.0-or-later
+[package]
+name = "isohopper-source-catalog-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[test]]
+name = "source_catalog"
+path = "../../studio/src-tauri/src/source_catalog.rs"
+
+[dev-dependencies]
+isohopper-config = { path = "../../crates/config" }
+isohopper-media = { path = "../../crates/media" }
+serde.workspace = true
+same-file = "=1.0.6"
+getrandom = "=0.4.3"
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

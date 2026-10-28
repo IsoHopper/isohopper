@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/config", "crates/cli", "crates/helper", "crates/media", "crates/inventory", "boot/launcher"]
+members = ["crates/core", "crates/config", "crates/cli", "crates/helper", "crates/media", "crates/inventory", "boot/launcher", "tests/source-catalog"]
 default-members = ["crates/core", "crates/config", "crates/cli", "crates/helper", "crates/media", "crates/inventory", "boot/launcher"]
 exclude = ["studio/src-tauri"]
 

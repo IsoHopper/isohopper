@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 S33G
 # SPDX-License-Identifier: GPL-3.0-or-later
-name: Windows VHD writer integration
+name: Windows storage integration
 
 on:
   workflow_dispatch:
@@ -8,6 +8,9 @@ on:
     branches: [main]
     paths:
       - .github/workflows/writer-windows-vhd.yml
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
       - crates/helper/tests/windows_vhd.rs
       - crates/helper/tests/windows_volume_lock.rs
       - crates/helper/tests/support/**
@@ -16,7 +19,11 @@ on:
       - crates/helper/src/windows_lock.rs
       - crates/helper/src/windows_lock/**
       - crates/helper/Cargo.toml
+      - crates/core/**
       - crates/media/**
+      - crates/config/**
+      - studio/src-tauri/src/source_catalog.rs
+      - tests/source-catalog/**
 
 permissions:
   contents: read
@@ -27,7 +34,7 @@ concurrency:
 
 jobs:
   vhd-writer:
-    name: Retained-device writer on a temporary VHDX
+    name: Source handles, file copies and disposable VHDX
     runs-on: windows-2022
     timeout-minutes: 10
     env:
@@ -55,6 +62,22 @@ jobs:
           print(text)
           text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
           print('::error title=Windows media integration failed::' + text)
+          PY
+            exit 1
+          fi
+
+      - name: Verify native source retention without a WebView build
+        shell: bash
+        run: |
+          if cargo +1.98.0 test --locked -p isohopper-source-catalog-tests --test source_catalog > source-tests.log 2>&1; then
+            cat source-tests.log
+          else
+            python - <<'PY'
+          from pathlib import Path
+          text = Path('source-tests.log').read_text(errors='replace')[-12000:]
+          print(text)
+          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=Windows native source retention failed::' + text)
           PY
             exit 1
           fi
