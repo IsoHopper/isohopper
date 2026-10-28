@@ -9,9 +9,12 @@ on:
     paths:
       - .github/workflows/writer-windows-vhd.yml
       - crates/helper/tests/windows_vhd.rs
+      - crates/helper/tests/windows_volume_lock.rs
       - crates/helper/tests/support/**
       - crates/helper/src/writer.rs
       - crates/helper/src/writer/**
+      - crates/helper/src/windows_lock.rs
+      - crates/helper/src/windows_lock/**
       - crates/helper/Cargo.toml
       - crates/media/**
 
@@ -68,6 +71,22 @@ jobs:
           print(text)
           text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
           print('::error title=Windows VHD writer integration failed::' + text)
+          PY
+            exit 1
+          fi
+
+      - name: Exercise filesystem locks on a new temporary VHDX
+        shell: bash
+        run: |
+          if cargo +1.98.0 test --locked -p isohopper-helper --test windows_volume_lock windows_vhd_lock_refuses_open_file_and_releases_locks -- --ignored --exact --nocapture --test-threads=1 > volume-lock-test.log 2>&1; then
+            cat volume-lock-test.log
+          else
+            python - <<'PY'
+          from pathlib import Path
+          text = Path('volume-lock-test.log').read_text(errors='replace')[-12000:]
+          print(text)
+          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=Windows VHD volume locking failed::' + text)
           PY
             exit 1
           fi
