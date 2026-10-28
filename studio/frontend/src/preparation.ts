@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+import { relativeImagePath } from './state';
 export interface EngineArchive { archive_id: string; name: string; bytes: number; sha256: string; version: string }
 export interface PreparationTarget { selection_token: string; display_id: string; disk: { number: number; friendly_name?: string | null; serial_number?: string | null; size: number | null; logical_sector_size: number | null; physical_sector_size: number | null; bus_type: number | null; [key: string]: unknown } }
+export interface PreparationSource { relative_path: string; bytes: number; sha256: string }
 export interface PreparationSnapshot {
   job_id: string; phase: string; message: string; active: boolean; cancel_requested: boolean;
   completed_bytes: number; total_bytes: number; bytes_written: number; bytes_verified: number;
   target_may_be_incomplete: boolean; sources_released: boolean;
+  source_manifest: PreparationSource[];
   target: { device_number: number; serial: string; device_id: string | null; bus_type: number; size_bytes: number; logical_sector_size: number; physical_sector_size: number } | null;
   image_sha256: string | null; description_digest: string | null; challenge: string | null;
 }
@@ -17,6 +20,11 @@ export function preparationSnapshot(value: unknown): PreparationSnapshot {
       [v.completed_bytes, v.total_bytes, v.bytes_written, v.bytes_verified].some(n => !Number.isSafeInteger(n) || n < 0) || v.completed_bytes > v.total_bytes || v.bytes_verified > v.bytes_written ||
       [v.image_sha256, v.description_digest].some(s => s !== null && (typeof s !== 'string' || !hex.test(s))) ||
       (v.challenge !== null && (typeof v.challenge !== 'string' || v.challenge.length > 4128))) throw new Error('Invalid native preparation response.');
+  if (!Array.isArray(v.source_manifest) || v.source_manifest.length > 128 || v.source_manifest.some(source =>
+    !source || typeof source !== 'object' || Object.keys(source).sort().join(',') !== 'bytes,relative_path,sha256' ||
+    typeof source.relative_path !== 'string' || source.relative_path.length > 4096 || relativeImagePath(source.relative_path) !== source.relative_path ||
+    !Number.isSafeInteger(source.bytes) || source.bytes <= 0 || typeof source.sha256 !== 'string' || !hex.test(source.sha256)
+  )) throw new Error('Invalid native preparation source manifest.');
   if (v.target !== null) {
     const t = v.target;
     if (!t || typeof t.serial !== 'string' || t.serial.length > 4096 || [t.device_number, t.bus_type, t.size_bytes, t.logical_sector_size, t.physical_sector_size].some(n => !Number.isSafeInteger(n) || n < 0) || (t.device_id !== null && (typeof t.device_id !== 'string' || !/^[a-f0-9]{32}$/.test(t.device_id)))) throw new Error('Invalid native target description.');
@@ -24,5 +32,5 @@ export function preparationSnapshot(value: unknown): PreparationSnapshot {
   return v;
 }
 export function canConfirmPreparation(job: PreparationSnapshot | null, text: string, physicalEnabled: boolean): boolean {
-  return !!(physicalEnabled && job?.active && job.phase === 'await_confirmation' && job.sources_released && !job.cancel_requested && job.challenge && job.description_digest && text === job.challenge);
+  return !!(physicalEnabled && job?.active && job.phase === 'await_confirmation' && job.sources_released && job.source_manifest.length > 0 && !job.cancel_requested && job.challenge && job.description_digest && text === job.challenge);
 }

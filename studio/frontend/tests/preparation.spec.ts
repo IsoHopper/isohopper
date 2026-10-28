@@ -17,7 +17,7 @@ test('native staging keeps physical writes gated and recovers its backend job af
       if (command === 'list_preparation_targets') return [target];
       if (command === 'preparation_status') return JSON.parse(sessionStorage.getItem('job') || 'null');
       if (command === 'start_preparation') {
-        const job = { job_id: 'd'.repeat(64), phase: 'await_confirmation', message: 'Staged image ready. Physical writing is disabled in this build; cancel to clean up.', active: true, cancel_requested: false, completed_bytes: 8000000000, total_bytes: 8000000000, bytes_written: 0, bytes_verified: 0, target_may_be_incomplete: false, sources_released: true, target: { device_number: 7, serial: 'USB-AbC', device_id: null, bus_type: 7, size_bytes: 8000000000, logical_sector_size: 512, physical_sector_size: 512 }, image_sha256: 'e'.repeat(64), description_digest: 'f'.repeat(64), challenge: 'WIPE USB-AbC' };
+        const job = { job_id: 'd'.repeat(64), phase: 'await_confirmation', message: 'Staged image ready. Physical writing is disabled in this build; cancel to clean up.', active: true, cancel_requested: false, completed_bytes: 8000000000, total_bytes: 8000000000, bytes_written: 0, bytes_verified: 0, target_may_be_incomplete: false, sources_released: true, source_manifest: [{ relative_path: source.relative_path, bytes: source.bytes, sha256: source.verification.digest }], target: { device_number: 7, serial: 'USB-AbC', device_id: null, bus_type: 7, size_bytes: 8000000000, logical_sector_size: 512, physical_sector_size: 512 }, image_sha256: 'e'.repeat(64), description_digest: 'f'.repeat(64), challenge: 'WIPE USB-AbC' };
         sessionStorage.setItem('job', JSON.stringify(job)); return job;
       }
       if (command === 'cancel_preparation') {
@@ -27,6 +27,7 @@ test('native staging keeps physical writes gated and recovers its backend job af
     } } };
   });
   await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'Configuration preview', exact: true })).toHaveCount(0);
   await page.locator('#preparation-target').selectOption('c'.repeat(64));
   await page.getByRole('button', { name: 'Build preparation image', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Write device', exact: true })).toBeDisabled();
@@ -38,6 +39,10 @@ test('native staging keeps physical writes gated and recovers its backend job af
   await expect(page.locator('.preparation-status')).toContainText('d'.repeat(64));
   await expect(page.getByRole('button', { name: 'Add images', exact: true })).toBeDisabled();
   await expect(page.locator('.image-row')).toHaveCount(0);
+  await expect(page.locator('.job-source-manifest tbody tr')).toHaveCount(1);
+  await expect(page.locator('.job-source-manifest')).toContainText('Windows/boot.iso');
+  await expect(page.locator('.job-source-manifest')).toContainText('a'.repeat(64));
+  await expect(page.locator('.main-column > .native-preparation')).toHaveCount(1);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.getByRole('button', { name: 'Cancel preparation', exact: true }).click();
   await expect(page.locator('.preparation-status')).toContainText('Staging removed; no target writes.');
@@ -59,9 +64,12 @@ test('enabled native preparation requires an exact explicit one-shot confirmatio
       job_id: '1'.repeat(64), phase: 'await_confirmation', message: 'Exact retained target ready.',
       active: true, cancel_requested: false, completed_bytes: 8000000000, total_bytes: 8000000000,
       bytes_written: 0, bytes_verified: 0, target_may_be_incomplete: false, sources_released: true,
+      source_manifest: [{ relative_path: 'Windows/boot.iso', bytes: 3, sha256: 'a'.repeat(64) }, { relative_path: 'Mac/boot.iso', bytes: 5, sha256: 'b'.repeat(64) }],
       target: { device_number: 7, serial: 'USB-AbC', device_id: '2'.repeat(32), bus_type: 7, size_bytes: 8000000000, logical_sector_size: 512, physical_sector_size: 4096 },
       image_sha256: '3'.repeat(64), description_digest: '4'.repeat(64), challenge: 'WIPE USB-AbC',
     };
+    const restored = sessionStorage.getItem('enabled-job');
+    if (restored) job = JSON.parse(restored);
     host.__TAURI__ = { core: { invoke: async (command: string, args: unknown) => {
       host.preparationCalls.push({ command, args });
       if (command === 'capabilities') return { mode: 'native', platform: 'windows', file_import: true, host_inventory: true, preparation_available: true, physical_preparation: true, preparation_unavailable_reason: '' };
@@ -70,6 +78,7 @@ test('enabled native preparation requires an exact explicit one-shot confirmatio
       if (command === 'selected_engine_archive') return null;
       if (command === 'preparation_status') {
         if (host.finishPreparation) job = { ...job, phase: 'succeeded', active: false, message: 'Mock device write and full readback verified.', bytes_written: 8000000000, bytes_verified: 8000000000, target_may_be_incomplete: false };
+        sessionStorage.setItem('enabled-job', JSON.stringify(job));
         return structuredClone(job);
       }
       if (command === 'confirm_preparation') {
@@ -137,4 +146,15 @@ test('enabled native preparation requires an exact explicit one-shot confirmatio
   expect(exported.runtime_capabilities.physical_preparation).toBe(true);
   expect(exported.preparation_snapshot).toMatchObject({ job_id: '1'.repeat(64), phase: 'succeeded', bytes_written: 8000000000, bytes_verified: 8000000000, target_may_be_incomplete: false, image_sha256: '3'.repeat(64), description_digest: '4'.repeat(64) });
   expect(exported).not.toHaveProperty('physical_disk_writes');
+  expect(exported.preparation_snapshot.source_manifest).toEqual([{ relative_path: 'Windows/boot.iso', bytes: 3, sha256: 'a'.repeat(64) }, { relative_path: 'Mac/boot.iso', bytes: 5, sha256: 'b'.repeat(64) }]);
+  await page.reload();
+  await expect(value('Phase')).toHaveText('succeeded');
+  await expect(page.locator('.image-row')).toHaveCount(0);
+  await expect(page.locator('.job-source-manifest tbody tr')).toHaveCount(2);
+  await expect(page.locator('.job-source-manifest')).toContainText('Windows/boot.iso');
+  await expect(page.locator('.job-source-manifest')).toContainText('Mac/boot.iso');
+  await expect(page.locator('.job-source-manifest')).toContainText('a'.repeat(64));
+  await expect(page.locator('.job-source-manifest')).toContainText('b'.repeat(64));
+  await expect(page.locator('.main-column > .native-preparation')).toHaveCount(1);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
