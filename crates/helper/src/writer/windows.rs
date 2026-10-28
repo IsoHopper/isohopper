@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Synchronous raw I/O through one caller-owned, already authorized handle.
 use super::{DeviceSnapshot, Geometry, RetainedDevice, StableDeviceId, windows_metadata};
+#[path = "windows_readiness.rs"]
+mod readiness;
 use std::{
+    fs::File,
     io,
-    mem::size_of,
+    mem::{offset_of, size_of},
     os::windows::io::{AsRawHandle, OwnedHandle},
     ptr,
 };
 use windows_sys::Win32::{
-    Foundation::{ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED},
+    Foundation::{ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_WRITE_PROTECT},
     Storage::FileSystem::{
         FILE_BEGIN, FILE_DEVICE_DISK, FILE_TYPE_DISK, FlushFileBuffers, GetFileType, ReadFile,
         SetFilePointerEx, WriteFile,
@@ -16,13 +19,78 @@ use windows_sys::Win32::{
     System::{
         IO::DeviceIoControl,
         Ioctl::{
-            GET_LENGTH_INFORMATION, IOCTL_DISK_GET_LENGTH_INFO, IOCTL_STORAGE_GET_DEVICE_NUMBER,
-            IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery,
-            STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, STORAGE_DEVICE_NUMBER, STORAGE_PROPERTY_QUERY,
-            StorageAccessAlignmentProperty, StorageDeviceIdProperty, StorageDeviceProperty,
+            DISK_ATTRIBUTE_OFFLINE, DISK_ATTRIBUTE_READ_ONLY, GET_DISK_ATTRIBUTES,
+            GET_LENGTH_INFORMATION, IOCTL_DISK_GET_DISK_ATTRIBUTES, IOCTL_DISK_GET_LENGTH_INFO,
+            IOCTL_DISK_IS_WRITABLE, IOCTL_STORAGE_GET_DEVICE_NUMBER, IOCTL_STORAGE_QUERY_PROPERTY,
+            PropertyStandardQuery, STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, STORAGE_DEVICE_NUMBER,
+            STORAGE_PROPERTY_QUERY, StorageAccessAlignmentProperty, StorageDeviceIdProperty,
+            StorageDeviceProperty,
         },
     },
 };
+
+const _: () = {
+    assert!(size_of::<GET_DISK_ATTRIBUTES>() == readiness::ATTRIBUTES_BYTES);
+    assert!(offset_of!(GET_DISK_ATTRIBUTES, Attributes) == 8);
+    assert!(DISK_ATTRIBUTE_OFFLINE == 1);
+    assert!(DISK_ATTRIBUTE_READ_ONLY == 2);
+    assert!(ERROR_WRITE_PROTECT == 19);
+};
+
+/// Query disk attributes and writability without modifying media or flags.
+///
+/// A read-only file handle to a disk is sufficient. This does not establish
+/// device identity, authorization, volume locks or full target safety. Unknown
+/// status fails closed. The result is a point-in-time observation, not a lease.
+///
+/// # Safety
+/// The file must contain a live disk handle opened synchronously, without
+/// FILE_FLAG_OVERLAPPED. The query waits for completion before returning, so
+/// a stalled driver can block it. No device path is accepted or reopened.
+pub unsafe fn check_write_readiness(file: &File) -> io::Result<()> {
+    handle_write_readiness(file)
+}
+
+fn handle_write_readiness(handle: &impl AsRawHandle) -> io::Result<()> {
+    readiness::check(
+        || {
+            // Sentinel bytes cannot look like a valid empty attribute result
+            // if a driver returns an incomplete structure as success.
+            let mut bytes = [0xffu8; readiness::ATTRIBUTES_BYTES];
+            let returned = control(
+                handle,
+                IOCTL_DISK_GET_DISK_ATTRIBUTES,
+                None,
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+            )?;
+            readiness::complete_attributes(bytes, returned)
+        },
+        || {
+            let mut unused = 0;
+            // SAFETY: the caller guarantees a synchronous live handle. This
+            // read-only IOCTL accepts no input or output buffer. Win32 defines
+            // lpBytesReturned as meaningless for an operation with no output,
+            // so only the success status is evidence of current writability.
+            if unsafe {
+                DeviceIoControl(
+                    handle.as_raw_handle(),
+                    IOCTL_DISK_IS_WRITABLE,
+                    ptr::null(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    &mut unused,
+                    ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        },
+    )
+}
 
 pub struct WindowsRawDevice {
     handle: OwnedHandle,
@@ -38,7 +106,8 @@ impl WindowsRawDevice {
     /// FILE_FLAG_WRITE_THROUGH. No duplicated handle may concurrently alter its
     /// file position or issue I/O. The caller must retain the required volume
     /// locks and finish independent target authorization before calling writes.
-    /// This constructor checks device metadata, not authorization or lock state.
+    /// This constructor checks metadata and current write readiness, not
+    /// authorization or lock state.
     pub unsafe fn from_owned_handle(handle: OwnedHandle) -> io::Result<Self> {
         // SAFETY: OwnedHandle keeps the live handle valid for this call.
         if unsafe { GetFileType(handle.as_raw_handle()) } != FILE_TYPE_DISK {
@@ -48,11 +117,18 @@ impl WindowsRawDevice {
         initial
             .validate_identity()
             .map_err(|_| invalid("device has no hardware serial or supported NAA-6 device ID"))?;
+        handle_write_readiness(&handle)?;
         Ok(Self { handle, initial })
     }
 
     pub fn initial_snapshot(&self) -> &DeviceSnapshot {
         &self.initial
+    }
+
+    /// Refresh the non-mutating readiness observation on this retained handle.
+    /// This does not replace the caller's independent target safety checks.
+    pub fn check_write_readiness(&self) -> io::Result<()> {
+        handle_write_readiness(&self.handle)
     }
 
     pub(crate) fn retained_handle(&self) -> &OwnedHandle {
@@ -85,7 +161,9 @@ impl WindowsRawDevice {
 
 impl RetainedDevice for WindowsRawDevice {
     fn snapshot(&mut self) -> io::Result<DeviceSnapshot> {
-        inspect(&self.handle)
+        let snapshot = inspect(&self.handle)?;
+        self.check_write_readiness()?;
+        Ok(snapshot)
     }
 
     fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
@@ -113,6 +191,11 @@ impl RetainedDevice for WindowsRawDevice {
     }
 
     fn write_at(&mut self, offset: u64, buffer: &[u8]) -> io::Result<usize> {
+        // Recheck immediately before each bounded write so a long-running job
+        // does not reuse its initial readiness. Three fixed-size/no-output
+        // IOCTLs per <=1 MiB write trade throughput for prompt fail-closed refusal.
+        // A later driver state change remains possible; WriteFile can still fail.
+        self.check_write_readiness()?;
         self.position(offset, buffer.as_ptr() as usize, buffer.len())?;
         let mut count = 0;
         // SAFETY: the slice remains valid until synchronous I/O completes;
@@ -149,7 +232,7 @@ fn invalid(message: &str) -> io::Error {
 }
 
 fn control(
-    handle: &OwnedHandle,
+    handle: &impl AsRawHandle,
     code: u32,
     query: Option<&STORAGE_PROPERTY_QUERY>,
     output: *mut core::ffi::c_void,

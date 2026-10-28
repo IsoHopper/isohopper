@@ -75,6 +75,22 @@ jobs:
             exit 1
           fi
 
+      - name: Check writable and read-only attachments of an owned VHDX
+        shell: bash
+        run: |
+          if cargo +1.98.0 test --locked -p isohopper-helper --test windows_readiness windows_vhd_readiness_refuses_read_only_attachment -- --ignored --exact --nocapture --test-threads=1 > readiness-test.log 2>&1; then
+            cat readiness-test.log
+          else
+            python - <<'PY'
+          from pathlib import Path
+          text = Path('readiness-test.log').read_text(errors='replace')[-12000:]
+          print(text)
+          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=Windows disk readiness failed::' + text)
+          PY
+            exit 1
+          fi
+
       - name: Write and verify only a newly created temporary VHDX
         shell: bash
         run: |
