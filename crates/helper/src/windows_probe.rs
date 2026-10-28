@@ -3,13 +3,14 @@
 //! Native read-only probe entry. No disk, source-transfer or Session operations.
 use crate::{
     broker_probe::{ProbeArgs, ProbeReply, ProbeRequest, check_pair},
+    windows_installation::{InstalledRole, MachineInstallation},
     windows_peer::{PeerError, ProcessPeer},
     windows_pipe::{Endpoint, connect},
 };
 use std::{
     io,
     os::windows::io::{FromRawHandle, OwnedHandle},
-    sync::atomic::AtomicBool,
+    sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 use windows_sys::Win32::System::Threading::{
@@ -53,6 +54,13 @@ pub fn serve(args: ProbeArgs) -> Result<(), String> {
         return Err("probe caller creation time mismatch".into());
     }
     check_pair(remote.evidence(), local.evidence()).map_err(|e| e.to_string())?;
+    let installation = Arc::new(MachineInstallation::open()?);
+    local = local
+        .bind_installation(Arc::clone(&installation), InstalledRole::Helper)
+        .map_err(|e| e.to_string())?;
+    let remote = remote
+        .bind_installation(installation, InstalledRole::Studio)
+        .map_err(|e| e.to_string())?;
     let endpoint = Endpoint::from_nonce(args.nonce()).map_err(|e| e.to_string())?;
     let mut connection =
         connect(&endpoint, remote, deadline, &cancel).map_err(|e| e.to_string())?;

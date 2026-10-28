@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 S33G
-use super::{ProbeOutcome, check_digest, installation::Installation};
+use super::{ProbeOutcome, check_digest, installation};
 use isohopper_helper::{
     broker_probe::{ProbeArgs, ProbeSession, check_pair, check_studio},
+    windows_installation::InstalledRole,
     windows_peer::ProcessPeer,
     windows_pipe::Server,
     windows_probe::current_peer,
@@ -16,7 +17,7 @@ use std::{
     },
     path::Path,
     ptr,
-    sync::atomic::AtomicBool,
+    sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
@@ -134,8 +135,12 @@ pub fn run(owner: usize, directory: &Path, expected_digest: &str) -> Result<Prob
     {
         return Err("Studio owner window is unavailable".into());
     }
-    let mut installation = Installation::open(directory)?;
-    let digest = check_digest(installation.image(), expected_digest)?;
+    let installation = installation::open(directory)?;
+    local = local
+        .bind_installation(Arc::clone(&installation), InstalledRole::Studio)
+        .map_err(|e| e.to_string())?;
+    let mut helper_image = installation.image(InstalledRole::Helper);
+    let digest = check_digest(&mut helper_image, expected_digest)?;
     let server = Server::create().map_err(|e| e.to_string())?;
     let args = ProbeArgs::new(
         server.endpoint().nonce(),
@@ -144,7 +149,7 @@ pub fn run(owner: usize, directory: &Path, expected_digest: &str) -> Result<Prob
     )
     .map_err(|e| e.to_string())?;
     let verb = wide(std::ffi::OsStr::new("runas"))?;
-    let file = wide(installation.path().as_os_str())?;
+    let file = wide(installation.path(InstalledRole::Helper).as_os_str())?;
     let parameters = wide(std::ffi::OsStr::new(&args.launch_arguments()))?;
     let working_directory = wide(installation.directory().as_os_str())?;
     let mut info = SHELLEXECUTEINFOW {
@@ -177,7 +182,9 @@ pub fn run(owner: usize, directory: &Path, expected_digest: &str) -> Result<Prob
     let handle = restricted_duplicate(original.as_raw_handle())?;
     let exit_handle = restricted_duplicate(original.as_raw_handle())?;
     drop(original);
-    let remote = ProcessPeer::from_owned_handle(handle).map_err(|e| e.to_string())?;
+    let remote = ProcessPeer::from_owned_handle(handle)
+        .and_then(|peer| peer.bind_installation(Arc::clone(&installation), InstalledRole::Helper))
+        .map_err(|e| e.to_string())?;
     local.revalidate().map_err(|e| e.to_string())?;
     check_pair(local.evidence(), remote.evidence()).map_err(|e| e.to_string())?;
     let evidence = remote.evidence().clone();

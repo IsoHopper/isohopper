@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 S33G
-use super::{Ace, ObjectKind, check_acl, installation_path};
+use super::{
+    InstalledRole,
+    policy::{Ace, ObjectKind, check_acl, installation_path},
+    state::{ImageStamp, image_stamp, wide_name},
+};
 use std::{
     ffi::{OsStr, c_void},
     fs::{File, OpenOptions},
     io,
+    mem::{offset_of, size_of},
     os::windows::{
         ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt},
@@ -22,8 +27,11 @@ use windows_sys::Win32::{
         OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     },
     Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, GetVolumeInformationByHandleW, QueryDosDeviceW,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_STANDARD_INFO, FILE_TYPE_DISK, FileBasicInfo, FileIdInfo, FileStandardInfo,
+        GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW,
+        GetVolumeInformationByHandleW, QueryDosDeviceW, VOLUME_NAME_NT,
     },
     System::{
         Com::CoTaskMemFree, SystemInformation::GetSystemWindowsDirectoryW,
@@ -284,20 +292,60 @@ fn retain_ancestors(directory: &str) -> Result<Vec<(File, ObjectKind)>, String> 
     Ok(ancestors)
 }
 
-pub(in super::super) struct Installation {
-    directory: PathBuf,
+struct RetainedImage {
     path: PathBuf,
+    file: File,
+    stamp: ImageStamp,
+    name: Vec<u16>,
+}
+
+impl RetainedImage {
+    fn open(directory: &Path, role: InstalledRole) -> Result<Self, String> {
+        let path = directory.join(role.filename());
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+            .map_err(|e| format!("Open protected installed image: {e}"))?;
+        check_object(&file, ObjectKind::File)?;
+        let stamp = image_metadata(&file)?;
+        let name = final_name(&file)?;
+        Ok(Self {
+            path,
+            file,
+            stamp,
+            name,
+        })
+    }
+
+    fn revalidate(&self) -> Result<(), String> {
+        check_object(&self.file, ObjectKind::File)?;
+        if image_metadata(&self.file)? != self.stamp || final_name(&self.file)? != self.name {
+            return Err("Retained installed image changed".into());
+        }
+        Ok(())
+    }
+}
+
+/// Retains the protected system-drive installation and both fixed executables.
+/// No caller-supplied path is opened. Read handles deny new write/delete opens;
+/// ACLs, identity, metadata and final names are rechecked without reopening files.
+/// This assumes a fresh protected installation and no privileged mutation. It
+/// does not attest loaded code, reject injection, or authorize any disk operation.
+pub struct MachineInstallation {
+    directory: PathBuf,
     drive: String,
     mapping: String,
     ancestors: Vec<(File, ObjectKind)>,
-    image: File,
+    studio: RetainedImage,
+    helper: RetainedImage,
 }
-impl Installation {
-    pub(in super::super) fn open(directory: &Path) -> Result<Self, String> {
-        let directory = directory
-            .to_str()
-            .ok_or("Installation path is not Unicode")?;
-        let directory = installation_path(directory, &program_files()?, &system_windows()?)?;
+impl MachineInstallation {
+    pub fn open() -> Result<Self, String> {
+        let base = program_files()?;
+        let directory =
+            installation_path(&format!("{base}\\IsoHopper"), &base, &system_windows()?)?;
         let drive = directory[..2].to_owned();
         // Boot-defined drive aliases are protected from nonadministrator
         // replacement (DefineDosDeviceW). Explicit global comparison rejects
@@ -305,41 +353,134 @@ impl Installation {
         let mapping = check_mapping(&drive, None)?;
         let ancestors = retain_ancestors(&directory)?;
         let directory = PathBuf::from(directory);
-        let path = directory.join("isohopper-helper.exe");
-        let image = OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&path)
-            .map_err(|e| format!("Open protected packaged helper: {e}"))?;
-        check_object(&image, ObjectKind::File)?;
+        let studio = RetainedImage::open(&directory, InstalledRole::Studio)?;
+        let helper = RetainedImage::open(&directory, InstalledRole::Helper)?;
         let result = Self {
             directory,
-            path,
             drive,
             mapping,
             ancestors,
-            image,
+            studio,
+            helper,
         };
         result.revalidate()?;
         Ok(result)
     }
-    pub(in super::super) fn revalidate(&self) -> Result<(), String> {
+
+    pub fn revalidate(&self) -> Result<(), String> {
         check_mapping(&self.drive, Some(&self.mapping))?;
         for (file, kind) in &self.ancestors {
             check_object(file, *kind)?;
         }
-        check_object(&self.image, ObjectKind::File)
+        self.studio.revalidate()?;
+        self.helper.revalidate()
     }
-    pub(in super::super) fn image(&mut self) -> &mut File {
-        &mut self.image
+
+    /// Validate an application resource directory without ever opening it.
+    pub fn require_directory(&self, directory: &Path) -> Result<(), String> {
+        let directory = directory
+            .to_str()
+            .ok_or("Installation path is not Unicode")?;
+        let expected = self
+            .directory
+            .to_str()
+            .ok_or("Installation path is not Unicode")?;
+        if directory.eq_ignore_ascii_case(expected) {
+            Ok(())
+        } else {
+            Err("Resource directory is not the protected machine installation".into())
+        }
     }
-    pub(in super::super) fn path(&self) -> &Path {
-        &self.path
+
+    fn retained(&self, role: InstalledRole) -> &RetainedImage {
+        match role {
+            InstalledRole::Studio => &self.studio,
+            InstalledRole::Helper => &self.helper,
+        }
     }
-    pub(in super::super) fn directory(&self) -> &Path {
+
+    /// Retained read-only image, suitable for the Studio build's helper hash
+    /// check. Sharing the cursor does not affect metadata/name observations.
+    pub fn image(&self, role: InstalledRole) -> &File {
+        &self.retained(role).file
+    }
+    pub fn path(&self, role: InstalledRole) -> &Path {
+        &self.retained(role).path
+    }
+    pub fn directory(&self) -> &Path {
         &self.directory
     }
+    pub(crate) fn native_name(&self, role: InstalledRole) -> &[u16] {
+        &self.retained(role).name
+    }
+}
+
+const _: () = {
+    assert!(size_of::<FILE_ID_INFO>() == 24);
+    assert!(offset_of!(FILE_ID_INFO, FileId) == 8);
+    assert!(size_of::<FILE_BASIC_INFO>() == 40);
+    assert!(offset_of!(FILE_BASIC_INFO, CreationTime) == 0);
+    assert!(offset_of!(FILE_BASIC_INFO, LastWriteTime) == 16);
+    assert!(offset_of!(FILE_BASIC_INFO, ChangeTime) == 24);
+    assert!(offset_of!(FILE_BASIC_INFO, FileAttributes) == 32);
+    assert!(size_of::<FILE_STANDARD_INFO>() == 24);
+    assert!(offset_of!(FILE_STANDARD_INFO, AllocationSize) == 0);
+    assert!(offset_of!(FILE_STANDARD_INFO, EndOfFile) == 8);
+    assert!(offset_of!(FILE_STANDARD_INFO, NumberOfLinks) == 16);
+    assert!(offset_of!(FILE_STANDARD_INFO, DeletePending) == 20);
+    assert!(offset_of!(FILE_STANDARD_INFO, Directory) == 21);
+};
+
+fn image_metadata(file: &File) -> Result<ImageStamp, String> {
+    // SAFETY: the retained regular File stays live through each synchronous
+    // query. Integer-only aligned buffers preserve arbitrary BOOLEAN bytes.
+    if unsafe { GetFileType(file.as_raw_handle()) } != FILE_TYPE_DISK {
+        return Err("Installed image is not a disk file".into());
+    }
+    let mut id = [u64::MAX; 3];
+    let mut basic = [u64::MAX; 5];
+    let mut standard = [u64::MAX; 3];
+    for (class, output) in [
+        (FileIdInfo, id.as_mut_slice()),
+        (FileBasicInfo, basic.as_mut_slice()),
+        (FileStandardInfo, standard.as_mut_slice()),
+    ] {
+        if unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                class,
+                output.as_mut_ptr().cast(),
+                size_of_val(output) as u32,
+            )
+        } == 0
+        {
+            return Err(error("Inspect retained installed image"));
+        }
+    }
+    fn bytes(words: &[u64]) -> &[u8] {
+        // SAFETY: initialized integer storage, borrowed only for this call.
+        unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), size_of_val(words)) }
+    }
+    image_stamp(bytes(&id), bytes(&basic), bytes(&standard))
+}
+
+fn final_name(file: &File) -> Result<Vec<u16>, String> {
+    let mut buffer = vec![u16::MAX; 32768];
+    // SAFETY: retained file plus bounded output. VOLUME_NAME_NT returns the
+    // resolved native name for comparison only, never a new path to open.
+    // https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew
+    let length = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            VOLUME_NAME_NT,
+        )
+    } as usize;
+    if length == 0 {
+        return Err(error("Read installed image native name"));
+    }
+    wide_name(&buffer, length)
 }
 
 #[cfg(test)]
@@ -408,16 +549,6 @@ mod tests {
         }
     }
     #[test]
-    #[ignore = "requires the matching NSIS package to be installed on this Windows test machine"]
-    fn native_installed_helper_is_protected_and_matches_build() {
-        let expected = env!("ISOHOPPER_HELPER_SHA256");
-        let directory = PathBuf::from(program_files().unwrap()).join("IsoHopper");
-        let mut installation = Installation::open(&directory).unwrap();
-        let digest = crate::elevation::check_digest(installation.image(), expected).unwrap();
-        assert_eq!(digest, expected);
-        installation.revalidate().unwrap();
-    }
-    #[test]
     fn native_installation_rejects_portable_fixture_before_opening_helper_or_launching() {
         let fixture = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -425,7 +556,14 @@ mod tests {
             b"never executable",
         )
         .unwrap();
-        assert!(Installation::open(fixture.path()).is_err());
+        assert!(
+            installation_path(
+                fixture.path().to_str().unwrap(),
+                &program_files().unwrap(),
+                &system_windows().unwrap(),
+            )
+            .is_err()
+        );
         assert_eq!(
             std::fs::read(fixture.path().join("isohopper-helper.exe")).unwrap(),
             b"never executable"

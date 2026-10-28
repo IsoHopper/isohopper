@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Read-only observations of a caller-retained Windows process and its primary
-//! token. These establish no pipe ownership, trusted publisher, application
-//! identity, elevation policy or permission to perform an operation.
+//! token. Optional protected-installation binding correlates its native image
+//! name with a retained installed file, without proving mapped code identity.
+//! Neither observation establishes pipe ownership, publisher trust, elevation
+//! policy or permission to perform an operation.
 //!
 //! Token fields are queried from one token with a stable modification stamp,
 //! then compared with the process's freshly reopened primary token. A retained
@@ -18,6 +20,8 @@ pub enum PeerError {
     Exited,
     #[error("peer process or primary token changed")]
     Changed,
+    #[error("protected Windows installation check failed: {0}")]
+    Installation(String),
     #[error("Windows peer query failed at {stage}: {source}")]
     Io {
         stage: &'static str,

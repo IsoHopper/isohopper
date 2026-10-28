@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::{PeerError, PeerEvidence, TokenEvidence, decode};
+use crate::windows_installation::{InstalledRole, MachineInstallation, wide_name};
 use std::{
     ffi::c_void,
     io,
     mem::{offset_of, size_of},
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     ptr,
+    sync::Arc,
 };
 use windows_sys::Win32::{
     Foundation::{ERROR_INSUFFICIENT_BUFFER, FILETIME, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
@@ -15,8 +17,13 @@ use windows_sys::Win32::{
         TOKEN_STATISTICS, TOKEN_USER, TokenElevation, TokenElevationType, TokenIntegrityLevel,
         TokenIsAppContainer, TokenLogonSid, TokenSessionId, TokenStatistics, TokenUser,
     },
-    System::Threading::{GetProcessId, GetProcessTimes, OpenProcessToken, WaitForSingleObject},
+    System::Threading::{
+        GetProcessId, GetProcessTimes, OpenProcessToken, PROCESS_NAME_NATIVE,
+        QueryFullProcessImageNameW, WaitForSingleObject,
+    },
 };
+#[path = "installed.rs"]
+mod installed;
 #[path = "source.rs"]
 mod source;
 
@@ -44,6 +51,7 @@ const _: () = {
 pub struct ProcessPeer {
     process: OwnedHandle,
     evidence: PeerEvidence,
+    installation: Option<(Arc<MachineInstallation>, InstalledRole)>,
 }
 
 impl ProcessPeer {
@@ -56,7 +64,29 @@ impl ProcessPeer {
     /// authenticated it. In particular, this does not bind a named-pipe peer.
     pub fn from_owned_handle(process: OwnedHandle) -> Result<Self, PeerError> {
         let evidence = observe(&process)?;
-        Ok(Self { process, evidence })
+        Ok(Self {
+            process,
+            evidence,
+            installation: None,
+        })
+    }
+
+    /// Retain the protected installation and correlate this process's native
+    /// image name with its fixed role. No process-reported path is opened.
+    /// Revalidation repeats the binding while this peer is owned by a pipe.
+    /// This is not mapped-image file-ID proof, injection prevention, or write
+    /// authority. A peer cannot replace an existing installation binding.
+    pub fn bind_installation(
+        mut self,
+        installation: Arc<MachineInstallation>,
+        role: InstalledRole,
+    ) -> Result<Self, PeerError> {
+        if self.installation.is_some() {
+            return Err(PeerError::Invalid("peer installation already bound"));
+        }
+        self.installation = Some((installation, role));
+        self.revalidate()?;
+        Ok(self)
     }
 
     /// Historical evidence. Retaining a process handle does not freeze its
@@ -69,7 +99,16 @@ impl ProcessPeer {
     /// compare every captured field with the baseline. Errors do not replace
     /// the baseline. This is a point-in-time check, not a liveness/token lease.
     pub fn revalidate(&mut self) -> Result<&PeerEvidence, PeerError> {
-        decode::unchanged(&self.evidence, &observe(&self.process)?)?;
+        if let Some((installation, role)) = &self.installation {
+            installed::check(&mut InstalledPeer {
+                process: &self.process,
+                evidence: &self.evidence,
+                installation,
+                role: *role,
+            })?;
+        } else {
+            decode::unchanged(&self.evidence, &observe(&self.process)?)?;
+        }
         Ok(&self.evidence)
     }
 
@@ -89,7 +128,49 @@ impl ProcessPeer {
     /// No path is opened or original remote handle exposed, and no write
     /// authority is granted.
     pub fn receive_source_file(&mut self, remote: u64) -> Result<std::fs::File, PeerError> {
-        source::receive(&self.process, &self.evidence, remote)
+        self.revalidate()?;
+        let result = source::receive(&self.process, &self.evidence, remote);
+        self.revalidate()?;
+        result
+    }
+}
+
+struct InstalledPeer<'a> {
+    process: &'a OwnedHandle,
+    evidence: &'a PeerEvidence,
+    installation: &'a MachineInstallation,
+    role: InstalledRole,
+}
+impl installed::Backend for InstalledPeer<'_> {
+    fn peer(&mut self) -> Result<(), PeerError> {
+        decode::unchanged(self.evidence, &observe(self.process)?)
+    }
+    fn installation(&mut self) -> Result<(), PeerError> {
+        self.installation
+            .revalidate()
+            .map_err(PeerError::Installation)
+    }
+    fn installed_image(&self) -> &[u16] {
+        self.installation.native_name(self.role)
+    }
+    fn process_image(&mut self) -> Result<Vec<u16>, PeerError> {
+        let mut buffer = vec![u16::MAX; 32768];
+        let mut length = buffer.len() as u32;
+        // SAFETY: the retained process handle has QUERY_LIMITED_INFORMATION.
+        // Bounded UTF-16 output is used only for an exact name comparison.
+        // https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew
+        if unsafe {
+            QueryFullProcessImageNameW(
+                self.process.as_raw_handle(),
+                PROCESS_NAME_NATIVE,
+                buffer.as_mut_ptr(),
+                &mut length,
+            )
+        } == 0
+        {
+            return Err(os_error("process native image name"));
+        }
+        wide_name(&buffer, length as usize).map_err(PeerError::Installation)
     }
 }
 
