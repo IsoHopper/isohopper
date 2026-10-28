@@ -142,15 +142,13 @@ jobs:
           compression-level: 0
           retention-days: 3
 
-  publish:
+  verify_packages:
+    # Public releases require real USB preparation and OS boot integration tests.
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    permissions:
-      contents: write
     env:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -162,14 +160,3 @@ jobs:
           merge-multiple: true
       - name: Verify complete release and write checksums
         run: python3 scripts/verify-release.py --directory dist/release --tag "$RELEASE_TAG" --source-revision "$GITHUB_SHA"
-      - name: Publish experimental release
-        run: |
-          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
-            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
-              -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$GITHUB_SHA"
-          fi
-          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)" = "$GITHUB_SHA"
-          gh release create "$RELEASE_TAG" dist/release/* \
-            --verify-tag --draft --prerelease --latest=false \
-            --title "IsoHopper $RELEASE_TAG" --notes-file dist/release-notes.md
-          gh release edit "$RELEASE_TAG" --draft=false
