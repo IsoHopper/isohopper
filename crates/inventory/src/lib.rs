@@ -8,6 +8,7 @@ use thiserror::Error;
 mod linux;
 mod macos;
 mod native;
+mod windows;
 pub use native::NativeCommandRunner;
 
 const MAX_OUTPUT: usize = 2 * 1024 * 1024;
@@ -81,6 +82,7 @@ pub fn discover_for(
     match platform {
         Platform::MacOs => macos::discover(runner),
         Platform::Linux => linux::discover(runner),
+        Platform::Windows => windows::discover(runner),
         other => Err(InventoryError::Unsupported(other)),
     }
 }

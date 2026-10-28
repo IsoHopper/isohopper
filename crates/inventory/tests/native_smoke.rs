@@ -44,3 +44,22 @@ fn native_linux_inventory_is_read_only_and_fail_closed() {
         inventory.disks.len()
     );
 }
+
+/// Opt-in only: the provider reads Windows storage metadata, never device bytes.
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "requires Windows with the Storage PowerShell module"]
+fn native_windows_inventory_is_read_only_and_fail_closed() {
+    let inventory = isohopper_inventory::discover().unwrap();
+    assert_eq!(inventory.source, "windows_powershell");
+    for disk in &inventory.disks {
+        assert!(!disk.safety_checks_complete);
+        assert!(!isohopper_core::guard::evaluate(disk, &Default::default()).allowed);
+    }
+    println!(
+        "devices={}, warnings={}, blocked={}",
+        inventory.disks.len(),
+        inventory.warnings.len(),
+        inventory.disks.len()
+    );
+}
