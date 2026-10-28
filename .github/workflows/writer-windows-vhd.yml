@@ -96,8 +96,18 @@ jobs:
       - name: Inspect protected storage and retained disk identity without writes
         shell: bash
         run: |
-          cargo +1.98.0 test --locked -p isohopper-helper --test windows_protected
-          cargo +1.98.0 test --locked -p isohopper-helper --test probe_command
+          if cargo +1.98.0 test --locked -p isohopper-helper --lib --test windows_protected --test probe_command > helper-unit.log 2>&1; then
+            cat helper-unit.log
+          else
+            python - <<'PY'
+          from pathlib import Path
+          text = Path('helper-unit.log').read_text(errors='replace')[-12000:]
+          print(text)
+          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=Windows helper checks failed::' + text)
+          PY
+            exit 1
+          fi
           failed=0
           for probe in \
             windows_protected:windows_protected_system_and_executable_mappings_are_read_only \

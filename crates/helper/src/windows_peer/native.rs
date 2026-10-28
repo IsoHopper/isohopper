@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::{PeerError, PeerEvidence, TokenEvidence, decode};
 use std::{
+    ffi::c_void,
     io,
     mem::{offset_of, size_of},
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
@@ -9,15 +10,19 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{ERROR_INSUFFICIENT_BUFFER, FILETIME, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
     Security::{
-        GetTokenInformation, SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS,
-        TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_STATISTICS, TOKEN_USER, TokenElevation,
-        TokenElevationType, TokenIntegrityLevel, TokenIsAppContainer, TokenLogonSid,
-        TokenSessionId, TokenStatistics, TokenUser,
+        GetTokenInformation, SID_AND_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_ELEVATION_TYPE,
+        TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+        TOKEN_STATISTICS, TOKEN_USER, TokenElevation, TokenElevationType, TokenIntegrityLevel,
+        TokenIsAppContainer, TokenLogonSid, TokenSessionId, TokenStatistics, TokenUser,
     },
     System::Threading::{GetProcessId, GetProcessTimes, OpenProcessToken, WaitForSingleObject},
 };
 
 const _: () = {
+    assert!(size_of::<TOKEN_ELEVATION>() == 4);
+    assert!(offset_of!(TOKEN_ELEVATION, TokenIsElevated) == 0);
+    assert!(size_of::<TOKEN_ELEVATION_TYPE>() == 4);
+    assert!(size_of::<u32>() == 4);
     assert!(size_of::<TOKEN_STATISTICS>() == 56);
     assert!(offset_of!(TOKEN_STATISTICS, TokenId) == 0);
     assert!(offset_of!(TOKEN_STATISTICS, AuthenticationId) == 8);
@@ -152,27 +157,42 @@ fn query(
     class: TOKEN_INFORMATION_CLASS,
     stage: &'static str,
 ) -> Result<TokenBuffer, PeerError> {
-    let mut needed = 0;
-    // SAFETY: null output with zero length is the documented sizing request.
-    let sized = unsafe {
-        GetTokenInformation(
-            token.as_raw_handle(),
-            class,
-            ptr::null_mut(),
-            0,
-            &mut needed,
-        )
-    };
-    let error = io::Error::last_os_error();
-    if sized != 0 || error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
-        return Err(if sized == 0 {
-            PeerError::Io {
-                stage,
-                source: error,
-            }
+    query_with(class, stage, |buffer, length, returned| {
+        // SAFETY: query_with provides either a null/zero sizing request or
+        // bounded initialized aligned storage. This call is synchronous and
+        // the retained token and output locations remain live until it returns.
+        if unsafe { GetTokenInformation(token.as_raw_handle(), class, buffer, length, returned) }
+            == 0
+        {
+            Err(io::Error::last_os_error())
         } else {
-            PeerError::Invalid("unexpected token sizing success")
-        });
+            Ok(())
+        }
+    })
+}
+
+fn query_with(
+    class: TOKEN_INFORMATION_CLASS,
+    stage: &'static str,
+    mut call: impl FnMut(*mut c_void, u32, &mut u32) -> io::Result<()>,
+) -> Result<TokenBuffer, PeerError> {
+    // These classes have documented fixed DWORD/enum outputs. In particular,
+    // TokenElevation can reject a null/zero probe with ERROR_BAD_LENGTH. Supply
+    // the SDK-sized buffer directly; do not reinterpret any failed call.
+    let fixed = [
+        TokenElevation,
+        TokenElevationType,
+        TokenSessionId,
+        TokenIsAppContainer,
+    ]
+    .contains(&class);
+    let mut needed = if fixed { 4 } else { 0 };
+    if !fixed {
+        match call(ptr::null_mut(), 0, &mut needed) {
+            Err(error) if error.raw_os_error() == Some(ERROR_INSUFFICIENT_BUFFER as i32) => {}
+            Err(source) => return Err(PeerError::Io { stage, source }),
+            Ok(()) => return Err(PeerError::Invalid("unexpected token sizing success")),
+        }
     }
     let length = needed as usize;
     if length == 0 || length > decode::MAX_TOKEN_BYTES {
@@ -180,21 +200,9 @@ fn query(
     }
     let mut storage = vec![0u64; length.div_ceil(size_of::<u64>())];
     let mut returned = 0;
-    // SAFETY: bounded initialized aligned storage has at least needed bytes.
-    // This synchronous query finishes before the storage can move or be freed.
-    if unsafe {
-        GetTokenInformation(
-            token.as_raw_handle(),
-            class,
-            storage.as_mut_ptr().cast(),
-            needed,
-            &mut returned,
-        )
-    } == 0
-    {
-        return Err(os_error(stage));
-    }
-    if returned == 0 || returned > needed {
+    call(storage.as_mut_ptr().cast(), needed, &mut returned)
+        .map_err(|source| PeerError::Io { stage, source })?;
+    if returned == 0 || returned > needed || (fixed && returned != needed) {
         return Err(PeerError::Invalid("token returned byte count"));
     }
     Ok(TokenBuffer {
@@ -249,4 +257,103 @@ fn observe(process: &OwnedHandle) -> Result<PeerEvidence, PeerError> {
             modified_id: before.modified,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_token_outputs_use_one_sdk_sized_call_without_a_probe() {
+        for class in [
+            TokenElevation,
+            TokenElevationType,
+            TokenSessionId,
+            TokenIsAppContainer,
+        ] {
+            let mut calls = 0;
+            let result = query_with(class, "fixed test", |buffer, length, returned| {
+                calls += 1;
+                assert!(!buffer.is_null());
+                assert_eq!(length, 4);
+                assert_eq!(buffer as usize % align_of::<u32>(), 0);
+                // SAFETY: query_with supplies four initialized aligned bytes.
+                unsafe { buffer.cast::<u32>().write(0x1234_5678) };
+                *returned = 4;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(result.bytes(), 0x1234_5678u32.to_ne_bytes());
+        }
+    }
+
+    #[test]
+    fn fixed_token_outputs_reject_partial_or_excess_returned_lengths() {
+        for returned_length in [0, 1, 2, 3, 5, u32::MAX] {
+            assert!(matches!(
+                query_with(TokenElevation, "fixed test", |_, _, returned| {
+                    *returned = returned_length;
+                    Ok(())
+                }),
+                Err(PeerError::Invalid("token returned byte count"))
+            ));
+        }
+    }
+
+    #[test]
+    fn failed_fixed_and_variable_queries_never_infer_a_value() {
+        for class in [TokenElevation, TokenUser] {
+            for code in [5, 24, 50, 122] {
+                let mut calls = 0;
+                let result = query_with(class, "failure test", |_, _, returned| {
+                    calls += 1;
+                    // Even plausible output metadata cannot turn failure
+                    // into valid evidence. A variable 122 only permits retry.
+                    *returned = 4;
+                    Err(io::Error::from_raw_os_error(code))
+                });
+                assert!(
+                    matches!(result, Err(PeerError::Io { stage: "failure test", source })
+                    if source.raw_os_error() == Some(code))
+                );
+                assert_eq!(
+                    calls,
+                    if class == TokenUser && code == 122 {
+                        2
+                    } else {
+                        1
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn variable_outputs_keep_the_bounded_insufficient_buffer_probe() {
+        let mut calls = 0;
+        let result = query_with(TokenUser, "variable test", |buffer, length, returned| {
+            calls += 1;
+            *returned = 16;
+            if calls == 1 {
+                assert!(buffer.is_null());
+                assert_eq!(length, 0);
+                Err(io::Error::from_raw_os_error(
+                    ERROR_INSUFFICIENT_BUFFER as i32,
+                ))
+            } else {
+                assert!(!buffer.is_null());
+                assert_eq!(length, 16);
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(result.bytes(), [0; 16]);
+
+        assert!(matches!(
+            query_with(TokenUser, "variable test", |_, _, _| Ok(())),
+            Err(PeerError::Invalid("unexpected token sizing success"))
+        ));
+    }
 }
