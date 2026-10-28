@@ -41,6 +41,9 @@ jobs:
             exit 1
           fi
 
+      - name: Check Windows helper staging with mock executables
+        run: python3 -m unittest discover -s scripts -p 'test_stage_windows_helper.py'
+
   check:
     name: Rust and Studio
     runs-on: ubuntu-24.04
