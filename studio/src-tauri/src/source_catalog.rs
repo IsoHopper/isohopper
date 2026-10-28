@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 S33G
 //! Backend-owned source handles. Source IDs are session-local references, not paths.
-use isohopper_config::verify::{Verification, opened_file};
+use isohopper_config::verify::{Verification, opened_file, opened_file_with_progress};
 use same_file::Handle;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{File, Metadata},
-    io::Seek,
+    io::{self, Seek},
     sync::{Arc, Mutex},
     time::SystemTime,
 };
@@ -69,12 +69,16 @@ impl RetainedSource {
         Ok(())
     }
 
-    fn verify(&mut self) -> Result<(), String> {
+    fn verify_with_progress(
+        &mut self,
+        progress: impl FnMut(u64) -> io::Result<()>,
+    ) -> Result<(), String> {
         self.unchanged()?;
-        let verified = opened_file(
+        let verified = opened_file_with_progress(
             self.handle.as_file_mut(),
             "sha256",
             Some(&self.info.verification.digest),
+            progress,
         )
         .map_err(|e| format!("Source verification failed: {e}"))?;
         if verified.bytes != self.info.bytes {
@@ -292,11 +296,32 @@ impl SourceBatch {
     /// checks. The eventual copy must verify the bytes it consumes and readback.
     #[allow(dead_code)] // Consumed by the forthcoming native preparation job.
     pub fn verify_all(&self) -> Result<Vec<SourceInfo>, String> {
-        let infos = self
-            .leases
-            .iter()
-            .map(|lease| lease.with_verified_source(|_, info| Ok(info.clone())))
-            .collect::<Result<Vec<_>, _>>()?;
+        self.verify_all_with_progress(|_, _| Ok(()))
+    }
+
+    /// Report aggregate hashed bytes and the fixed imported total before each
+    /// bounded read. A callback error aborts the batch without a partial report.
+    /// The callback must not acquire a source cursor; that cursor remains locked.
+    pub fn verify_all_with_progress(
+        &self,
+        mut progress: impl FnMut(u64, u64) -> Result<(), String>,
+    ) -> Result<Vec<SourceInfo>, String> {
+        let total = self.leases.iter().try_fold(0_u64, |total, lease| {
+            let source = lease.0.lock().map_err(|_| "Source lock is unavailable.")?;
+            total
+                .checked_add(source.info.bytes)
+                .ok_or("Source byte total overflow.")
+        })?;
+        let mut completed = 0;
+        let mut infos = Vec::with_capacity(self.leases.len());
+        for lease in &self.leases {
+            let info = lease.with_verified_source_with_progress(
+                |bytes, _| progress(completed + bytes, total),
+                |_, info| Ok(info.clone()),
+            )?;
+            completed += info.bytes;
+            infos.push(info);
+        }
         self.check_all_unchanged()?;
         Ok(infos)
     }
@@ -315,9 +340,21 @@ impl SourceBatch {
     #[allow(dead_code)] // Native preparation only; never exposed to the renderer.
     pub fn visit_verified(
         &self,
+        visit: impl FnMut(&File, &SourceInfo) -> Result<(), String>,
+    ) -> Result<Vec<SourceInfo>, String> {
+        self.visit_verified_with_progress(|_, _| Ok(()), visit)
+    }
+
+    /// Like `visit_verified`, with cooperative hash progress/cancellation.
+    /// Every hash and the first complete stability check precede any visitor.
+    /// Synchronous filesystem calls and a visitor already running cannot be
+    /// forcibly interrupted; visitors must handle their own cancellation.
+    pub fn visit_verified_with_progress(
+        &self,
+        progress: impl FnMut(u64, u64) -> Result<(), String>,
         mut visit: impl FnMut(&File, &SourceInfo) -> Result<(), String>,
     ) -> Result<Vec<SourceInfo>, String> {
-        let infos = self.verify_all()?;
+        let infos = self.verify_all_with_progress(progress)?;
         for (lease, info) in self.leases.iter().zip(&infos) {
             let mut source = lease.0.lock().map_err(|_| "Source lock is unavailable.")?;
             source.unchanged()?;
@@ -359,8 +396,25 @@ impl SourceLease {
         &self,
         use_source: impl FnOnce(&mut File, &SourceInfo) -> Result<T, String>,
     ) -> Result<T, String> {
+        self.with_verified_source_with_progress(|_, _| Ok(()), use_source)
+    }
+
+    /// Like `with_verified_source`, reporting bytes and the imported total.
+    /// The cursor lock and retained file cover hashing and the entire callback;
+    /// no pathname is reopened between verification and use.
+    pub fn with_verified_source_with_progress<T>(
+        &self,
+        mut progress: impl FnMut(u64, u64) -> Result<(), String>,
+        use_source: impl FnOnce(&mut File, &SourceInfo) -> Result<T, String>,
+    ) -> Result<T, String> {
         let mut source = self.0.lock().map_err(|_| "Source lock is unavailable.")?;
-        source.verify()?;
+        let bytes = source.info.bytes;
+        source.verify_with_progress(|completed| {
+            if completed > bytes {
+                return Err(io::Error::other("Source grew while hashing."));
+            }
+            progress(completed, bytes).map_err(io::Error::other)
+        })?;
         let info = source.info.clone();
         let result = use_source(source.handle.as_file_mut(), &info);
         let stability = source.unchanged();
@@ -687,6 +741,122 @@ mod tests {
         assert_eq!(retried, 2);
         drop(batch);
         catalog.release_sources(&ids).unwrap();
+    }
+
+    #[test]
+    fn cancelled_batch_hash_stops_reading_before_later_sources_or_visitors() {
+        let root = tempfile::tempdir().unwrap();
+        let mut catalog = SourceCatalog::default();
+        let infos = catalog
+            .insert_batch(vec![
+                prepared(root.path(), "large.iso", &vec![b'a'; 1_000_000]),
+                prepared(root.path(), "last.iso", b"xyz"),
+            ])
+            .unwrap();
+        let ids: Vec<_> = infos.iter().map(|info| info.source_id.clone()).collect();
+        let batch = catalog.lease_batch(&ids).unwrap();
+        batch.leases[1]
+            .0
+            .lock()
+            .unwrap()
+            .handle
+            .as_file_mut()
+            .rewind()
+            .unwrap();
+        let mut visits = 0;
+        let mut progress = Vec::new();
+        let error = batch
+            .visit_verified_with_progress(
+                |done, total| {
+                    progress.push((done, total));
+                    if done > 0 {
+                        Err("cancelled by test".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_, _| {
+                    visits += 1;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(error.contains("cancelled by test"));
+        assert_eq!(progress, [(0, 1_000_003), (128 * 1024, 1_000_003)]);
+        assert_eq!(visits, 0);
+        assert_eq!(
+            batch.leases[0]
+                .0
+                .lock()
+                .unwrap()
+                .handle
+                .as_file_mut()
+                .stream_position()
+                .unwrap(),
+            128 * 1024
+        );
+        assert_eq!(
+            batch.leases[1]
+                .0
+                .lock()
+                .unwrap()
+                .handle
+                .as_file_mut()
+                .stream_position()
+                .unwrap(),
+            0
+        );
+        assert!(catalog.release_sources(&ids).is_err());
+        let mut completed = 0;
+        let verified = batch
+            .visit_verified_with_progress(
+                |done, total| {
+                    assert!(done >= completed && done <= total);
+                    completed = done;
+                    Ok(())
+                },
+                |mut file, info| {
+                    assert_eq!(file.stream_position().unwrap(), 0);
+                    visits += 1;
+                    assert!(info.bytes > 0);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(completed, 1_000_003);
+        assert_eq!(verified.len(), 2);
+        assert_eq!(visits, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn progress_callback_cannot_hide_an_earlier_source_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut catalog = SourceCatalog::default();
+        let infos = catalog
+            .insert_batch(vec![
+                prepared(root.path(), "first.iso", b"abc"),
+                prepared(root.path(), "last.iso", b"xyz"),
+            ])
+            .unwrap();
+        let ids: Vec<_> = infos.iter().map(|info| info.source_id.clone()).collect();
+        let batch = catalog.lease_batch(&ids).unwrap();
+        let mut visits = 0;
+        let result = batch.visit_verified_with_progress(
+            |done, total| {
+                if done == total {
+                    std::fs::write(root.path().join("first.iso"), b"changed length").unwrap();
+                }
+                Ok(())
+            },
+            |_, _| {
+                visits += 1;
+                Ok(())
+            },
+        );
+        assert!(result.unwrap_err().contains("changed"));
+        assert_eq!(visits, 0);
+        assert!(catalog.release_sources(&ids).is_err());
     }
 
     #[test]
