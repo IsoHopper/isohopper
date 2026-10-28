@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::{
     HandleObservation, MAX_INTERFACE_UNITS, TargetError, TargetObservation, parse_interfaces,
+    resolve_interface,
     state::{self, Backend},
 };
 use crate::{
@@ -35,6 +36,32 @@ pub struct BoundTarget {
 }
 
 impl BoundTarget {
+    /// Acquire a read-only target using a current disk-interface selector.
+    /// The candidate is never opened directly: only one matching entry from
+    /// the current GUID_DEVINTERFACE_DISK list may be opened, using that entry's
+    /// exact spelling. Native identity, geometry and provider/volume coverage
+    /// are derived from retained handles; no caller snapshot is trusted.
+    ///
+    /// This performs no write, lock, dismount or elevation and grants no
+    /// preparation permission. Synchronous device/provider queries may block.
+    pub fn open_present_interface(candidate: &str) -> Result<Self, TargetError> {
+        let interfaces = present_interfaces()?;
+        let selected = resolve_interface(candidate, &interfaces)?;
+        let target = open_enumerated_interface(selected)?;
+        // SAFETY: the selected interface was opened read-only, synchronously,
+        // without OVERLAPPED; this owner retains it throughout every query.
+        let initial = unsafe { observe_handle(&target)? };
+        // SAFETY: ownership of that same synchronous read-only handle moves
+        // into the existing full binding path, with its own observed snapshot.
+        let bound = unsafe { Self::from_owned_handle(target, &initial.device)? };
+        if bound.observation.handle != initial {
+            return Err(TargetError::Mismatch(
+                "selected interface changed during binding",
+            ));
+        }
+        Ok(bound)
+    }
+
     /// Correlate a fresh provider record with an already retained target.
     /// The target path is never reconstructed from an OS disk number. Full-path
     /// ASCII case comparison selects one present GUID_DEVINTERFACE_DISK entry;
@@ -146,21 +173,26 @@ impl Backend for Native<'_> {
     fn open(&mut self, path: &str) -> Result<OwnedHandle, TargetError> {
         // state::refresh selected this exact entry from the immediately preceding
         // present disk-interface query. No string enters a shell or command.
-        OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .open(path)
-            .map(Into::into)
-            .map_err(|source| TargetError::Io {
-                stage: "opening provider disk interface read-only",
-                source,
-            })
+        open_enumerated_interface(path)
     }
     fn inspect(&mut self, handle: &OwnedHandle) -> Result<HandleObservation, TargetError> {
         // SAFETY: every provider handle comes from the synchronous read-only
         // open above and remains owned while all metadata queries complete.
         unsafe { observe_handle(handle) }
     }
+}
+
+// Both callers first resolve this exact string from the current CM list.
+fn open_enumerated_interface(path: &str) -> Result<OwnedHandle, TargetError> {
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(path)
+        .map(Into::into)
+        .map_err(|source| TargetError::Io {
+            stage: "opening provider disk interface read-only",
+            source,
+        })
 }
 
 unsafe fn observe_handle(handle: &OwnedHandle) -> Result<HandleObservation, TargetError> {

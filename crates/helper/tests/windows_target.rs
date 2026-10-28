@@ -372,8 +372,27 @@ fn windows_vhd_provider_path_binds_to_retained_target() -> Result<(), Box<dyn st
     let target = OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .open(path)?;
+        .open(&path)?;
     assert_readback_binding(&target, number)?;
+    let ordinary_path = directory.path().join("ordinary-file.img");
+    let ordinary_contents = b"owned non-device fixture";
+    std::fs::write(&ordinary_path, ordinary_contents)?;
+    // Neither an ordinary file nor this VHD's valid PhysicalDrive alias is a
+    // CM disk-interface selection. Refusal must precede file/device inspection.
+    for candidate in [
+        ordinary_path
+            .to_str()
+            .ok_or("fixture path is not Unicode")?,
+        path.to_str().ok_or("VHD path is not Unicode")?,
+    ] {
+        assert!(matches!(
+            BoundTarget::open_present_interface(candidate),
+            Err(TargetError::Invalid(
+                "provider path has no matching present disk interface"
+            ))
+        ));
+    }
+    assert_eq!(std::fs::read(ordinary_path)?, ordinary_contents);
     // SAFETY: this owned VHD's handle is live, read-only and synchronous.
     let identity = unsafe { query_identity(&target) };
     // Record only typed issue categories and numeric disk/partition keys. This
@@ -407,8 +426,20 @@ fn windows_vhd_provider_path_binds_to_retained_target() -> Result<(), Box<dyn st
             assert!(bound.observation().partitions.is_empty());
             let first = bound.observation().clone();
             assert_eq!(bound.revalidate()?, &first);
+            // Obtain a second owner using only the observed interface selector,
+            // without passing it a handle, snapshot, serial or device number.
+            // Different ASCII case must still preserve the actual CM spelling.
+            let mut acquired =
+                BoundTarget::open_present_interface(&first.interface_path.to_ascii_uppercase())?;
+            assert_eq!(acquired.observation(), &first);
+            assert_eq!(acquired.revalidate()?, &first);
+            assert_eq!(bound.revalidate()?, &first);
+            drop(acquired);
             println!(
                 "Owned blank VHD provider path, retained native identity and empty partition topology agree across a fresh collection; no physical write or safety approval"
+            );
+            println!(
+                "Owned VHD read-only interface acquisition agrees with retained target; ordinary-file and PhysicalDrive selectors refused"
             );
             drop(bound);
         }
