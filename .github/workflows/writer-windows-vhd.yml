@@ -96,7 +96,7 @@ jobs:
       - name: Inspect protected storage and retained disk identity without writes
         shell: bash
         run: |
-          if cargo +1.98.0 test --locked -p isohopper-helper --lib --test windows_protected --test windows_source_transfer --test probe_command > helper-unit.log 2>&1 &&
+          if cargo +1.98.0 test --locked -p isohopper-helper --lib --test windows_protected --test windows_source_transfer --test windows_installation --test probe_command > helper-unit.log 2>&1 &&
              cargo +1.98.0 test --locked -p isohopper-helper --lib windows_peer::native::tests::native_linked_token_relationship_is_observed_without_elevation -- --exact --ignored --nocapture >> helper-unit.log 2>&1; then
             cat helper-unit.log
           else
@@ -115,16 +115,18 @@ jobs:
             windows_peer:windows_peer_observes_current_process_and_owned_child \
             windows_source_transfer:windows_source_transfer_retains_readonly_file_from_owned_child \
             windows_pipe:windows_pipe_checks_peers_deadlines_and_frames \
+            windows_pipe:windows_pipe_transfers_source_from_retained_peer \
             windows_identity:windows_vhd_identity_queries_agree_or_report_unsupported \
             windows_target:windows_vhd_provider_path_binds_to_retained_target \
             windows_pagefile_probe:windows_active_pagefile_zero_access_metadata_probe; do
             target="${probe%%:*}"
             test_name="${probe#*:}"
-            if cargo +1.98.0 test --locked -p isohopper-helper --test "$target" "$test_name" -- --ignored --exact --nocapture --test-threads=1 > "$target.log" 2>&1; then
-              cat "$target.log"
+            log_file="${target}-${test_name}.log"
+            if cargo +1.98.0 test --locked -p isohopper-helper --test "$target" "$test_name" -- --ignored --exact --nocapture --test-threads=1 > "$log_file" 2>&1; then
+              cat "$log_file"
             else
               failed=1
-              python - "$target.log" <<'PY'
+              python - "$log_file" <<'PY'
           import sys
           from pathlib import Path
           text = Path(sys.argv[1]).read_text(errors='replace')[-12000:]
@@ -262,13 +264,15 @@ jobs:
               'windows_pagefiles.log': r'active_pagefiles=\d+',
               'windows_encryption.log': r'BitLocker provider (?:observed \d+ volumes; no write authorization|unavailable: (?:MissingNamespace|MissingClass); encryption state unknown)',
               'windows_pools.log': r'Observed \d+ physical disks; \d+ have concrete pool associations',
-              'windows_peer.log': r'Windows peer observation passed: current=1 child=1 exited_child_rejected=1; no UAC or device access',
-              'windows_pipe.log': r'Windows pipe transport passed: roundtrip=1 cross_process=1 immediate_io=1 clean_eof=1 immediate_eof=1 partial_payload_eof=1 first_instance=1 wrong_peer=1 connect_timeout=1 connect_cancel=1 read_timeout=1 read_cancel=1 write_timeout=1 partial_header_timeout=1; no UAC or device access',
-              'windows_target.log': r'(?:Owned VHD interface selection: match=(?:exact|ascii_case_only)|Owned blank VHD provider path, retained native identity and empty partition topology agree across a fresh collection; no physical write or safety approval|UNSUPPORTED: owned VHD (?:identity is random \(flags \d+\)|has no native device GUID|driver lacks the device identity query); provider binding was refused, not passed)',
-              'windows_identity.log': r'Owned (?:read-only VHD identity agrees across retained handles; no physical device tested|VHD reports a random GUID \(flags \d+\); identity binding remains unsupported, not accepted|VHD has no device GUID; identity binding remains unsupported, not accepted|VHD driver does not implement the identity query \(Win32 Some\(\d+\)\); binding remains unsupported)',
-              'windows_protected.log': r'(?:Protected storage observations: successful_mappings=\d+, actual_volume_overlap_refusals=\d+, unsupported_executable_roles=\d+|UNSUPPORTED executable role=(?:Helper|Caller): external-backing query returned Win32 1; mapping remains blocked)',
+              'windows_peer-windows_peer_observes_current_process_and_owned_child.log': r'Windows peer observation passed: current=1 child=1 exited_child_rejected=1; no UAC or device access',
+              'windows_pipe-windows_pipe_checks_peers_deadlines_and_frames.log': r'Windows pipe transport passed: roundtrip=1 cross_process=1 immediate_io=1 clean_eof=1 immediate_eof=1 partial_payload_eof=1 first_instance=1 wrong_peer=1 connect_timeout=1 connect_cancel=1 read_timeout=1 read_cancel=1 write_timeout=1 partial_header_timeout=1; no UAC or device access',
+              'windows_source_transfer-windows_source_transfer_retains_readonly_file_from_owned_child.log': r'Windows source transfer passed: owned child, synchronous independent cursor, readonly sharing, invalid/non-file/closed/dead peer refusals; no UAC or devices',
+              'windows_pipe-windows_pipe_transfers_source_from_retained_peer.log': r'Windows pipe source transfer passed: framed_handle=1 retained_child=1 sha256=1 readonly=1 wrong_handle=1 closed_handle=1 cancellation=1 deadline=1 poisoned=1; no UAC or devices',
+              'windows_target-windows_vhd_provider_path_binds_to_retained_target.log': r'(?:Owned VHD interface selection: match=(?:exact|ascii_case_only)|Owned blank VHD provider path, retained native identity and empty partition topology agree across a fresh collection; no physical write or safety approval|UNSUPPORTED: owned VHD (?:identity is random \(flags \d+\)|has no native device GUID|driver lacks the device identity query); provider binding was refused, not passed)',
+              'windows_identity-windows_vhd_identity_queries_agree_or_report_unsupported.log': r'Owned (?:read-only VHD identity agrees across retained handles; no physical device tested|VHD reports a random GUID \(flags \d+\); identity binding remains unsupported, not accepted|VHD has no device GUID; identity binding remains unsupported, not accepted|VHD driver does not implement the identity query \(Win32 Some\(\d+\)\); binding remains unsupported)',
+              'windows_protected-windows_protected_system_and_executable_mappings_are_read_only.log': r'(?:Protected storage observations: successful_mappings=\d+, actual_volume_overlap_refusals=\d+, unsupported_executable_roles=\d+|UNSUPPORTED executable role=(?:Helper|Caller): external-backing query returned Win32 1; mapping remains blocked)',
               'volume-lock-test.log': r'(?:Owned formatted VHD provider binding agrees for 2 GPT partitions across a fresh collection; no physical device tested|VHD BitLocker observation: provider=(?:Reported\((?:Available|MissingNamespace|MissingClass)\)|QueryFailed\((?:UnsupportedPlatform|InvalidResponse|CommandFailed)\)), target_partitions=\d+, returned_volume_records=\d+)',
-              'windows_pagefile_probe.log': r'(?:UNSUPPORTED: no active pagefiles observed; zero handle mappings verified|UNSUPPORTED: stage=open active pagefile, Win32=\d+, count=\d+|OBSERVED: \d+ active pagefile metadata handles, GUIDs and extents remained consistent; no production exclusion or backing-ancestry claim)',
+              'windows_pagefile_probe-windows_active_pagefile_zero_access_metadata_probe.log': r'(?:UNSUPPORTED: no active pagefiles observed; zero handle mappings verified|UNSUPPORTED: stage=open active pagefile, Win32=\d+, count=\d+|OBSERVED: \d+ active pagefile metadata handles, GUIDs and extents remained consistent; no production exclusion or backing-ancestry claim)',
               'exfat-stage.log': r'Owned VHD exFAT staging: 3 nested files copied and SHA-256 verified after read-only reattachment; GPT and both FAT boot slots preserved; no physical disk or OS boot tested',
           }
           messages = []
@@ -279,7 +283,7 @@ jobs:
                       messages.append(message)
           if messages:
               print('::notice title=Windows observations::' + '%0A'.join(messages))
-          path = Path('windows_protected.log')
+          path = Path('windows_protected-windows_protected_system_and_executable_mappings_are_read_only.log')
           seen = set()
           for raw in re.findall(r'^PROTECTED_BACKING_DIAGNOSTIC (\{[^\r\n]{1,2048}\})$', path.read_text(errors='replace') if path.exists() else '', re.M):
               try:
