@@ -626,3 +626,291 @@ fn windows_pipe_checks_peers_deadlines_and_frames() -> Result<(), Box<dyn std::e
     );
     Ok(())
 }
+
+#[cfg(windows)]
+#[test]
+#[ignore = "internal controlled child offering an owned temporary source over a pipe"]
+fn windows_pipe_child_offers_source() -> Result<(), Box<dyn std::error::Error>> {
+    use isohopper_helper::{windows_peer::ProcessPeer, windows_pipe::connect};
+    use std::{
+        fs::OpenOptions,
+        io::{BufRead, Read, Seek, SeekFrom, Write},
+        os::windows::{
+            fs::OpenOptionsExt,
+            io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        },
+        ptr,
+        sync::atomic::AtomicBool,
+        time::{Duration, Instant},
+    };
+    use windows_sys::Win32::{
+        Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE},
+        System::Threading::{
+            CreateEventW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        },
+    };
+    if std::env::var_os("ISOHOPPER_PIPE_SOURCE_CHILD").as_deref() != Some(std::ffi::OsStr::new("1"))
+    {
+        return Ok(());
+    }
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut bootstrap = String::new();
+    input.by_ref().take(129).read_line(&mut bootstrap)?;
+    assert!(bootstrap.len() <= 128 && bootstrap.ends_with('\n'));
+    let fields: Vec<_> = bootstrap.split_ascii_whitespace().collect();
+    assert_eq!(fields.len(), 4);
+    let endpoint = Endpoint::from_nonce(fields[0])?;
+    let parent_id: u32 = fields[1].parse()?;
+    let created: u64 = fields[2].parse()?;
+    assert!(matches!(fields[3], "keep" | "close"));
+    // SAFETY: this gated fixture receives its live parent's identity through
+    // inherited stdin, and checks creation time before connecting to its pipe.
+    let raw = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            parent_id,
+        )
+    };
+    if raw.is_null() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: successful OpenProcess returned one new owned process handle.
+    let expected = ProcessPeer::from_owned_handle(unsafe { OwnedHandle::from_raw_handle(raw) })?;
+    assert_eq!(expected.evidence().creation_time, created);
+    // This parent-owned temporary path is test bootstrap only. Production
+    // transfer below receives a handle through the checked frame, not a path.
+    let path = std::env::var_os("ISOHOPPER_PIPE_SOURCE_FILE").ok_or("missing fixture path")?;
+    let mut source = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)?;
+    source.seek(SeekFrom::Start(7))?;
+    // SAFETY: one unnamed, noninheritable event, used as the wrong-type fixture.
+    let raw = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
+    if raw.is_null() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: successful CreateEventW returned one new owned event handle.
+    let event = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let cancel = AtomicBool::new(false);
+    let mut connection = connect(&endpoint, expected, deadline, &cancel)?;
+    let mut offer = Vec::new();
+    for handle in [source.as_raw_handle(), event.as_raw_handle()] {
+        offer.extend_from_slice(&(handle as usize as u64).to_le_bytes());
+    }
+    connection.write_frame(&offer, deadline, &cancel)?;
+    let mut source = Some(source);
+    if fields[3] == "close" {
+        drop(source.take());
+    }
+    // No further native object creation after closing the source: avoid handle
+    // number reuse. This independent lifecycle signal follows frame peer checks.
+    std::io::stderr().write_all(&[0x5a])?;
+    std::io::stderr().flush()?;
+    let mut done = [0];
+    input.read_exact(&mut done)?;
+    assert_eq!(done, [0x5a]);
+    if let Some(mut source) = source {
+        assert_eq!(
+            source.stream_position()?,
+            7,
+            "receiver changed sender cursor"
+        );
+        let mut byte = [0];
+        source.read_exact(&mut byte)?;
+        assert_eq!(byte, [7]);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "owned child, temporary file and local pipe only; no UAC or device access"]
+fn windows_pipe_transfers_source_from_retained_peer() -> Result<(), Box<dyn std::error::Error>> {
+    use isohopper_helper::{
+        windows_peer::{PeerError, ProcessPeer},
+        windows_pipe::{PipeError, Server},
+    };
+    use sha2::{Digest, Sha256};
+    use std::{
+        io::{Read, Seek, Write},
+        os::windows::io::{AsHandle, FromRawHandle, OwnedHandle},
+        process::{Child, Command, Stdio},
+        sync::{atomic::AtomicBool, mpsc},
+        thread,
+        time::{Duration, Instant},
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+    struct OwnChild(Child);
+    impl Drop for OwnChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn deadline() -> Instant {
+        Instant::now() + Duration::from_secs(15)
+    }
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("pipe-source.bin");
+    let bytes: Vec<_> = (0..8193).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &bytes)?;
+    // SAFETY: query only this retained parent identity for fixture bootstrap.
+    let raw = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            GetCurrentProcessId(),
+        )
+    };
+    if raw.is_null() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: successful OpenProcess returned one new owned process handle.
+    let parent = ProcessPeer::from_owned_handle(unsafe { OwnedHandle::from_raw_handle(raw) })?;
+    let active = AtomicBool::new(false);
+    for case in ["valid", "wrong", "closed", "cancelled", "expired"] {
+        let server = Server::create()?;
+        let bootstrap = format!(
+            "{} {} {} {}\n",
+            server.endpoint().nonce(),
+            parent.evidence().process_id,
+            parent.evidence().creation_time,
+            if case == "closed" { "close" } else { "keep" }
+        );
+        let mut child = OwnChild(
+            Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "windows_pipe_child_offers_source",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("ISOHOPPER_PIPE_SOURCE_CHILD", "1")
+                .env("ISOHOPPER_PIPE_SOURCE_FILE", &path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()?,
+        );
+        // Child's actual process handle includes duplication rights. The pipe
+        // consumes this same retained peer; no lookup by supplied PID occurs.
+        let expected = ProcessPeer::from_owned_handle(child.0.as_handle().try_clone_to_owned()?)?;
+        let mut stderr = child.0.stderr.take().ok_or("missing fixture stderr")?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let ready = thread::spawn(move || {
+            let mut signal = [0];
+            let result = stderr.read_exact(&mut signal).map(|()| signal);
+            let _ = sender.send((result, stderr));
+        });
+        child
+            .0
+            .stdin
+            .as_mut()
+            .ok_or("missing fixture stdin")?
+            .write_all(bootstrap.as_bytes())?;
+        let mut connection = server.accept(expected, deadline(), &active)?;
+        let offer = connection
+            .read_frame(deadline(), &active)?
+            .ok_or("missing source offer")?;
+        assert_eq!(offer.len(), 16);
+        let source_handle = u64::from_le_bytes(offer[..8].try_into()?);
+        let wrong_handle = u64::from_le_bytes(offer[8..].try_into()?);
+        let (signal, _stderr) = receiver.recv_timeout(Duration::from_secs(15))?;
+        assert_eq!(signal?, [0x5a]);
+        ready.join().unwrap();
+        let mut retained = None;
+        match case {
+            "valid" => {
+                let mut file =
+                    connection.receive_source_file(source_handle, deadline(), &active)?;
+                assert_eq!(file.stream_position()?, 0);
+                let mut actual = Vec::new();
+                file.read_to_end(&mut actual)?;
+                assert_eq!(actual, bytes);
+                assert_eq!(
+                    hex::encode(Sha256::digest(&actual)),
+                    "7e3691790cd64b19d4edb1a80e988214515abeb53aa0f34ffbfe4b4bf405d120"
+                );
+                assert!(
+                    file.write_all(&[0]).is_err(),
+                    "received source was writable"
+                );
+                retained = Some(file);
+            }
+            "wrong" => assert!(matches!(
+                connection.receive_source_file(wrong_handle, deadline(), &active),
+                Err(PipeError::Peer(_))
+            )),
+            "closed" => assert!(matches!(
+                connection.receive_source_file(source_handle, deadline(), &active),
+                Err(PipeError::Peer(PeerError::Io { stage: "duplicate source file", source }))
+                    if source.raw_os_error() == Some(6)
+            )),
+            "cancelled" => assert!(matches!(
+                connection.receive_source_file(source_handle, deadline(), &AtomicBool::new(true)),
+                Err(PipeError::Cancelled)
+            )),
+            "expired" => assert!(matches!(
+                connection.receive_source_file(source_handle, Instant::now(), &active),
+                Err(PipeError::TimedOut)
+            )),
+            _ => unreachable!(),
+        }
+        if case != "valid" {
+            assert!(matches!(
+                connection.receive_source_file(source_handle, deadline(), &active),
+                Err(PipeError::Closed)
+            ));
+            assert!(matches!(
+                connection.write_frame(b"after error", deadline(), &active),
+                Err(PipeError::Closed)
+            ));
+            assert!(matches!(
+                connection.read_frame(deadline(), &active),
+                Err(PipeError::Closed)
+            ));
+        }
+        drop(connection);
+        child
+            .0
+            .stdin
+            .take()
+            .ok_or("missing fixture stdin")?
+            .write_all(&[0x5a])?;
+        let exit_deadline = deadline();
+        loop {
+            if let Some(status) = child.0.try_wait()? {
+                assert!(status.success(), "source pipe child failed: {case}");
+                break;
+            }
+            if Instant::now() >= exit_deadline {
+                return Err("source pipe child exit timed out".into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if let Some(mut file) = retained {
+            file.rewind()?;
+            let mut actual = Vec::new();
+            file.read_to_end(&mut actual)?;
+            assert_eq!(
+                actual, bytes,
+                "received file did not outlive the child/connection"
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read(path)?,
+        bytes,
+        "source transfer modified the fixture"
+    );
+    println!(
+        "Windows pipe source transfer passed: framed_handle=1 retained_child=1 sha256=1 readonly=1 wrong_handle=1 closed_handle=1 cancellation=1 deadline=1 poisoned=1; no UAC or devices"
+    );
+    Ok(())
+}

@@ -289,7 +289,8 @@ pub fn connect(
 }
 
 /// A checked endpoint and retained peer observation. No raw handle escape,
-/// reconnect or clone API is supplied. Any failed frame closes the stream.
+/// reconnect or clone API is supplied. Any failed frame or source transfer
+/// closes the stream.
 pub struct Connection {
     handle: Option<OwnedHandle>,
     expected: ProcessPeer,
@@ -318,6 +319,41 @@ impl Connection {
         self.expected.revalidate()?;
         Ok(())
     }
+
+    /// Receive a source handle selected by a checked peer frame. The caller
+    /// must validate that frame's operation and source selection; this method
+    /// grants no job, role or disk authority. The retained peer must have
+    /// PROCESS_DUP_HANDLE rights, and its sender must keep the source leased.
+    /// No process is reopened by PID and no source path is opened.
+    ///
+    /// Kernel pipe identity and retained peer evidence bracket the transfer.
+    /// Any failure closes this connection and releases any newly received file.
+    /// The returned file still needs content hashing and storage-exclusion
+    /// checks. Synchronous process/file metadata calls cannot be forcibly
+    /// cancelled: deadline/cancellation are checked before and after, and a
+    /// late result is discarded rather than returned as a successful transfer.
+    pub fn receive_source_file(
+        &mut self,
+        remote: u64,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<std::fs::File, PipeError> {
+        let result = (|| {
+            check_deadline(deadline, cancel)?;
+            self.check_peer()?;
+            check_deadline(deadline, cancel)?;
+            let received = self.expected.receive_source_file(remote);
+            check_deadline(deadline, cancel)?;
+            self.check_peer()?;
+            check_deadline(deadline, cancel)?;
+            received.map_err(PipeError::from)
+        })();
+        if result.is_err() {
+            self.handle = None;
+        }
+        result
+    }
+
     pub fn read_frame(
         &mut self,
         deadline: Instant,
