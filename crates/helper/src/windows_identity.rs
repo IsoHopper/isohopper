@@ -132,14 +132,16 @@ pub fn parse_identity(bytes: &[u8]) -> Result<DiskIdentity, IdentityError> {
 /// virtual storage.
 ///
 /// # Safety
-/// `file` must use synchronous I/O: it must not have FILE_FLAG_OVERLAPPED. This
+/// `file` must expose a valid handle kept live throughout this call and use
+/// synchronous I/O: it must not have FILE_FLAG_OVERLAPPED. This
 /// function passes a null OVERLAPPED and uses a stack buffer which is valid only
 /// until the synchronous DeviceIoControl call returns.
 #[cfg(windows)]
-pub unsafe fn query_identity(file: &std::fs::File) -> Result<DiskIdentity, IdentityError> {
+pub unsafe fn query_identity(
+    file: &(impl std::os::windows::io::AsRawHandle + ?Sized),
+) -> Result<DiskIdentity, IdentityError> {
     use std::{
         mem::{offset_of, size_of},
-        os::windows::io::AsRawHandle,
         ptr,
     };
     use windows_sys::Win32::System::{
@@ -161,7 +163,7 @@ pub unsafe fn query_identity(file: &std::fs::File) -> Result<DiskIdentity, Ident
     }
     let mut bytes = [0; DESCRIPTOR_BYTES];
     let mut returned = 0;
-    // SAFETY: the borrowed File retains the live handle. The caller guarantees
+    // SAFETY: the borrowed owner retains the live handle. The caller guarantees
     // synchronous I/O; the output buffer and byte-count pointer remain valid
     // for the entire call, and their capacities match the supplied sizes.
     if unsafe {
