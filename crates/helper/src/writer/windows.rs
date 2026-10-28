@@ -51,6 +51,10 @@ impl WindowsRawDevice {
         &self.initial
     }
 
+    pub(crate) fn retained_handle(&self) -> &OwnedHandle {
+        &self.handle
+    }
+
     fn position(&self, offset: u64, pointer: usize, length: usize) -> io::Result<()> {
         let geometry = &self.initial.geometry;
         geometry.check_io(offset, pointer, length)?;
