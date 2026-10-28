@@ -186,6 +186,36 @@ fn windows_pipe_checks_peers_deadlines_and_frames() -> Result<(), Box<dyn std::e
         }
     }
 
+    // A preparation helper bootstraps privileges before connecting. Capture
+    // its token only after that rendezvous, still from the retained process.
+    let listener = Server::create()?;
+    let endpoint = listener.endpoint().clone();
+    let captured = Arc::new(AtomicBool::new(false));
+    let captured_in_callback = captured.clone();
+    let retained = current();
+    let listener = thread::spawn(move || {
+        listener.accept_with_peer(
+            || {
+                captured_in_callback.store(true, Ordering::Release);
+                Ok(retained)
+            },
+            deadline(),
+            &AtomicBool::new(false),
+        )
+    });
+    let mut client = connect(&endpoint, current(), deadline(), &AtomicBool::new(false))?;
+    let mut server = listener.join().unwrap()?;
+    assert!(captured.load(Ordering::Acquire));
+    client.write_frame(b"after bootstrap", deadline(), &AtomicBool::new(false))?;
+    assert_eq!(
+        server
+            .read_frame(deadline(), &AtomicBool::new(false))?
+            .unwrap(),
+        b"after bootstrap"
+    );
+    drop(server);
+    drop(client);
+
     // Both sides open with the production exact rights and verify the protected
     // DACL before these frames. Maximum payload also exercises partial transfers.
     let (mut server, mut client) = pair();
@@ -457,14 +487,19 @@ fn windows_pipe_checks_peers_deadlines_and_frames() -> Result<(), Box<dyn std::e
     // Missing peer cannot turn a pending connect into an unbounded wait.
     let server = Server::create()?;
     let started = Instant::now();
+    let mut acquired = false;
     assert!(matches!(
-        server.accept(
-            current(),
+        server.accept_with_peer(
+            || {
+                acquired = true;
+                Ok(current())
+            },
             started + Duration::from_millis(80),
             &AtomicBool::new(false)
         ),
         Err(PipeError::TimedOut)
     ));
+    assert!(!acquired, "a missing client must not trigger peer capture");
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "local cancellation drain unexpectedly slow"

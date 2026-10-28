@@ -79,10 +79,35 @@ try {
     exit 1
 }
 "#;
-struct FinishChild(Child);
+struct FinishChild {
+    child: Child,
+    output: Option<thread::JoinHandle<io::Result<Vec<u8>>>>,
+    errors: Option<thread::JoinHandle<io::Result<Vec<u8>>>>,
+}
+impl FinishChild {
+    fn collect(&mut self) -> Result<(Vec<u8>, Vec<u8>), StageError> {
+        // Join both before propagating either failure. Each drain owns only its
+        // pipe, but neither thread may escape the owned staging operation.
+        let output = self.output.take().map(thread::JoinHandle::join);
+        let errors = self.errors.take().map(thread::JoinHandle::join);
+        let output = output
+            .ok_or(StageError::Invalid("formatter stdout worker missing"))?
+            .map_err(|_| StageError::Invalid("formatter output worker"))?
+            .map_err(|e| err("formatter stdout", e))?;
+        let errors = errors
+            .ok_or(StageError::Invalid("formatter stderr worker missing"))?
+            .map_err(|_| StageError::Invalid("formatter error worker"))?
+            .map_err(|e| err("formatter stderr", e))?;
+        Ok((output, errors))
+    }
+}
 impl Drop for FinishChild {
     fn drop(&mut self) {
-        let _ = self.0.wait();
+        // A failed request must still deliver EOF before waiting. Never kill
+        // the formatter or release its VHD while it or its drain workers run.
+        drop(self.child.stdin.take());
+        let _ = self.child.wait();
+        let _ = self.collect();
     }
 }
 fn drain(mut input: impl Read) -> io::Result<Vec<u8>> {
@@ -119,8 +144,8 @@ pub(super) fn format_owned(v: &SelectedVolume) -> Result<(), StageError> {
     let directory = program
         .parent()
         .ok_or(StageError::Invalid("PowerShell parent"))?;
-    let mut child = FinishChild(
-        Command::new(&program)
+    let mut child = FinishChild {
+        child: Command::new(&program)
             .args([
                 "-NoLogo",
                 "-NoProfile",
@@ -136,21 +161,23 @@ pub(super) fn format_owned(v: &SelectedVolume) -> Result<(), StageError> {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| err("start owned-volume formatter", e))?,
-    );
+        output: None,
+        errors: None,
+    };
     let output = child
-        .0
+        .child
         .stdout
         .take()
         .ok_or(StageError::Invalid("formatter stdout"))?;
     let errors = child
-        .0
+        .child
         .stderr
         .take()
         .ok_or(StageError::Invalid("formatter stderr"))?;
-    let output = thread::spawn(move || drain(output));
-    let errors = thread::spawn(move || drain(errors));
+    child.output = Some(thread::spawn(move || drain(output)));
+    child.errors = Some(thread::spawn(move || drain(errors)));
     child
-        .0
+        .child
         .stdin
         .take()
         .ok_or(StageError::Invalid("formatter stdin"))?
@@ -159,19 +186,16 @@ pub(super) fn format_owned(v: &SelectedVolume) -> Result<(), StageError> {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut overdue = false;
     let status = loop {
-        if let Some(s) = child.0.try_wait().map_err(|e| err("wait formatter", e))? {
+        if let Some(s) = child
+            .child
+            .try_wait()
+            .map_err(|e| err("wait formatter", e))?
+        {
             break s;
         }
         overdue |= Instant::now() >= deadline;
         thread::sleep(Duration::from_millis(25));
     };
-    let output = output
-        .join()
-        .map_err(|_| StageError::Invalid("formatter output worker"))?
-        .map_err(|e| err("formatter stdout", e))?;
-    let errors = errors
-        .join()
-        .map_err(|_| StageError::Invalid("formatter error worker"))?
-        .map_err(|e| err("formatter stderr", e))?;
+    let (output, errors) = child.collect()?;
     format_outcome(status.code(), overdue, &output, &errors)
 }

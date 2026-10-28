@@ -211,6 +211,20 @@ impl Server {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<Connection, PipeError> {
+        self.accept_with_peer(|| Ok(expected), deadline, cancel)
+    }
+
+    /// Wait for connection before capturing the expected peer's token state.
+    /// The callback must use an independently retained process handle, never
+    /// open a process from the pipe's reported PID. This supports a helper that
+    /// completes privilege bootstrap before connecting. No bytes are read or
+    /// written until the returned peer passes the ordinary kernel PID checks.
+    pub fn accept_with_peer(
+        self,
+        acquire: impl FnOnce() -> Result<ProcessPeer, PipeError>,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<Connection, PipeError> {
         check_deadline(deadline, cancel)?;
         {
             let mut operation = Operation::new(&self.handle)?;
@@ -229,6 +243,8 @@ impl Server {
                 }
             }
         }
+        check_deadline(deadline, cancel)?;
+        let expected = acquire()?;
         let mut connection = Connection {
             handle: Some(self.handle),
             expected,
