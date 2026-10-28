@@ -42,7 +42,7 @@ let customConfig: string | undefined;
 let launcherChoice = 0;
 const powerLabels = { reboot: 'Reboot', shutdown: 'Shut down', firmware_setup: 'Firmware setup' } as const;
 const options = { netboot: true, systemInfo: true, memtest: true, timeout: 10, theme: 'midnight', policy: 'enforce', power: { reboot: true, shutdown: true, firmware_setup: true } };
-let images: MediaImage[] = [
+let images: MediaImage[] = bridge.PickImages ? [] : [
   { id: 'sample-linux', name: 'linux-desktop-demo.iso', size: 4_800_000_000, sample: true, status: 'sample' },
   { id: 'sample-recovery', name: 'recovery-toolkit-demo.img', size: 1_600_000_000, sample: true, status: 'sample' }
 ];
@@ -73,7 +73,7 @@ function render() {
       <div class="experimental">${icon('info')}<span>Experimental · mock devices · no physical disk writes</span><span class="source-mode">${bridgeMode}</span></div>
       <main id="main-content">${tab === 'prepare' ? prepareView() : tab === 'images' ? imagesView() : tab === 'settings' ? settingsView() : tab === 'activity' ? activityView() : launcherView()}</main>
     </div>
-  </div><input id="file-input" type="file" accept=".iso,.img,.wim,.vhd,.vhdx" multiple hidden/><input id="folder-input" type="file" webkitdirectory multiple hidden/><div id="toast" class="toast" role="status" aria-live="polite"></div>${deviceDialog ? dialogView() : ''}${inventoryDialog ? inventoryView() : ''}`;
+  </div><input id="file-input" type="file" accept=".iso,.img,.wim,.vhd,.vhdx,.efi" multiple hidden/><input id="folder-input" type="file" webkitdirectory multiple hidden/><div id="toast" class="toast" role="status" aria-live="polite"></div>${deviceDialog ? dialogView() : ''}${inventoryDialog ? inventoryView() : ''}`;
   bindEvents(); renderToast();
 }
 function titleBlock(_eyebrow: string, title: string, description: string, actions = '') { return `<div class="page-title"><div><h1>${title}</h1>${description ? `<p>${description}</p>` : ''}</div>${actions}</div>`; }

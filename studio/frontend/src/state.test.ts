@@ -29,6 +29,7 @@ describe('disk-bound simulation gate', () => {
 describe('local image intake', () => {
   it('accepts intended formats while rejecting empty, huge and unrelated files', () => {
     expect(fileProblem({ name: 'Installer.ISO', size: 8_000 })).toBeNull();
+    expect(fileProblem({ name: 'tools/diagnostics.EFI', size: 8_000 })).toBeNull();
     expect(fileProblem({ name: 'archive.iso.exe', size: 8_000 })).toMatch(/format/i);
     expect(fileProblem({ name: 'empty.iso', size: 0 })).toMatch(/empty/i);
     expect(fileProblem({ name: 'large.iso', size: 513 * 1024 * 1024 })).toMatch(/512 MiB/);

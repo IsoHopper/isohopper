@@ -193,6 +193,7 @@ for (const outcome of ['image', 'cancel', 'error'] as const) {
       } } };
     }, { outcome });
     await page.goto('/');
+    await expect(page.locator('.image-row')).toHaveCount(0);
     await page.getByRole('button', { name: 'Add images', exact: true }).click();
     if (outcome === 'image') {
       const row = page.locator('.image-row').filter({ hasText: 'native-large.iso' });
@@ -200,7 +201,7 @@ for (const outcome of ['image', 'cancel', 'error'] as const) {
       await expect(row).toContainText('Hash only');
       await expect(page.getByText('/private/media/native-large.iso', { exact: true })).toHaveCount(0);
     } else {
-      await expect(page.locator('.image-row')).toHaveCount(2);
+      await expect(page.locator('.image-row')).toHaveCount(0);
       if (outcome === 'error') await expect(page.getByRole('status')).toContainText('Native image selection failed');
     }
     await expect(page.getByRole('button', { name: 'Add images', exact: true })).toBeEnabled();
@@ -220,7 +221,7 @@ test('directory import preserves nested names and reports conflicting destinatio
   await page.getByRole('button', { name: 'Import folder', exact: true }).click();
   await expect(page.getByText('Mac/boot.iso', { exact: true })).toBeVisible();
   await expect(page.getByText('Windows/boot.iso', { exact: true })).toBeVisible();
-  await expect(page.locator('.image-row')).toHaveCount(4);
+  await expect(page.locator('.image-row')).toHaveCount(2);
   await expect(page.getByRole('status')).toContainText('Skipped symbolic link: external');
   await page.locator('nav').getByRole('button', { name: 'Activity' }).click();
   await expect(page.getByText('Directory import warning')).toBeVisible();

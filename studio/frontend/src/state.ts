@@ -19,7 +19,7 @@ export function canSimulate(disk: DiskRecord | undefined, input: string, bytes: 
   return disk.verdict.state === 'ok' || confirmationMatches(disk, input);
 }
 export function fileProblem(file: { name: string; size: number }): string | null {
-  if (!/\.(iso|img|wim|vhd|vhdx)$/i.test(file.name)) return 'Unsupported format. Use ISO, IMG, WIM, VHD or VHDX.';
+  if (!/\.(iso|img|wim|vhd|vhdx|efi)$/i.test(file.name)) return 'Unsupported format. Use ISO, IMG, WIM, VHD, VHDX or EFI.';
   if (file.size <= 0) return 'This file is empty.';
   if (file.size > 512 * 1024 * 1024) return 'This preview hashes files up to 512 MiB. Streaming large images requires native file access.';
   return null;
