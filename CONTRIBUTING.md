@@ -28,11 +28,14 @@ These optional commands create a new regular-file image and test firmware entry 
 ```sh
 cargo build -p isohopper-launcher --features firmware --target x86_64-unknown-uefi --release --locked
 cargo run -p isohopper-cli --locked -- image create /tmp/isohopper-test.img --size-mib 256 --efi target/x86_64-unknown-uefi/release/isohopper-launcher.efi
+cargo run -p isohopper-cli --locked -- image verify /tmp/isohopper-test.img --efi target/x86_64-unknown-uefi/release/isohopper-launcher.efi
 python3 scripts/firmware-smoke.py --image /tmp/isohopper-test.img --code /path/to/OVMF_CODE.fd --vars /path/to/OVMF_VARS.fd
 python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
-The smoke test checks a firmware-entry marker. Add `--action shutdown`, `--action reboot`, or `--action firmware-setup` to exercise confirmed guest power requests. Firmware setup checks the request and reset, not the next setup screen. It does not establish operating-system boot compatibility or Secure Boot support. It attaches no physical host disk. The optional firmware workflow runs only when manually dispatched.
+Add `--utility /path/to/tool.efi` to both image commands to embed and verify a supplied x64 EFI application. The launcher offers it with `U`, then requires `Y`. Its firmware loader preserves security-policy rejections.
+
+The smoke test checks a firmware-entry marker. Add `--action shutdown`, `--action reboot`, or `--action firmware-setup` to exercise confirmed guest power requests. Firmware setup checks the request and reset, not the next setup screen. `--action utility` requires the source-built `isohopper-test-utility` (feature `test-utility`); it checks ordered start/entry/return markers. These tests establish neither OS compatibility nor Secure Boot enforcement. They attach no physical disk. Native and firmware workflows run only when manually dispatched.
 
 ## Review expectations
 
