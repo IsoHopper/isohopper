@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import importlib.util
+from contextlib import redirect_stdout
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -8,7 +10,9 @@ import struct
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 import uuid
 
 SPEC = importlib.util.spec_from_file_location('secure_smoke', Path(__file__).with_name('secure-boot-smoke.py'))
@@ -33,6 +37,90 @@ def signed_pe():
 
 
 class SecureBootSmokeTests(unittest.TestCase):
+    def test_utility_kind_changes_only_the_signed_case_action(self):
+        for kind, accepted_action in [('returning-efi', 'utility'),
+                                      ('linux-diagnostic', 'linux-diagnostic')]:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                private, output = root / 'private', root / 'output'
+                private.mkdir()
+                output.mkdir()
+                args = SimpleNamespace(cli=Path('/test/isohopper'), qemu='test-qemu',
+                                       timeout=30, utility_kind=kind)
+                for name in ('launcher', 'utility', 'code', 'vars'):
+                    source = root / name
+                    source.write_bytes(b'test input')
+                    setattr(args, name, source)
+                actions = []
+
+                def fake_run(command, _deadline, **kwargs):
+                    if command[0] == 'openssl':
+                        Path(command[command.index('-out') + 1]).write_bytes(b'test certificate')
+                        if '-keyout' in command:
+                            Path(command[command.index('-keyout') + 1]).write_bytes(b'test key')
+                    elif command[0] == 'sbsign':
+                        Path(command[command.index('--output') + 1]).write_bytes(signed_pe())
+                    elif len(command) > 1 and Path(command[1]).name == 'firmware-smoke.py':
+                        case = Path(command[command.index('--log') + 1]).stem
+                        actions.append((case, command[command.index('--action') + 1]))
+                        self.assertIn('--require-secure-boot', command)
+                    return kwargs.get('allowed', (0,))[0], b'{}', b''
+
+                with patch.object(smoke, 'run', side_effect=fake_run), \
+                        patch.object(smoke, 'check_enrollment', return_value={}):
+                    results = smoke.exercise(args, private, output, time.monotonic() + 10)
+                self.assertEqual(actions, [('signed', accepted_action),
+                                           ('unsigned', 'utility-reject'),
+                                           ('tampered', 'utility-reject'),
+                                           ('revoked', 'utility-reject')])
+                self.assertEqual(results, dict.fromkeys(['signed', 'unsigned', 'tampered', 'revoked'], 'passed'))
+
+    def test_utility_kind_default_and_diagnostic_summary_scope(self):
+        for kind, signed in [(None, 'passed'), ('linux-diagnostic', 'passed'),
+                             ('linux-diagnostic', 'failed')]:
+            with self.subTest(kind=kind, signed=signed), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / 'evidence'
+                command = [str(Path(smoke.__file__))]
+                for name in ('cli', 'launcher', 'utility', 'code', 'vars'):
+                    command += [f'--{name}', '/not-used']
+                command += ['--output', str(output)]
+                if kind is not None:
+                    command += ['--utility-kind', kind]
+                cases = {'signed': signed, 'unsigned': 'passed',
+                         'tampered': 'passed', 'revoked': 'passed'}
+                with patch.object(sys, 'argv', command), \
+                        patch.object(smoke, 'exercise', return_value=cases) as exercise, \
+                        redirect_stdout(io.StringIO()):
+                    code = smoke.main()
+                summary = json.loads((output / 'summary.json').read_text())
+                self.assertEqual(code, 0 if signed == 'passed' else 1)
+                self.assertEqual(getattr(exercise.call_args.args[0], 'utility_kind', None),
+                                 kind or 'returning-efi')
+                if kind is None:
+                    self.assertFalse(summary['os_boot_tested'])
+                    self.assertNotIn('os_boot_scope', summary)
+                    self.assertNotIn('utility_kind', summary)
+                else:
+                    self.assertEqual(summary['utility_kind'], 'linux-diagnostic')
+                    self.assertEqual(summary['os_boot_scope'], 'custom-linux-diagnostic')
+                    self.assertEqual(summary['os_boot_tested'], signed == 'passed')
+
+    def test_failed_diagnostic_setup_preserves_scope_without_claiming_a_boot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'evidence'
+            command = [str(Path(smoke.__file__))]
+            for name in ('cli', 'launcher', 'utility', 'code', 'vars'):
+                command += [f'--{name}', '/not-used']
+            command += ['--output', str(output), '--utility-kind', 'linux-diagnostic']
+            with patch.object(sys, 'argv', command), \
+                    patch.object(smoke, 'exercise', side_effect=ValueError('test setup failure')), \
+                    redirect_stdout(io.StringIO()):
+                self.assertEqual(smoke.main(), 1)
+            summary = json.loads((output / 'summary.json').read_text())
+            self.assertEqual(summary.get('utility_kind'), 'linux-diagnostic')
+            self.assertEqual(summary.get('os_boot_scope'), 'custom-linux-diagnostic')
+            self.assertIs(summary.get('os_boot_tested'), False)
+
     def test_enrollment_accepts_only_exact_test_certificates_and_known_empty_dbx(self):
         def siglist(kind, content):
             return (uuid.UUID(kind).bytes_le + struct.pack('<III', 44 + len(content), 0, 16 + len(content))

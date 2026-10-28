@@ -231,8 +231,9 @@ def exercise(args, private, output, deadline):
                                     cert_hashes['utility'], revoked)
         write_json(output / f'{stem}-certificates.json', observed)
     results = {}
+    accepted_action = 'linux-diagnostic' if args.utility_kind == 'linux-diagnostic' else 'utility'
     for name, utility, variables, action in [
-            ('signed', 'utility.signed', 'enrolled', 'utility'),
+            ('signed', 'utility.signed', 'enrolled', accepted_action),
             ('unsigned', 'utility', 'enrolled', 'utility-reject'),
             ('tampered', 'utility.tampered', 'enrolled', 'utility-reject'),
             ('revoked', 'utility.signed', 'revoked', 'utility-reject')]:
@@ -256,6 +257,9 @@ def main():
     for name in ('cli', 'launcher', 'utility', 'code', 'vars', 'output'):
         parser.add_argument(f'--{name}', required=True, type=Path)
     parser.add_argument('--qemu', default='qemu-system-x86_64')
+    parser.add_argument('--utility-kind', choices=['returning-efi', 'linux-diagnostic'],
+                        default='returning-efi',
+                        help='Accepted payload: returning EFI utility or custom Linux diagnostic')
     parser.add_argument('--timeout', type=int, default=90, help='Seconds per guest (1..90)')
     args = parser.parse_args()
     if os.name != 'posix' or not hasattr(os, 'O_NOFOLLOW'):
@@ -279,8 +283,14 @@ def main():
                        'cases': results, 'keys': 'disposable-test-only',
                        'physical_devices_attached': False, 'host_firmware_modified': False,
                        'production_signing_tested': False, 'os_boot_tested': False}
+            if args.utility_kind == 'linux-diagnostic':
+                summary['os_boot_tested'] = results.get('signed') == 'passed'
         except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
             summary = {'status': 'failed', 'reason': str(error)}
+        if args.utility_kind == 'linux-diagnostic':
+            summary.update(utility_kind='linux-diagnostic',
+                           os_boot_scope='custom-linux-diagnostic')
+            summary.setdefault('os_boot_tested', False)
         summary['elapsed_seconds'] = round(time.monotonic() - started, 2)
         write_json(args.output / 'summary.json', summary)
         print(json.dumps(summary, indent=2))
