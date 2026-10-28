@@ -15,6 +15,7 @@ on:
       - crates/core/**
       - crates/media/**
       - crates/config/**
+      - crates/inventory/**
       - studio/src-tauri/src/source_catalog.rs
       - tests/source-catalog/**
 
@@ -42,6 +43,32 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal
+
+      - name: Observe pagefiles, BitLocker and storage pools without changes
+        shell: bash
+        run: |
+          failed=0
+          for probe in \
+            windows_pagefiles:native_windows_pagefiles_observes_only_active_runtime_names \
+            windows_encryption:native_windows_encryption_observes_or_reports_missing_provider \
+            windows_pools:windows_storage_pool_observation_smoke; do
+            target="${probe%%:*}"
+            test_name="${probe#*:}"
+            if cargo +1.98.0 test --locked -p isohopper-inventory --test "$target" "$test_name" -- --ignored --exact --nocapture --test-threads=1 > "$target.log" 2>&1; then
+              cat "$target.log"
+            else
+              failed=1
+              python - "$target.log" <<'PY'
+          import sys
+          from pathlib import Path
+          text = Path(sys.argv[1]).read_text(errors='replace')[-12000:]
+          print(text)
+          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=Windows preflight observation failed::' + text)
+          PY
+            fi
+          done
+          exit "$failed"
 
       - name: Check actual filesystem copies and readback on Windows
         shell: bash
