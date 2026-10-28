@@ -141,6 +141,8 @@ def notes(tag, revision, run_url, scopes):
 {windows}
 macOS and Linux provide local image imports, streaming SHA-256 and read-only device inspection. They cannot prepare physical USB devices. Nested image paths are retained.
 
+This build adds verified in-app engine download and session restore, allows preparing an empty image library, and fixes the Windows canonical installation-path check. Large candidates are hidden by default; suitable small USB/SD candidates can be suggested, with exact write confirmation still required.
+
 | Download | Scope |
 | --- | --- |
 | `windows-x64-setup.exe` | Windows x64; fresh machine installation in Program Files required for the privileged helper. WebView2 may download during setup. |
