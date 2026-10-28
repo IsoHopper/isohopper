@@ -8,6 +8,7 @@ use std::{
     ptr,
 };
 use windows_sys::Win32::{
+    Foundation::ERROR_VIRTDISK_NOT_VIRTUAL_DISK,
     Storage::{
         FileSystem::{
             BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -26,6 +27,7 @@ use windows_sys::Win32::{
 const _: () = {
     assert!(offset_of!(STORAGE_DEPENDENCY_INFO, Anonymous) == 8);
     assert!(size_of::<STORAGE_DEPENDENCY_INFO_TYPE_1>() == 28);
+    assert!(ERROR_VIRTDISK_NOT_VIRTUAL_DISK == 0xc03a0015);
 };
 
 fn io_error(stage: &'static str, source: io::Error) -> SourceError {
@@ -227,17 +229,17 @@ fn no_virtual_dependencies(volume: &File) -> Result<(), SourceError> {
         )
     };
     if code != 0 {
-        return Err(io_error(
-            "source backing dependencies",
-            io::Error::from_raw_os_error(code as i32),
-        ));
+        // On failure the output is undefined. Dispatch the exact documented
+        // nonvirtual status before interpreting the payload or its reported
+        // size; all other failures remain errors.
+        return check_dependency_response(code, &[]);
     }
     if used as usize > bytes.len() {
         return Err(SourceError::Mapping(
             "oversized source backing dependencies",
         ));
     }
-    check_dependencies(&bytes[..used as usize])
+    check_dependency_response(code, &bytes[..used as usize])
 }
 
 fn no_external_backing(source: &File) -> Result<(), SourceError> {

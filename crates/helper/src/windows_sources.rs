@@ -165,6 +165,21 @@ fn check_dependencies(bytes: &[u8]) -> Result<(), SourceError> {
 }
 
 #[cfg(any(windows, test))]
+fn check_dependency_response(code: u32, bytes: &[u8]) -> Result<(), SourceError> {
+    match code {
+        0 => check_dependencies(bytes),
+        // ERROR_VIRTDISK_NOT_VIRTUAL_DISK explicitly reports a nonvirtual
+        // disk. It is not equivalent to a missing provider or unsupported
+        // query. Windows defines output bytes only for ERROR_SUCCESS.
+        0xc03a0015 => Ok(()),
+        _ => Err(SourceError::Io {
+            stage: "source backing dependencies",
+            source: io::Error::from_raw_os_error(code as i32),
+        }),
+    }
+}
+
+#[cfg(any(windows, test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FileIdentity {
     volume_serial: u32,
@@ -323,6 +338,54 @@ mod tests {
             ));
         }
         assert!(check_external_backing(Err(io::Error::other("unknown backing state"))).is_err());
+    }
+
+    #[test]
+    fn dependency_response_accepts_only_valid_success_or_exact_nonvirtual_status() {
+        let empty = [1, 0, 0, 0, 0, 0, 0, 0];
+        check_dependency_response(0, &empty).unwrap();
+        let mut virtual_disk = vec![0; 36];
+        virtual_disk[..4].copy_from_slice(&1u32.to_le_bytes());
+        virtual_disk[4..8].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(
+            check_dependency_response(0, &virtual_disk),
+            Err(SourceError::VirtualDependency)
+        ));
+        for bytes in [vec![], vec![0xff], vec![0xff; 16], vec![0; 1801]] {
+            assert!(check_dependency_response(0, &bytes).is_err());
+            // On non-success Windows leaves the output undefined. Only this
+            // documented negative status may succeed without reading output.
+            check_dependency_response(0xc03a0015, &bytes).unwrap();
+        }
+        check_dependency_response(0xc03a0015, &virtual_disk).unwrap();
+    }
+
+    #[test]
+    fn dependency_response_rejects_every_other_failure_without_parsing_undefined_output() {
+        for code in [
+            1,
+            2,
+            5,
+            50,
+            87,
+            122,
+            234,
+            1167,
+            0xc03a0014, // ERROR_VIRTDISK_PROVIDER_NOT_FOUND
+            0xc03a0016, // ERROR_VHD_PARENT_VHD_ACCESS_DENIED
+            0xc03a001d, // ERROR_VIRTDISK_UNSUPPORTED_DISK_SECTOR_SIZE
+            u32::MAX,
+        ] {
+            for bytes in [vec![], vec![0xff; 17], vec![1, 0, 0, 0, 0, 0, 0, 0]] {
+                match check_dependency_response(code, &bytes).unwrap_err() {
+                    SourceError::Io { stage, source } => {
+                        assert_eq!(stage, "source backing dependencies");
+                        assert_eq!(source.raw_os_error(), Some(code as i32));
+                    }
+                    other => panic!("unexpected dependency error: {other}"),
+                }
+            }
+        }
     }
 
     #[test]
