@@ -97,6 +97,7 @@ jobs:
         shell: bash
         run: |
           cargo +1.98.0 test --locked -p isohopper-helper --test windows_protected
+          cargo +1.98.0 test --locked -p isohopper-helper --test probe_command
           failed=0
           for probe in \
             windows_protected:windows_protected_system_and_executable_mappings_are_read_only \
