@@ -57,7 +57,7 @@ The shared script checks Rust, frontend code, and Chromium at desktop and compac
 
 Validation on 28 October 2026:
 
-- **322 Rust workspace tests, 17 native tests, 34 frontend tests, 41 Python tests and 58 Chromium cases passed locally.** The workspace includes 12 catalogue tests also covered by native tests. Browser bridge tests use mocks; filesystem tests use real temporary files. Hosted results are in [Actions](https://github.com/IsoHopper/isohopper/actions).
+- **325 Rust workspace tests, 17 native tests, 34 frontend tests, 41 Python tests and 58 Chromium cases passed locally.** The workspace includes 12 catalogue tests also covered by native tests. Browser bridge tests use mocks; filesystem tests use real temporary files. Hosted results are in [Actions](https://github.com/IsoHopper/isohopper/actions).
 - [Windows storage integration](https://github.com/IsoHopper/isohopper/actions/runs/40708807100) passed source-handle protection, nested copies, a 256 MiB VHD write/readback, reattachment, GPT validation, FAT32 volume locks, source-to-disk mapping, source-change rejection and read-only disk refusal. This exercised real Windows storage APIs on disposable virtual disks, not USB hardware.
 - Windows CI currently cannot retain active pagefile handles (Win32 32), and executable external-backing queries are unsupported there (Win32 1). Tests record these limits; they do not count as safe or enable physical preparation.
 - QEMU passed firmware entry, EFI utility handoff/return, and confirmed guest power requests. The next firmware setup screen was not inspected.
