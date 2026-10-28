@@ -48,18 +48,7 @@ pub fn start(
                 .map_err(|_| "Could not obtain Studio owner window".to_string())
                 .and_then(|r| r)
                 .and_then(|owner| run(&job, inputs, &target, owner, &directory));
-            if let Err(error) = result {
-                let _ = job.update(|s| {
-                    s.phase = if s.cancel_requested && !s.target_may_be_incomplete {
-                        "cancelled"
-                    } else {
-                        "failed"
-                    }
-                    .into();
-                    s.message = error;
-                });
-            }
-            let _ = job.update(|s| s.active = false);
+            let _ = job.finish(result);
         })
         .map_err(|e| {
             let _ = job.update(|s| {
@@ -197,17 +186,21 @@ fn run(
         job.transfer_sources(inputs.sources.as_ref().ok_or("Missing source batch")?, |file, info| {
             if cancelled(job)? { return Err("Preparation cancelled before staging".into()); }
             if channel.is_none() {
-                job.update(|s| { s.phase = "requesting_elevation".into(); s.message = "Waiting for the Windows elevation dialog.".into(); })?;
-                let launched = launch_preparation(owner, directory, env!("ISOHOPPER_HELPER_SHA256"))?
-                    .ok_or("Windows elevation was cancelled")?;
-                channel = Some(Channel { launched, protocol: ClientSession::new(count), current: None, terminal_received: false });
-                let connection = channel.as_mut().ok_or("Missing helper channel")?;
-                connection.receive(job)?;
-                expected(connection, job, |v| matches!(v, ServerMessage::Hello))?;
-                connection.reply(job, ClientMessage::Begin { target_selector: target.into(), source_count: count })?;
-                connection.receive(job)?;
-                expected(connection, job, |v| matches!(v, ServerMessage::NeedArchive))?;
-                inputs.archive.as_ref().ok_or("Missing engine archive")?.with_verified_source(|archive, metadata| {
+                // Hash the fixed archive before launch, outside the helper's
+                // response deadline. Keep its cursor/identity lease through
+                // launch and the archive acknowledgement; no path reopen.
+                job.with_verified_archive(inputs.archive.as_ref().ok_or("Missing engine archive")?, |archive, metadata| {
+                    if cancelled(job)? { return Err("Preparation cancelled before staging".into()); }
+                    job.update(|s| { s.phase = "requesting_elevation".into(); s.message = "Waiting for the Windows elevation dialog.".into(); })?;
+                    let launched = launch_preparation(owner, directory, env!("ISOHOPPER_HELPER_SHA256"))?
+                        .ok_or("Windows elevation was cancelled")?;
+                    channel = Some(Channel { launched, protocol: ClientSession::new(count), current: None, terminal_received: false });
+                    let connection = channel.as_mut().ok_or("Missing helper channel")?;
+                    connection.receive(job)?;
+                    expected(connection, job, |v| matches!(v, ServerMessage::Hello))?;
+                    connection.reply(job, ClientMessage::Begin { target_selector: target.into(), source_count: count })?;
+                    connection.receive(job)?;
+                    expected(connection, job, |v| matches!(v, ServerMessage::NeedArchive))?;
                     connection.reply(job, ClientMessage::Archive { remote_handle: remote_handle(archive)?, bytes: metadata.bytes, sha256: metadata.verification.digest.clone() })?;
                     connection.receive(job)
                 })?;

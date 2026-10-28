@@ -12,7 +12,7 @@ pub mod targets;
 #[path = "preparation/windows.rs"]
 mod windows;
 
-use crate::imports::source_catalog::{SourceBatch, SourceInfo};
+use crate::imports::source_catalog::{SourceBatch, SourceInfo, SourceLease};
 use serde::Serialize;
 use std::fs::File;
 use std::sync::{
@@ -62,6 +62,52 @@ struct Job {
     abort: AtomicBool,
 }
 impl Job {
+    fn finish(&self, result: Result<(), String>) -> Result<(), String> {
+        self.update(|snapshot| {
+            if let Err(error) = result {
+                snapshot.phase = if snapshot.cancel_requested && !snapshot.target_may_be_incomplete
+                {
+                    "cancelled"
+                } else {
+                    "failed"
+                }
+                .into();
+                snapshot.message = error;
+            }
+            snapshot.active = false;
+        })
+    }
+
+    fn with_verified_archive<T>(
+        &self,
+        archive: &SourceLease,
+        use_archive: impl FnOnce(&mut File, &SourceInfo) -> Result<T, String>,
+    ) -> Result<T, String> {
+        archive.with_verified_source_with_progress(
+            |completed, total| self.verification_progress("verifying_archive", completed, total),
+            use_archive,
+        )
+    }
+
+    fn verification_progress(&self, phase: &str, completed: u64, total: u64) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Preparation state is unavailable")?;
+        if state.snapshot.cancel_requested {
+            return Err("Preparation cancelled during input verification.".into());
+        }
+        if completed > total {
+            return Err("Invalid input verification progress.".into());
+        }
+        state.snapshot.phase = phase.into();
+        state.snapshot.message =
+            "Rechecking retained input bytes before starting the helper.".into();
+        state.snapshot.completed_bytes = completed;
+        state.snapshot.total_bytes = total;
+        Ok(())
+    }
+
     /// Publish metadata only after every transfer callback and the final source
     /// stability checks succeed. Earlier callbacks may already have sent handles
     /// on failure, but the UI never receives a partial or unverified manifest.
@@ -71,7 +117,12 @@ impl Job {
         transfer: impl FnMut(&File, &SourceInfo) -> Result<(), String>,
     ) -> Result<(), String> {
         let manifest = sources
-            .visit_verified(transfer)?
+            .visit_verified_with_progress(
+                |completed, total| {
+                    self.verification_progress("verifying_sources", completed, total)
+                },
+                transfer,
+            )?
             .into_iter()
             .map(|source| SourceManifestEntry {
                 relative_path: source.relative_path,
@@ -233,6 +284,9 @@ mod tests {
         let mut transferred = Vec::new();
         job.transfer_sources(&batch, |file, info| {
             assert_eq!(file.metadata().unwrap().len(), info.bytes);
+            let snapshot = job.snapshot().unwrap();
+            assert_eq!(snapshot.phase, "verifying_sources");
+            assert_eq!((snapshot.completed_bytes, snapshot.total_bytes), (6, 6));
             transferred.push(info.relative_path.clone());
             Ok(())
         })
@@ -300,6 +354,103 @@ mod tests {
         assert!(catalogue.release_sources(&ids).is_err());
         drop(batch);
         catalogue.release_sources(&ids).unwrap();
+    }
+
+    #[test]
+    fn cancelled_job_does_not_hash_or_transfer_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("boot.iso");
+        std::fs::write(&path, vec![b'a'; 1_000_000]).unwrap();
+        let mut catalogue = SourceCatalog::default();
+        let info = catalogue
+            .insert_batch(vec![
+                PreparedSource::new(File::open(path).unwrap(), "boot.iso").unwrap(),
+            ])
+            .unwrap()
+            .remove(0);
+        let batch = catalogue.lease_batch(&[info.source_id]).unwrap();
+        let job = Job::new("cancelled-job".into());
+        job.cancel().unwrap();
+        let mut transferred = false;
+        let result = job.transfer_sources(&batch, |_, _| {
+            transferred = true;
+            Ok(())
+        });
+        assert!(result.is_err());
+        job.finish(result).unwrap();
+        assert!(!transferred);
+        let snapshot = job.snapshot().unwrap();
+        assert!(snapshot.source_manifest.is_empty());
+        assert_eq!(snapshot.completed_bytes, 0);
+        assert_eq!(snapshot.phase, "cancelled");
+        assert!(!snapshot.active);
+    }
+
+    #[test]
+    fn cancelled_archive_verification_never_reaches_the_launch_callback() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("archive.tar.gz");
+        std::fs::write(&path, vec![b'a'; 1_000_000]).unwrap();
+        let mut catalogue = SourceCatalog::default();
+        let info = catalogue
+            .insert_batch(vec![
+                PreparedSource::new(File::open(path).unwrap(), "archive.tar.gz").unwrap(),
+            ])
+            .unwrap()
+            .remove(0);
+        let archive = catalogue.lease(&info.source_id).unwrap();
+        let job = Job::new("archive-job".into());
+        job.cancel().unwrap();
+        let mut launched = false;
+        let result = job.with_verified_archive(&archive, |_, _| {
+            launched = true;
+            Ok(())
+        });
+        assert!(result.is_err());
+        job.finish(result).unwrap();
+        assert!(!launched);
+        let snapshot = job.snapshot().unwrap();
+        assert_eq!(snapshot.phase, "cancelled");
+        assert!(!snapshot.active);
+        assert!(snapshot.source_manifest.is_empty());
+        assert!(catalogue.release(&info.source_id).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_checksum_mismatch_finishes_failed_without_source_transfer() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("boot.iso");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut catalogue = SourceCatalog::default();
+        let info = catalogue
+            .insert_batch(vec![
+                PreparedSource::new(File::open(&path).unwrap(), "boot.iso").unwrap(),
+            ])
+            .unwrap()
+            .remove(0);
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut writer = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        writer.write_all(b"xyz").unwrap();
+        writer
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let batch = catalogue.lease_batch(&[info.source_id]).unwrap();
+        let job = Job::new("mismatch-job".into());
+        let mut transferred = false;
+        let result = job.transfer_sources(&batch, |_, _| {
+            transferred = true;
+            Ok(())
+        });
+        assert!(result.as_ref().unwrap_err().contains("checksum mismatch"));
+        job.finish(result).unwrap();
+        assert!(!transferred);
+        let snapshot = job.snapshot().unwrap();
+        assert_eq!(snapshot.phase, "failed");
+        assert!(!snapshot.active);
+        assert!(!snapshot.cancel_requested);
+        assert!(snapshot.source_manifest.is_empty());
     }
 
     #[cfg(unix)]
