@@ -351,3 +351,10 @@ main { padding: 20px; }
 .checksum { display: block; overflow-wrap: anywhere; white-space: normal; font-size: 12px; }
 .native-preparation .risk-box input { width: 100%; min-width: 0; }
 .job-source-manifest { border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+.engine-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.engine-download-status { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); }
+.engine-download-status .device-details { margin: 0 0 10px; }
+.large-drive-option { display: block; }
+.preparation-prerequisites { display: grid; gap: 4px; }
+.preparation-prerequisites > div { display: grid; grid-template-columns: 60px minmax(0, 1fr); gap: 8px; }
+.preparation-prerequisites dd { margin: 0; overflow-wrap: anywhere; }

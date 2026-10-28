@@ -7,7 +7,6 @@ describe('native preparation boundary', () => {
     expect(canConfirmPreparation(snapshot, 'WIPE Usb-AbC', false)).toBe(false);
     expect(canConfirmPreparation(snapshot, 'WIPE USB-ABC', true)).toBe(false);
     expect(canConfirmPreparation(snapshot, 'WIPE Usb-AbC', true)).toBe(true);
-    expect(canConfirmPreparation({ ...snapshot, source_manifest: [] }, snapshot.challenge!, true)).toBe(false);
     expect(canConfirmPreparation({ ...snapshot, sources_released: false }, snapshot.challenge!, true)).toBe(false);
     expect(canConfirmPreparation({ ...snapshot, cancel_requested: true }, snapshot.challenge!, true)).toBe(false);
   });
@@ -24,4 +23,13 @@ describe('native preparation boundary', () => {
     expect(preparationSnapshot(snapshot).source_manifest).toEqual(snapshot.source_manifest);
   });
 
+});
+
+describe('empty media preparation', () => {
+  it('permits explicit confirmation of a sealed empty image while retaining source-release and exact challenge gates', () => {
+    const empty = { ...snapshot, source_manifest: [] };
+    expect(canConfirmPreparation(empty, empty.challenge!, true)).toBe(true);
+    expect(canConfirmPreparation({ ...empty, sources_released: false }, empty.challenge!, true)).toBe(false);
+    expect(canConfirmPreparation(empty, 'WIPE OTHER', true)).toBe(false);
+  });
 });

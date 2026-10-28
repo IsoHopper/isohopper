@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import './style.css';
 import { bridge, bridgeMode, initialImages, isDemo, isNative, nativeHost } from './bridge';
-import { canConfirmPreparation, type EngineArchive, type PreparationTarget, type PreparationSnapshot } from './preparation';
+import { defaultPreparationTarget, preparationTargetHint, visiblePreparationTargets, canConfirmPreparation, type EngineArchive, type PreparationTarget, type PreparationSnapshot } from './preparation';
 import { icon } from './icons';
+import type { EngineDownloadSnapshot } from './engine_download';
+import { parsePreferences, preferencesKey, type StudioPreferences } from './preferences';
 import { mergeNativeImages, removeMediaImages } from './image_lifecycle';
 import { nativeImageForDisplay, inspectionRecords, preparationUnavailable, type HostInventory, type StudioCapabilities } from './native';
 import { browserRelativePath, destinationKey, canSimulate, challengeFor, confirmationMatches, escapeHTML as esc, fileProblem, formatBytes, safeFileName, type DiskRecord, type DiskPlan, type MediaImage } from './state';
@@ -11,6 +13,7 @@ import { browserRelativePath, destinationKey, canSimulate, challengeFor, confirm
 type Tab = 'prepare' | 'images' | 'settings' | 'activity' | 'launcher';
 interface Log { time: string; title: string; detail: string; kind: 'info' | 'success' | 'warning' }
 const app = document.querySelector<HTMLDivElement>('#app')!;
+const savedPreferences = readPreferences();
 const nav: { id: Tab; label: string; icon: string }[] = [
   { id: 'prepare', label: 'Prepare drive', icon: 'drive' }, { id: 'images', label: 'Image library', icon: 'layers' },
   { id: 'settings', label: 'Configuration', icon: 'settings' }, { id: 'activity', label: 'Activity', icon: 'activity' },
@@ -32,6 +35,7 @@ let releasingImages = false;
 let sourcesLoaded = false;
 let sourcesLoading = false;
 let sourcesError = '';
+let sourceRestoreWarnings: string[] = [];
 let progress = 0;
 let complete = false;
 let runTitle = '';
@@ -43,8 +47,21 @@ let inspectingHost = false;
 let probingHelper = false;
 let helperStatus = '';
 let engineArchive: EngineArchive | null = null;
+let engineDownloadJob: EngineDownloadSnapshot | null = null;
+let engineDownloadLoaded = false;
+let engineDownloadRequest = false;
+let engineDownloadSyncing = false;
+let engineDownloadCancelling = false;
+let engineDownloadPolling = false;
+let engineDownloadError = '';
+let engineDownloadStatusError = false;
+let engineSelectionJob: string | undefined;
+let engineDownloadTimer: ReturnType<typeof setTimeout> | undefined;
 let preparationTargets: PreparationTarget[] = [];
 let preparationTarget = '';
+let targetHint = savedPreferences.targetHint;
+let showLargeDrives = savedPreferences.showLargeDrives;
+let preferenceWriteWarning = false;
 let preparationJob: PreparationSnapshot | null = null;
 let preparationError = '';
 let preparationPhrase = '';
@@ -55,23 +72,51 @@ let preparationTimer: ReturnType<typeof setTimeout> | undefined;
 let hostInventory: HostInventory | undefined;
 let inventoryError = '';
 let query = '';
-let configFormat = 'yaml';
+let configFormat = savedPreferences.configFormat;
 let configResult = '';
-let customConfig: string | undefined;
+let customConfig = savedPreferences.customConfig;
 let launcherChoice = 0;
 const powerLabels = { reboot: 'Reboot', shutdown: 'Shut down', firmware_setup: 'Firmware setup' } as const;
-const options = { netboot: true, systemInfo: true, memtest: true, timeout: 10, theme: 'midnight', policy: 'enforce', power: { reboot: true, shutdown: true, firmware_setup: true } };
+const options = savedPreferences.options;
 let images: MediaImage[] = initialImages;
 let logs: Log[] = [{ time: new Date().toISOString(), title: 'Session started', detail: `${bridgeMode}. Awaiting runtime capabilities.`, kind: 'info' }];
-const canImport = () => capabilities?.file_import === true && (!isNative || (sourcesLoaded && !sourcesError)) && !sourcesLoading;
+const engineDownloadLocked = () => capabilities?.engine_download === true && (!engineDownloadLoaded || engineDownloadRequest || engineDownloadSyncing || engineDownloadJob?.active === true);
+// These actions share the native operation guard, including read-only inventory.
+const nativeActionsLocked = () => engineDownloadLocked() || busy || preparationRequest || pickingImages || releasingImages || sourcesLoading || refreshing || probingHelper || inspectingHost;
+const canImport = () => !nativeActionsLocked() && capabilities?.file_import === true && (!isNative || (sourcesLoaded && !sourcesError));
 const exactBytes = (bytes: number) => `${bytes.toLocaleString('en-GB')} bytes`;
 const physicalPreparationEnabled = () => isNative && capabilities?.physical_preparation === true;
-const preparationConfirmationAllowed = () => !preparationConfirming && canConfirmPreparation(preparationJob, preparationPhrase, physicalPreparationEnabled());
+const preparationConfirmationAllowed = () => !engineDownloadLocked() && !preparationConfirming && canConfirmPreparation(preparationJob, preparationPhrase, physicalPreparationEnabled());
 const runtimeDescription = () => isDemo ? 'Explicit browser demo; mock devices; no physical disk writes.' : physicalPreparationEnabled() ? 'Experimental physical preparation enabled; exact device confirmation required.' : capabilities?.preparation_available ? 'Native image staging available; physical writing disabled.' : 'Physical preparation unavailable.';
 const imagePath = (image: MediaImage) => image.relativePath || image.name;
 const sumBytes = () => images.reduce((sum, image) => sum + image.size, 0);
 const pendingImages = () => images.some(image => image.status === 'hashing' || image.status === 'error');
 const runAllowed = () => isDemo && !!plan && !planLoading && !planError && !pickingImages && !releasingImages && !pendingImages() && canSimulate(selected, confirmation, sumBytes(), busy);
+function readPreferences(): StudioPreferences {
+  try { return parsePreferences(localStorage.getItem(preferencesKey)); }
+  catch { return parsePreferences(null); }
+}
+function savePreferences() {
+  // Persist only presentation settings and a device identity hint. Live native
+  // source/archive/target tokens and write confirmations remain session-only.
+  const preferences = parsePreferences(JSON.stringify({ version: 1, options, configFormat, customConfig, showLargeDrives, targetHint }));
+  try { localStorage.setItem(preferencesKey, JSON.stringify(preferences)); }
+  catch { if (!preferenceWriteWarning) { preferenceWriteWarning = true; notify('Settings could not be saved locally. Export configuration before closing.'); } }
+}
+function setPreparationTargets(next: PreparationTarget[]) {
+  const previous = preparationTargets.find(item => item.selection_token === preparationTarget);
+  preparationTarget = defaultPreparationTarget(next, preparationTarget, preparationTargetHint(previous) || targetHint);
+  preparationTargets = next;
+}
+function preparationTargetLabel(target: PreparationTarget): string {
+  return `${esc(target.display_id)} · ${esc(target.disk.friendly_name || 'Unnamed')}${target.volume_labels?.length ? ` · ${target.volume_labels.map(esc).join(', ')}` : ''} · ${target.disk.size === null ? 'unknown size' : formatBytes(target.disk.size)}`;
+}
+function preparationPrerequisites() {
+  const target = preparationTargets.find(item => item.selection_token === preparationTarget);
+  const invalidImages = images.some(image => image.origin !== 'native' || !image.sourceId || image.status !== 'hashed');
+  const next = engineDownloadLocked() ? 'Wait for the engine download, or cancel it.' : busy || preparationRequest ? 'Preparation in progress.' : sourcesLoading || !sourcesLoaded ? 'Wait for saved images to be restored.' : sourcesError ? 'Retry image restoration.' : refreshing ? 'Wait for device information to refresh.' : probingHelper ? 'Wait for the elevated helper check to finish.' : inspectingHost ? 'Wait for host inspection to finish.' : !engineArchive ? 'Download engine or choose an engine archive.' : !target ? 'Choose a target device.' : invalidImages ? 'Remove failed or browser-only images, or import them with the native picker.' : pickingImages || releasingImages ? 'Wait for the image library operation.' : 'Ready to build. Windows elevation is required; writing needs a separate exact confirmation.';
+  return `<dl class="preparation-prerequisites"><div><dt>Engine</dt><dd>${engineArchive ? `Verified ${esc(engineArchive.version)}` : 'Required'}</dd></div><div><dt>Target</dt><dd>${target ? `${esc(target.disk.friendly_name || target.display_id)} · helper revalidates` : 'Required'}</dd></div><div><dt>Images</dt><dd>${images.length} ${images.length === 1 ? 'image' : 'images'}${images.length === 0 ? ' · optional; add images to the prepared drive later' : invalidImages ? ' · review needed' : ' · ready'}</dd></div></dl><p>${esc(next)}</p>`;
+}
 function log(title: string, detail: string, kind: Log['kind'] = 'info') { logs.unshift({ time: new Date().toISOString(), title, detail, kind }); }
 function notify(message: string) { toast = message; clearTimeout(toastTimer); renderToast(); toastTimer = setTimeout(() => { toast = ''; renderToast(); }, 6000); }
 function renderToast() { const node = document.querySelector('#toast'); if (node) { node.textContent = toast; node.classList.toggle('visible', !!toast); } }
@@ -103,10 +148,10 @@ function prepareView() {
       ${nativePreparationPanel()}
     </div><aside class="detail-column">${targetPanel()}${layoutPanel()}</aside></div>`;
 }
-function dropZone() { return `<div class="add-images"><button class="secondary-button dropzone" id="dropzone" ${busy || pickingImages || releasingImages || !canImport() ? 'disabled' : ''}>${icon(pickingImages ? 'activity' : 'plus')}${pickingImages ? 'Reading selected images…' : 'Add images'}</button><button class="secondary-button" id="import-folder" ${busy || pickingImages || releasingImages || !canImport() ? 'disabled' : ''}>Import folder</button><span>${isNative ? 'Native picker: Rust streaming SHA-256, no preview size cap. Browser drop: 512 MiB maximum.' : isDemo ? 'Browser intake: WebCrypto SHA-256; 512 MiB per file. Desktop picker streams larger files.' : 'Local file import requires the native desktop runtime or explicit browser demo.'} Folder paths are relative to the selected directory.</span>${sourcesLoading ? '<span>Restoring retained native sources…</span>' : sourcesError ? `<p class="error-text">${esc(sourcesError)}</p><button class="text-button" id="retry-sources">Retry source listing</button>` : ''}</div>`; }
+function dropZone() { return `<div class="add-images"><button class="secondary-button dropzone" id="dropzone" ${busy || pickingImages || releasingImages || !canImport() ? 'disabled' : ''}>${icon(pickingImages ? 'activity' : 'plus')}${pickingImages ? 'Reading selected images…' : 'Add images'}</button><button class="secondary-button" id="import-folder" ${busy || pickingImages || releasingImages || !canImport() ? 'disabled' : ''}>Import folder</button><span>${isNative ? 'Native picker: Rust streaming SHA-256, no preview size cap. Browser drop: 512 MiB maximum.' : isDemo ? 'Browser intake: WebCrypto SHA-256; 512 MiB per file. Desktop picker streams larger files.' : 'Local file import requires the native desktop runtime or explicit browser demo.'} Folder paths are relative to the selected directory.</span>${sourcesLoading ? `<span>${capabilities?.session_restore ? 'Restoring saved native files…' : 'Restoring retained native sources…'}</span>` : sourcesError ? `<p class="error-text">${esc(sourcesError)}</p><button class="text-button" id="retry-sources" ${nativeActionsLocked() ? 'disabled' : ''}>Retry source listing</button>` : ''}${sourceRestoreWarnings.length ? `<div class="source-restore-warnings" role="status">${sourceRestoreWarnings.map(warning => `<p>${esc(warning)}</p>`).join('')}</div>` : ''}</div>`; }
 function imageTable(items: MediaImage[]) { return `<table class="image-table"><thead><tr><th scope="col">Relative path</th><th scope="col">Size</th><th scope="col">Source</th><th scope="col">SHA-256</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead><tbody>${items.map(imageRow).join('')}</tbody></table>`; }
 function imageRow(image: MediaImage) {
-  return `<tr class="image-row"><td class="image-name">${esc(imagePath(image))}</td><td class="size-cell">${formatBytes(image.size)}<small class="exact-value">${exactBytes(image.size)}</small></td><td class="source-cell">${image.sample ? 'Sample' : image.origin === 'native' ? 'Native' : 'Browser'}${image.sourceId ? `<code class="source-id">${esc(image.sourceId)}</code>` : ''}</td><td class="hash-cell">${image.sample ? '<span class="subtle">No file loaded</span>' : image.status === 'hashing' ? 'SHA-256: computing' : image.status === 'error' ? `<span class="error-text">${esc(image.error || 'Failed')}</span>` : `<code>${image.hash!}</code><small>Hash only · publisher not verified</small>`}</td><td class="row-actions">${image.hash ? `<button class="icon-button copy-hash" data-id="${image.id}" aria-label="Copy SHA-256 for ${esc(imagePath(image))}" title="Copy SHA-256">${icon('copy')}</button>` : ''}<button class="icon-button remove-image" data-id="${image.id}" aria-label="Remove ${esc(imagePath(image))}" title="Remove image" ${busy || pickingImages || releasingImages || sourcesLoading ? 'disabled' : ''}>${icon('close')}</button></td></tr>`;
+  return `<tr class="image-row"><td class="image-name">${esc(imagePath(image))}</td><td class="size-cell">${formatBytes(image.size)}<small class="exact-value">${exactBytes(image.size)}</small></td><td class="source-cell">${image.sample ? 'Sample' : image.origin === 'native' ? 'Native' : 'Browser'}${image.sourceId ? `<code class="source-id">${esc(image.sourceId)}</code>` : ''}</td><td class="hash-cell">${image.sample ? '<span class="subtle">No file loaded</span>' : image.status === 'hashing' ? 'SHA-256: computing' : image.status === 'error' ? `<span class="error-text">${esc(image.error || 'Failed')}</span>` : `<code>${image.hash!}</code><small>Hash only · publisher not verified</small>`}</td><td class="row-actions">${image.hash ? `<button class="icon-button copy-hash" data-id="${image.id}" aria-label="Copy SHA-256 for ${esc(imagePath(image))}" title="Copy SHA-256">${icon('copy')}</button>` : ''}<button class="icon-button remove-image" data-id="${image.id}" aria-label="Remove ${esc(imagePath(image))}" title="Remove image" ${nativeActionsLocked() ? 'disabled' : ''}>${icon('close')}</button></td></tr>`;
 }
 function optionRow(key: string, _glyph: string, title: string, detail: string, checked: boolean) { return `<label class="option-row"><input class="toggle-input" type="checkbox" data-option="${key}" ${checked ? 'checked' : ''} ${busy ? 'disabled' : ''}/><span class="option-copy"><strong>${title}</strong><small>${detail}</small></span></label>`; }
 function powerSettings() {
@@ -118,30 +163,45 @@ function powerPreview() {
   return `<div class="launcher-power"><strong>Power</strong>${enabled.map(([key, label]) => `<div><button class="secondary-button" data-power-preview="${key}" aria-label="${label}">${label}</button>${key === 'firmware_setup' ? '<small>Requires firmware support</small>' : ''}</div>`).join('')}</div>`;
 }
 function nativeTargetPanel() {
-  return `<section class="panel target-panel"><div class="panel-heading"><h2>Target device</h2><button class="text-button" id="refresh-drives" ${busy || refreshing || pickingImages || inspectingHost || !isNative ? 'disabled' : ''}>${refreshing ? 'Loading…' : 'Refresh'}</button></div>
+  return `<section class="panel target-panel"><div class="panel-heading"><h2>Target device</h2><button class="text-button" id="refresh-drives" ${nativeActionsLocked() || !isNative ? 'disabled' : ''}>${refreshing ? 'Loading…' : 'Refresh'}</button></div>
     ${!isNative ? `<div class="inventory-note"><p>Native desktop runtime unavailable.</p><p>${nativeHost ? 'The desktop bridge did not initialize. Restart the application.' : 'Open the desktop application for local file import and host inventory.'}</p>${nativeHost ? '' : '<a class="text-button" href="?demo=1">Open browser demo</a>'}</div>` : ''}
     ${deviceError && isNative ? `<div class="error-notice">${esc(deviceError)}</div>` : ''}
     ${physicalPreparationEnabled() ? '<div class="inventory-note"><strong>Preparation requires exact confirmation</strong><p>Read-only inventory is not authorization to write. Review the helper-bound target and staged image below.</p></div>' : `<div class="inventory-note"><strong>Preparation unavailable</strong><p>${esc(capabilities?.preparation_unavailable_reason || preparationUnavailable)}</p></div>`}
-    ${isNative && capabilities?.platform === 'windows' && capabilities.helper_probe === true ? `<div class="inventory-note"><button class="secondary-button" id="probe-helper" ${busy || probingHelper || refreshing || pickingImages || inspectingHost ? 'disabled' : ''}>${probingHelper ? 'Checking elevated helper…' : 'Check elevated helper'}</button><p>Requests Windows elevation for a read-only connection test. No disk access. Publisher not verified.</p>${helperStatus ? `<p id="helper-status" role="status">${esc(helperStatus)}</p>` : ''}</div>` : ''}
+    ${isNative && capabilities?.platform === 'windows' && capabilities.helper_probe === true ? `<div class="inventory-note"><button class="secondary-button" id="probe-helper" ${nativeActionsLocked() ? 'disabled' : ''}>${probingHelper ? 'Checking elevated helper…' : 'Check elevated helper'}</button><p>Requests Windows elevation for a read-only connection test. No disk access. Publisher not verified.</p>${helperStatus ? `<p id="helper-status" role="status">${esc(helperStatus)}</p>` : ''}</div>` : ''}
     ${hostInventory ? `<p class="inventory-note"><code>source=${esc(hostInventory.source)} · disks=${hostInventory.disks.length}</code><br/>Read-only observations. No device is selected for writing.</p>${hostInventory.warnings.length ? `<div class="inventory-warnings">${hostInventory.warnings.map(warning => `<p><code>${esc(warning.code)}${warning.disk_id ? ` [${esc(warning.disk_id)}]` : ''}</code>: ${esc(warning.message)}</p>`).join('')}</div>` : ''}<div class="native-device-list">${hostInventory.disks.map(disk => `<article class="host-device"><h3>${esc(disk.model || disk.id)}</h3><dl class="device-details"><div><dt>Device ID</dt><dd>${esc(disk.id)}</dd></div><div><dt>Serial</dt><dd>${esc(disk.serial || 'Not reported')}</dd></div><div><dt>Capacity</dt><dd>${formatBytes(disk.size_bytes)}<br/>${exactBytes(disk.size_bytes)}</dd></div><div><dt>Bus</dt><dd>${esc(disk.bus || 'Unknown')}</dd></div><div><dt>Logical sector</dt><dd>${disk.logical_sector_size} bytes</dd></div><div><dt>Physical sector</dt><dd>${typeof disk.physical_sector_size === 'number' ? `${disk.physical_sector_size} bytes` : 'Not reported'}</dd></div><div><dt>Safety complete</dt><dd>${typeof disk.safety_checks_complete === 'boolean' ? String(disk.safety_checks_complete) : 'Not reported'}</dd></div></dl></article>`).join('') || '<p class="empty-inline">No disks returned by the host adapter.</p>'}</div>` : ''}
-    ${isNative && capabilities?.host_inventory ? `<button class="text-button inspect-host" id="inspect-host" ${busy || inspectingHost || refreshing || pickingImages ? 'disabled' : ''}>Inspect host devices (read only)</button>` : ''}
+    ${isNative && capabilities?.host_inventory ? `<button class="text-button inspect-host" id="inspect-host" ${nativeActionsLocked() ? 'disabled' : ''}>Inspect host devices (read only)</button>` : ''}
   </section>`;
 }
 function jobSourceManifest(job: PreparationSnapshot) {
   return `<section class="job-source-manifest" aria-label="Job source manifest"><div class="panel-heading"><h3>Job source manifest</h3><span class="count">${job.source_manifest.length}</span></div>
     <p class="inventory-note">${job.sources_released ? 'Source metadata from the verified staging image. Original handles released; these records are not reusable imports.' : 'Transferred source metadata. Staging may still be incomplete; these records are not reusable imports.'}</p>
-    ${job.source_manifest.length ? `<div class="image-list"><table class="image-table"><thead><tr><th scope="col">Relative path</th><th scope="col">Size</th><th scope="col">SHA-256</th></tr></thead><tbody>${job.source_manifest.map(source => `<tr><td class="image-name">${esc(source.relative_path)}</td><td class="size-cell">${formatBytes(source.bytes)}<small class="exact-value">${exactBytes(source.bytes)}</small></td><td class="hash-cell"><code>${esc(source.sha256)}</code></td></tr>`).join('')}</tbody></table></div>` : '<p class="inventory-note">Available after all source transfers and stability checks complete.</p>'}
+    ${job.source_manifest.length ? `<div class="image-list"><table class="image-table"><thead><tr><th scope="col">Relative path</th><th scope="col">Size</th><th scope="col">SHA-256</th></tr></thead><tbody>${job.source_manifest.map(source => `<tr><td class="image-name">${esc(source.relative_path)}</td><td class="size-cell">${formatBytes(source.bytes)}<small class="exact-value">${exactBytes(source.bytes)}</small></td><td class="hash-cell"><code>${esc(source.sha256)}</code></td></tr>`).join('')}</tbody></table></div>` : `<p class="inventory-note">${job.sources_released ? 'No images in this preparation. Add images to the prepared drive later.' : 'Available after all source transfers and stability checks complete.'}</p>`}
   </section>`;
+}
+function nativePreparationAllowed() {
+  return !!engineArchive && preparationTargets.some(item => item.selection_token === preparationTarget) && sourcesLoaded && !sourcesError && images.every(image => image.origin === 'native' && !!image.sourceId && image.status === 'hashed') && !nativeActionsLocked();
+}
+function engineDownloadAllowed() {
+  return isNative && capabilities?.engine_download === true && !nativeActionsLocked() && !preparationConfirming;
+}
+function engineSelectionView() {
+  const job = engineDownloadJob;
+  return `<div class="inventory-note"><div class="engine-actions">${capabilities?.engine_download === true ? `<button class="secondary-button" id="download-engine" ${engineDownloadAllowed() ? '' : 'disabled'}>Download engine</button>` : ''}<button class="secondary-button" id="pick-engine" ${nativeActionsLocked() ? 'disabled' : ''}>Choose engine archive</button></div><p>Official Ventoy 1.1.18 Linux tar.gz only. SHA-256 pin checked locally. <a href="https://github.com/ventoy/Ventoy/releases/tag/v1.1.18" target="_blank" rel="noreferrer">Upstream release</a></p>${engineArchive ? `<p>${esc(engineArchive.name)} · ${exactBytes(engineArchive.bytes)}</p><code class="checksum">${esc(engineArchive.sha256)}</code>` : '<p>No engine archive selected.</p>'}
+    ${capabilities?.engine_download === true ? `${engineDownloadRequest ? '<p role="status">Starting engine download…</p>' : !engineDownloadLoaded && !engineDownloadStatusError ? '<p role="status">Reading engine download status…</p>' : ''}${job ? `<div class="engine-download-status" role="status"><dl class="device-details"><div><dt>Phase</dt><dd>${esc(job.phase)}</dd></div><div><dt>Progress</dt><dd>${exactBytes(job.completed_bytes)} / ${exactBytes(job.total_bytes)}</dd></div><div><dt>Source</dt><dd>${job.cache_hit ? 'Verified cache' : job.phase === 'checking_cache' ? 'Checking local cache' : 'New download'}</dd></div></dl><p>Expected SHA-256</p><code class="checksum">${esc(job.expected_sha256)}</code><p>${esc(job.message)}</p>${job.active ? `<button class="secondary-button" id="cancel-engine-download" ${job.cancel_requested || engineDownloadCancelling ? 'disabled' : ''}>${job.cancel_requested || engineDownloadCancelling ? 'Cancellation requested…' : 'Cancel download'}</button>` : ''}</div>` : ''}${engineDownloadError ? `<p class="error-text" role="alert">${esc(engineDownloadError)}</p>` : ''}${engineDownloadStatusError ? '<button class="secondary-button" id="retry-engine-status">Retry download status</button>' : ''}` : ''}</div>`;
 }
 function nativePreparationPanel() {
   if (!isNative || !capabilities?.preparation_available) return '';
   const target = preparationTargets.find(item => item.selection_token === preparationTarget);
-  const allowed = !!engineArchive && !!target && images.length > 0 && images.every(image => image.origin === 'native' && !!image.sourceId && image.status === 'hashed') && !busy && !preparationRequest && !pickingImages && !releasingImages && !sourcesLoading;
+  const allowed = nativePreparationAllowed();
+  const visibleTargets = visiblePreparationTargets(preparationTargets, showLargeDrives, preparationTarget);
+  const hiddenTargets = preparationTargets.length - visibleTargets.length;
   return `<section class="panel native-preparation"><div class="panel-heading"><h2>Prepare device</h2></div>
     <p class="inventory-note">Builds a verified staging image in protected local storage. Requires Windows elevation and enough free space for the whole target. Configuration preview is not applied. ${capabilities.physical_preparation ? 'Writing requires a separate exact confirmation.' : 'Physical writing is disabled in this build.'}</p>
-    <div class="inventory-note"><button class="secondary-button" id="pick-engine" ${busy || preparationRequest || pickingImages || releasingImages ? 'disabled' : ''}>Choose engine archive</button><p>Official Ventoy 1.1.18 Linux tar.gz only. SHA-256 pin checked locally. <a href="https://github.com/ventoy/Ventoy/releases/tag/v1.1.18" target="_blank" rel="noreferrer">Upstream release</a></p>${engineArchive ? `<p>${esc(engineArchive.name)} · ${exactBytes(engineArchive.bytes)}</p><code class="checksum">${esc(engineArchive.sha256)}</code>` : '<p>No engine archive selected.</p>'}</div>
-    <label class="inventory-note" for="preparation-target">Target candidate (helper revalidates)<select id="preparation-target" ${busy || preparationRequest ? 'disabled' : ''}><option value="">Choose a target</option>${preparationTargets.map(item => `<option value="${esc(item.selection_token)}" ${preparationTarget === item.selection_token ? 'selected' : ''}>${esc(item.display_id)} · ${esc(item.disk.friendly_name || 'Unnamed')} · ${item.disk.size === null ? 'unknown size' : formatBytes(item.disk.size)}</option>`).join('')}</select></label>
-    ${target ? `<details class="inventory-note"><summary>Candidate device fields</summary><pre>${esc(JSON.stringify(target.disk, null, 2))}</pre></details>` : ''}
+    <div id="engine-selection">${engineSelectionView()}</div>
+    <label class="inventory-note" for="preparation-target">Target candidate (helper revalidates)<select id="preparation-target" ${busy || engineDownloadLocked() || preparationRequest ? 'disabled' : ''}><option value="">Choose a target</option>${visibleTargets.map(item => `<option value="${esc(item.selection_token)}" ${preparationTarget === item.selection_token ? 'selected' : ''}>${preparationTargetLabel(item)}</option>`).join('')}</select></label>
+    <label class="inventory-note large-drive-option"><input type="checkbox" id="show-large-drives" ${showLargeDrives ? 'checked' : ''}/> Show large drives (over 256 GiB)${hiddenTargets ? ` · ${hiddenTargets} hidden` : ''}</label>
+    ${target ? `<details class="inventory-note"><summary>Candidate device fields</summary><pre>${esc(JSON.stringify({ ...target.disk, volume_labels: target.volume_labels ?? null }, null, 2))}</pre></details>` : ''}
+    <div id="preparation-prerequisites" class="inventory-note" role="status">${preparationPrerequisites()}</div>
     <div class="inventory-note"><button class="primary-button" id="start-preparation" ${allowed ? '' : 'disabled'}>${preparationRequest ? 'Starting…' : 'Build preparation image'}</button></div>
     ${preparationError ? `<p class="error-notice" role="alert">${esc(preparationError)}</p>` : ''}
     ${preparationJob ? `<div class="preparation-status" role="status"><dl class="device-details"><div><dt>Job ID</dt><dd>${esc(preparationJob.job_id)}</dd></div><div><dt>Phase</dt><dd>${esc(preparationJob.phase)}</dd></div><div><dt>Progress</dt><dd>${exactBytes(preparationJob.completed_bytes)} / ${exactBytes(preparationJob.total_bytes)}</dd></div><div><dt>Written / verified</dt><dd>${exactBytes(preparationJob.bytes_written)} / ${exactBytes(preparationJob.bytes_verified)}</dd></div><div><dt>Source handles released</dt><dd>${preparationJob.sources_released}</dd></div><div><dt>Target may be incomplete</dt><dd>${preparationJob.target_may_be_incomplete}</dd></div></dl><p class="inventory-note">${esc(preparationJob.message)}</p>${preparationJob.target ? `<details class="inventory-note" open><summary>Helper-bound target</summary><pre>${esc(JSON.stringify(preparationJob.target, null, 2))}</pre></details>` : ''}${preparationJob.image_sha256 ? `<div class="inventory-note">Image SHA-256<code class="checksum">${esc(preparationJob.image_sha256)}</code></div>` : ''}${preparationJob.description_digest ? `<div class="inventory-note">Description digest<code class="checksum">${esc(preparationJob.description_digest)}</code></div>` : ''}
@@ -154,7 +214,7 @@ function targetPanel() {
   if (!isDemo) return nativeTargetPanel();
   const disk = selected?.disk;
   const risks = selected?.verdict.risks || [];
-  return `<section class="panel target-panel"><div class="panel-heading"><h2>Target device</h2><button class="text-button" id="refresh-drives" ${busy || refreshing ? 'disabled' : ''}>${refreshing ? 'Loading…' : 'Refresh'}</button></div>
+  return `<section class="panel target-panel"><div class="panel-heading"><h2>Target device</h2><button class="text-button" id="refresh-drives" ${busy || engineDownloadLocked() || refreshing ? 'disabled' : ''}>${refreshing ? 'Loading…' : 'Refresh'}</button></div>
     ${deviceError ? `<div class="error-notice">${esc(deviceError)}</div>` : ''}
     <button class="selected-drive" id="choose-drive" ${busy || refreshing ? 'disabled' : ''}><span><strong>${deviceName(selected)}</strong><small>Change fixture device</small></span>${icon('down')}</button>
     ${selected && disk ? `<div class="inventory-note">Inventory: built-in fixtures. No OS device enumeration.</div><div class="drive-facts"><span>Guard status</span>${badge(selected.verdict.state)}</div><dl class="device-details"><div><dt>Device ID</dt><dd>${esc(disk.id)}</dd></div><div><dt>Serial</dt><dd>${esc(disk.serial)}</dd></div><div><dt>Capacity</dt><dd>${formatBytes(disk.size_bytes)}<br/>${exactBytes(disk.size_bytes)}</dd></div><div><dt>Bus</dt><dd>${esc(disk.bus.toUpperCase())}</dd></div><div><dt>Logical sector</dt><dd>${disk.logical_sector_size} bytes</dd></div><div><dt>Physical sector</dt><dd>${typeof disk.physical_sector_size === 'number' && disk.physical_sector_size > 0 ? `${disk.physical_sector_size} bytes` : 'Not reported'}</dd></div><div><dt>Layout</dt><dd>GPT / exFAT (planned)</dd></div></dl>` : ''}
@@ -171,7 +231,7 @@ function layoutPanel() {
   const partitions = plan?.partitions || [];
   return `<section class="panel layout-panel"><div class="panel-heading"><h3>Partition plan</h3><span class="subtle">GPT / 1 MiB alignment</span></div>${planLoading ? '<p class="subtle">Calculating partition boundaries…</p>' : planError ? `<p class="error-notice">${esc(planError)}</p>` : plan ? `<div class="geometry"><div class="geometry-summary">Logical sector: ${plan.logical_sector_size} bytes<br/>Device: ${exactBytes(plan.size_bytes)}</div>${partitions.map(part => `<section class="partition-details"><h4>${esc(part.name)}</h4><dl><div><dt>Start LBA</dt><dd>${part.start_lba.toLocaleString('en-GB')}</dd></div><div><dt>End LBA</dt><dd>${part.end_lba.toLocaleString('en-GB')}</dd></div><div><dt>Sectors</dt><dd>${(part.end_lba - part.start_lba + 1).toLocaleString('en-GB')}</dd></div><div><dt>Size</dt><dd>${exactBytes((part.end_lba - part.start_lba + 1) * plan!.logical_sector_size)}</dd></div></dl></section>`).join('')}</div>` : '<p class="subtle">Choose a device to calculate the layout.</p>'}</section>`;
 }
-function imagesView() { const filtered = images.filter(image => imagePath(image).toLowerCase().includes(query.toLowerCase())); return `${titleBlock('', 'Images', 'Local SHA-256 fingerprints. Publisher verification is not connected.', isDemo ? `<button class="secondary-button" id="load-samples" ${busy ? 'disabled' : ''}>Load samples</button>` : '')}<section class="panel library-panel">${dropZone()}<div class="library-toolbar"><h2>Image library <span class="count">${images.length}</span></h2><button class="text-button" id="clear-images" ${busy || pickingImages || releasingImages || sourcesLoading || !images.length ? 'disabled' : ''}>${releasingImages ? 'Releasing sources…' : 'Clear library'}</button><label class="search-field">${icon('search')}<input id="image-search" type="search" value="${esc(query)}" aria-label="Search images" placeholder="Filter filenames"/></label></div><div class="image-list" id="filtered-images">${filtered.length ? imageTable(filtered) : '<div class="empty-inline">No matching images.</div>'}</div><div class="panel-foot"><span>${isDemo ? 'Sample entries contain no files. ' : ''}${isNative ? 'Native sources stay open until removed or the application exits. Reload restores the catalogue; hashes are from import time.' : 'Browser fingerprints are cleared on reload.'}</span><span>${formatBytes(sumBytes())} total</span></div></section>`; }
+function imagesView() { const filtered = images.filter(image => imagePath(image).toLowerCase().includes(query.toLowerCase())); return `${titleBlock('', 'Images', 'Local SHA-256 fingerprints. Publisher verification is not connected.', isDemo ? `<button class="secondary-button" id="load-samples" ${busy ? 'disabled' : ''}>Load samples</button>` : '')}<section class="panel library-panel">${dropZone()}<div class="library-toolbar"><h2>Image library <span class="count">${images.length}</span></h2><button class="text-button" id="clear-images" ${nativeActionsLocked() || !images.length ? 'disabled' : ''}>${releasingImages ? 'Releasing sources…' : 'Clear library'}</button><label class="search-field">${icon('search')}<input id="image-search" type="search" value="${esc(query)}" aria-label="Search images" placeholder="Filter filenames"/></label></div><div class="image-list" id="filtered-images">${filtered.length ? imageTable(filtered) : '<div class="empty-inline">No matching images.</div>'}</div><div class="panel-foot"><span>${isDemo ? 'Sample entries contain no files. ' : ''}${isNative ? capabilities?.session_restore ? 'Saved native sources are restored by the desktop. Review missing or changed file warnings before preparing.' : 'Native sources stay open until removed or the application exits. Reload restores the catalogue; hashes are from import time.' : 'Browser fingerprints are cleared on reload.'}</span><span>${formatBytes(sumBytes())} total</span></div></section>`; }
 function settingsView() { return `${titleBlock('', 'Configuration', 'Edit and export YAML or TOML. Changes are not applied to a drive.')}<div class="settings-grid"><section class="panel"><div class="panel-heading"><h2>Boot settings</h2><span class="badge">Preview</span></div>${optionRow('netboot', 'globe', 'Include network boot', 'Add netboot.xyz to the planned boot menu.', options.netboot)}${optionRow('memtest', 'activity', 'Include memory test', 'Add a Memtest86+ entry to the preview.', options.memtest)}${optionRow('systemInfo', 'monitor', 'Show system information', 'Hardware details in the launcher preview.', options.systemInfo)}${powerSettings()}<label class="field-row"><span><strong>Boot timeout</strong><small>Seconds before default selection.</small></span><input id="timeout" type="number" min="0" max="300" value="${options.timeout}"/></label><label class="field-row"><span><strong>Secure Boot policy</strong><small>Configuration only; not enforced here.</small></span><select id="policy">${['enforce', 'prompt', 'off'].map(policy => `<option ${options.policy === policy ? 'selected' : ''}>${policy}</option>`).join('')}</select></label><label class="field-row"><span><strong>Launcher theme</strong><small>Used in the launcher preview.</small></span><select id="theme">${['midnight', 'aurora'].map(theme => `<option ${options.theme === theme ? 'selected' : ''}>${theme}</option>`).join('')}</select></label><div class="settings-note">${icon('info')} These settings and power-menu controls are not applied to Ventoy engine media.</div></section><section class="panel config-panel"><div class="panel-heading"><h2>Configuration source</h2><div class="segmented" aria-label="Configuration format"><button data-format="yaml" class="${configFormat === 'yaml' ? 'selected' : ''}">YAML</button><button data-format="toml" class="${configFormat === 'toml' ? 'selected' : ''}">TOML</button></div></div><div class="editor-label"><span class="status-dot"></span> isohopper.${configFormat === 'yaml' ? 'yml' : 'toml'}<span>LOCAL PREVIEW</span></div><textarea id="config-editor" aria-label="Configuration source" spellcheck="false">${esc(configText())}</textarea><div class="config-actions"><button class="secondary-button" id="validate-config">${icon('check')} Validate</button><button class="secondary-button" id="reset-config">Reset from settings</button><button class="primary-button compact" id="download-config">${icon('download')} Export</button></div>${configResult ? `<div class="config-result" role="status">${esc(configResult)}</div>` : ''}<p class="subtle editor-note">Changing form settings or format replaces manual edits. Export edits first.</p></section></div>`; }
 function activityView() { return `${titleBlock('', 'Activity', isDemo ? 'File hashing and simulation events for this session.' : capabilities?.preparation_available ? 'Host inventory, file hashing and preparation events for this session.' : 'Host inventory and local file hashing events for this session.', '<button class="secondary-button" id="export-activity">'+icon('download')+' Export activity</button>')}<section class="panel activity-panel"><div class="panel-heading"><h2>This session <span class="count">${logs.length}</span></h2><button class="text-button" id="clear-activity">Clear activity</button></div>${logs.length ? logs.map(item => `<article class="log-row"><span class="log-symbol ${item.kind}">[${item.kind === 'success' ? 'OK' : item.kind === 'warning' ? 'WARN' : 'INFO'}]</span><div><strong>${esc(item.title)}</strong><p>${esc(item.detail)}</p></div><time>${item.time}</time></article>`).join('') : '<div class="empty-state">No events.</div>'}</section>`; }
 function launcherView() {
@@ -184,7 +244,7 @@ function inventoryView() {
   return `<div class="modal-backdrop inventory-backdrop"><section class="inventory-dialog" role="dialog" aria-modal="true" aria-labelledby="inventory-title"><div class="panel-heading"><h2 id="inventory-title">Host devices — read only</h2><button class="icon-button" id="close-inventory" aria-label="Close host inventory">${icon('close')}</button></div><p class="dialog-description">Actual OS inventory. These records cannot be selected for preparation. Unknown safety metadata remains unknown.</p>${inspectingHost ? '<p class="inventory-status" role="status">Reading host inventory…</p>' : inventoryError ? `<p class="error-notice">${esc(inventoryError)}</p>` : hostInventory ? `<div class="inventory-toolbar"><code>source=${esc(hostInventory.source)} disks=${hostInventory.disks.length} warnings=${hostInventory.warnings.length}</code><button class="secondary-button" id="export-inventory">Export JSON</button></div>${hostInventory.warnings.length ? `<div class="inventory-warnings">${hostInventory.warnings.map(warning => `<p><code>${esc(warning.code)}${warning.disk_id ? ` [${esc(warning.disk_id)}]` : ''}</code> ${esc(warning.message)}</p>`).join('')}</div>` : ''}<div class="host-device-list">${hostInventory.disks.length ? hostInventory.disks.map(disk => `<article class="host-device"><h3>${esc(disk.model || disk.id)}</h3><dl class="device-details"><div><dt>Device ID</dt><dd>${esc(disk.id)}</dd></div><div><dt>Serial</dt><dd>${esc(disk.serial || 'Not reported')}</dd></div><div><dt>Capacity</dt><dd>${formatBytes(disk.size_bytes)} / ${exactBytes(disk.size_bytes)}</dd></div><div><dt>Bus</dt><dd>${esc(disk.bus || 'Unknown')}</dd></div><div><dt>Logical sector</dt><dd>${disk.logical_sector_size} bytes</dd></div><div><dt>Physical sector</dt><dd>${typeof disk.physical_sector_size === 'number' && disk.physical_sector_size > 0 ? `${disk.physical_sector_size} bytes` : 'Not reported'}</dd></div><div><dt>Safety complete</dt><dd>${typeof disk.safety_checks_complete === 'boolean' ? String(disk.safety_checks_complete) : 'Not reported'}</dd></div></dl><details><summary>All reported fields</summary><pre>${esc(JSON.stringify(disk, null, 2))}</pre></details></article>`).join('') : '<p class="empty-inline">No disks returned by the host adapter.</p>'}</div>` : ''}</section></div>`;
 }
 async function inspectHost() {
-  if (!bridge.InspectDevices || !capabilities?.host_inventory || inspectingHost || refreshing || pickingImages) return;
+  if (nativeActionsLocked() || !bridge.InspectDevices || !capabilities?.host_inventory) return;
   deviceDialog = false; inventoryDialog = true; inspectingHost = true; inventoryError = ''; render();
   document.querySelector<HTMLButtonElement>('#close-inventory')?.focus();
   try { hostInventory = await bridge.InspectDevices(); log('Host inventory read', `source=${hostInventory.source} disks=${hostInventory.disks.length} warnings=${hostInventory.warnings.length} read_only=true selectable=false`); }
@@ -206,8 +266,9 @@ function bindEvents() {
   document.querySelectorAll<HTMLButtonElement>('[data-disk]').forEach(button => button.onclick = async () => { const record = disks.find(item => item.disk.id === button.dataset.disk); if (!isDemo || !record || record.verdict.state === 'blocked' || busy) return; selected = record; confirmation = ''; complete = false; deviceDialog = false; log('Fixture selected', `id=${record.disk.id} serial=${record.disk.serial} model=${record.disk.model} bytes=${record.disk.size_bytes} bus=${record.disk.bus} logical_sector=${record.disk.logical_sector_size} physical_sector=${record.disk.physical_sector_size ?? 'unknown'} verdict=${record.verdict.state} risks=${(record.verdict.risks || []).map(reason => reason.code).join(',') || 'none'}`, record.verdict.state === 'confirm' ? 'warning' : 'info'); await loadPlan(); });
   document.querySelector('#refresh-drives')?.addEventListener('click', loadDevices);
   document.querySelector('#probe-helper')?.addEventListener('click', probeHelper);
-  document.querySelector('#pick-engine')?.addEventListener('click', pickEngine);
-  document.querySelector<HTMLSelectElement>('#preparation-target')?.addEventListener('change', event => { preparationTarget = (event.target as HTMLSelectElement).value; preparationPhrase = ''; render(); });
+  bindEngineEvents();
+  document.querySelector<HTMLSelectElement>('#preparation-target')?.addEventListener('change', event => { preparationTarget = (event.target as HTMLSelectElement).value; targetHint = preparationTargetHint(preparationTargets.find(item => item.selection_token === preparationTarget)); preparationPhrase = ''; savePreferences(); render(); });
+  document.querySelector<HTMLInputElement>('#show-large-drives')?.addEventListener('change', event => { showLargeDrives = (event.target as HTMLInputElement).checked; savePreferences(); render(); });
   document.querySelector('#start-preparation')?.addEventListener('click', startNativePreparation);
   document.querySelector('#cancel-preparation')?.addEventListener('click', cancelNativePreparation);
   document.querySelector('#confirm-preparation')?.addEventListener('click', confirmNativePreparation);
@@ -228,24 +289,24 @@ function bindEvents() {
   document.querySelector('#simulate')?.addEventListener('click', simulate);
   const dropzone = document.querySelector<HTMLButtonElement>('#dropzone');
   if (dropzone) { dropzone.onclick = () => void browseImages(); dropzone.ondragover = event => { event.preventDefault(); dropzone.classList.add('dragging'); }; dropzone.ondragleave = () => dropzone.classList.remove('dragging'); dropzone.ondrop = event => { event.preventDefault(); dropzone.classList.remove('dragging'); if (!busy) void addFiles(Array.from(event.dataTransfer?.files || [])); }; }
-  document.querySelector('#retry-sources')?.addEventListener('click', () => void restoreSources());
+  document.querySelector('#retry-sources')?.addEventListener('click', () => { if (!nativeActionsLocked()) void restoreSources(); });
   document.querySelector('#import-folder')?.addEventListener('click', () => void browseImages('folder'));
   document.querySelector<HTMLInputElement>('#folder-input')!.onchange = event => void addFiles(Array.from((event.target as HTMLInputElement).files || []));
   document.querySelector<HTMLInputElement>('#file-input')!.onchange = event => void addFiles(Array.from((event.target as HTMLInputElement).files || []));
   bindImageActions();
-  document.querySelectorAll<HTMLInputElement>('[data-option]').forEach(input => input.onchange = () => { (options as unknown as Record<string, boolean>)[input.dataset.option!] = input.checked; customConfig = undefined; configResult = ''; complete = false; render(); });
-  document.querySelectorAll<HTMLInputElement>('[data-power-option]').forEach(input => input.onchange = () => { options.power[input.dataset.powerOption as keyof typeof options.power] = input.checked; customConfig = undefined; configResult = ''; complete = false; render(); });
+  document.querySelectorAll<HTMLInputElement>('[data-option]').forEach(input => input.onchange = () => { (options as unknown as Record<string, boolean>)[input.dataset.option!] = input.checked; customConfig = undefined; configResult = ''; complete = false; savePreferences(); render(); });
+  document.querySelectorAll<HTMLInputElement>('[data-power-option]').forEach(input => input.onchange = () => { options.power[input.dataset.powerOption as keyof typeof options.power] = input.checked; customConfig = undefined; configResult = ''; complete = false; savePreferences(); render(); });
   document.querySelectorAll<HTMLButtonElement>('[data-power-preview]').forEach(button => button.onclick = () => { const action = button.dataset.powerPreview as keyof typeof powerLabels; notify(`${powerLabels[action]}: preview only. No host action performed.`); });
   document.querySelector('#load-samples')?.addEventListener('click', () => { if (!isDemo || busy || releasingImages) return; if (!images.some(image => image.id === 'sample-linux')) images.push({ id: 'sample-linux', name: 'linux-desktop-demo.iso', size: 4_800_000_000, sample: true, status: 'sample' }); if (!images.some(image => image.id === 'sample-recovery')) images.push({ id: 'sample-recovery', name: 'recovery-toolkit-demo.img', size: 1_600_000_000, sample: true, status: 'sample' }); complete = false; log('Sample manifest loaded', 'Two illustrative entries. No image data loaded or downloaded.'); render(); });
   document.querySelector<HTMLInputElement>('#image-search')?.addEventListener('input', event => { query = (event.target as HTMLInputElement).value; const filtered = images.filter(image => imagePath(image).toLowerCase().includes(query.toLowerCase())); document.querySelector('#filtered-images')!.innerHTML = filtered.length ? imageTable(filtered) : '<div class="empty-inline">No matching images.</div>'; bindImageActions(); });
-  document.querySelectorAll<HTMLButtonElement>('[data-format]').forEach(button => button.onclick = () => { configFormat = button.dataset.format!; customConfig = undefined; configResult = ''; render(); });
-  document.querySelector<HTMLTextAreaElement>('#config-editor')?.addEventListener('input', event => { customConfig = (event.target as HTMLTextAreaElement).value; configResult = ''; document.querySelector('.config-result')?.remove(); });
-  document.querySelector<HTMLInputElement>('#timeout')?.addEventListener('change', event => { options.timeout = Math.max(0, Math.min(300, Number((event.target as HTMLInputElement).value) || 0)); customConfig = undefined; configResult = ''; render(); });
-  for (const key of ['policy', 'theme'] as const) document.querySelector<HTMLSelectElement>(`#${key}`)?.addEventListener('change', event => { options[key] = (event.target as HTMLSelectElement).value; customConfig = undefined; configResult = ''; render(); });
+  document.querySelectorAll<HTMLButtonElement>('[data-format]').forEach(button => button.onclick = () => { configFormat = button.dataset.format === 'toml' ? 'toml' : 'yaml'; customConfig = undefined; configResult = ''; savePreferences(); render(); });
+  document.querySelector<HTMLTextAreaElement>('#config-editor')?.addEventListener('input', event => { customConfig = (event.target as HTMLTextAreaElement).value; configResult = ''; savePreferences(); document.querySelector('.config-result')?.remove(); });
+  document.querySelector<HTMLInputElement>('#timeout')?.addEventListener('change', event => { options.timeout = Math.max(0, Math.min(300, Math.trunc(Number((event.target as HTMLInputElement).value)) || 0)); customConfig = undefined; configResult = ''; savePreferences(); render(); });
+  for (const key of ['policy', 'theme'] as const) document.querySelector<HTMLSelectElement>(`#${key}`)?.addEventListener('change', event => { const value = (event.target as HTMLSelectElement).value; if (key === 'policy' && (value === 'enforce' || value === 'prompt' || value === 'off')) options.policy = value; if (key === 'theme' && (value === 'midnight' || value === 'aurora')) options.theme = value; customConfig = undefined; configResult = ''; savePreferences(); render(); });
   document.querySelector('#validate-config')?.addEventListener('click', async () => { const text = configText(); const format = configFormat; try { const result = await bridge.CheckConfig(text, format); if (text !== configText() || format !== configFormat) return; configResult = result.valid ? `Native schema validation: valid.${result.warnings?.length ? ` Warnings: ${result.warnings.join('; ')}` : ' No warnings.'} Boot chain not validated.` : result.error || 'Configuration did not pass validation.'; log(result.valid ? 'Configuration validated' : 'Configuration validation result', configResult, result.valid ? 'success' : 'warning'); } catch (error) { configResult = `Validation unavailable: ${errorMessage(error)}`; } render(); });
-  document.querySelector('#reset-config')?.addEventListener('click', () => { customConfig = undefined; configResult = ''; render(); });
+  document.querySelector('#reset-config')?.addEventListener('click', () => { customConfig = undefined; configResult = ''; savePreferences(); render(); });
   document.querySelector('#download-config')?.addEventListener('click', () => { download(`isohopper.${configFormat === 'yaml' ? 'yml' : 'toml'}`, configText(), 'text/plain'); log('Configuration exported', `Downloaded the ${configFormat.toUpperCase()} preview. No target drive was modified.`); notify('Configuration preview exported.'); });
-  document.querySelector('#export-activity')?.addEventListener('click', () => download('isohopper-session.json', JSON.stringify({ experimental: true, exported_at: new Date().toISOString(), bridge_mode: bridgeMode, runtime_capabilities: capabilities ?? null, preparation_snapshot: preparationJob, events: logs }, null, 2), 'application/json'));
+  document.querySelector('#export-activity')?.addEventListener('click', () => download('isohopper-session.json', JSON.stringify({ experimental: true, exported_at: new Date().toISOString(), bridge_mode: bridgeMode, runtime_capabilities: capabilities ?? null, preparation_snapshot: preparationJob, engine_download_snapshot: engineDownloadJob, events: logs }, null, 2), 'application/json'));
   document.querySelector('#clear-activity')?.addEventListener('click', () => { logs = []; render(); });
   document.querySelectorAll<HTMLButtonElement>('[data-boot]').forEach(button => button.onclick = () => { launcherChoice = Number(button.dataset.boot); render(); document.querySelector<HTMLButtonElement>(`[data-boot="${launcherChoice}"]`)?.focus(); });
 }
@@ -255,17 +316,103 @@ function bindImageActions() {
   if (clear) clear.onclick = () => void removeImages(new Set(images.map(image => image.id)));
   document.querySelectorAll<HTMLButtonElement>('.copy-hash').forEach(button => button.onclick = async () => { const image = images.find(item => item.id === button.dataset.id); if (!image?.hash) return; try { await navigator.clipboard.writeText(image.hash); notify(`SHA-256 copied: ${image.hash}`); } catch { notify('Clipboard access failed. Select and copy the full checksum from the table.'); } });
 }
+function bindEngineEvents() {
+  document.querySelector('#pick-engine')?.addEventListener('click', pickEngine);
+  document.querySelector('#download-engine')?.addEventListener('click', startEngineDownload);
+  document.querySelector('#cancel-engine-download')?.addEventListener('click', cancelEngineDownload);
+  document.querySelector('#retry-engine-status')?.addEventListener('click', () => void pollEngineDownload());
+}
+// A progress tick replaces only the engine block. Do not reset another field's
+// text, focus, selection, or a typed physical-write confirmation.
+function renderEngineDownload() {
+  const prerequisites = document.querySelector('#preparation-prerequisites');
+  if (prerequisites) prerequisites.innerHTML = preparationPrerequisites();
+  const block = document.querySelector('#engine-selection');
+  if (block) { block.innerHTML = engineSelectionView(); bindEngineEvents(); }
+  const disabled = (selector: string, value: boolean) => document.querySelectorAll<HTMLButtonElement | HTMLSelectElement>(selector).forEach(node => { node.disabled = value; });
+  disabled('#start-preparation', !nativePreparationAllowed());
+  disabled('#preparation-target', busy || engineDownloadLocked() || preparationRequest);
+  disabled('#dropzone, #import-folder', busy || pickingImages || releasingImages || !canImport());
+  disabled('#refresh-drives', nativeActionsLocked() || !isNative);
+  disabled('#probe-helper', nativeActionsLocked());
+  disabled('#inspect-host', nativeActionsLocked());
+  disabled('#confirm-preparation', !preparationConfirmationAllowed());
+  disabled('.remove-image', nativeActionsLocked());
+  disabled('#clear-images', nativeActionsLocked() || !images.length);
+  disabled('#retry-sources', nativeActionsLocked());
+}
+function scheduleEngineDownloadPoll() {
+  clearTimeout(engineDownloadTimer);
+  if (engineDownloadJob?.active) engineDownloadTimer = setTimeout(() => void pollEngineDownload(), 750);
+}
+async function acceptEngineDownload(next: EngineDownloadSnapshot | null) {
+  const previous = engineDownloadJob;
+  const recovering = engineDownloadStatusError;
+  if (!next && previous?.active) throw new Error('Active engine download disappeared; completion is unknown.');
+  engineDownloadJob = next;
+  engineDownloadLoaded = true;
+  engineDownloadStatusError = false;
+  if (next && (next.job_id !== previous?.job_id || next.phase !== previous?.phase)) log('Engine download state', `job=${next.job_id} phase=${next.phase} bytes=${next.completed_bytes}/${next.total_bytes} cache_hit=${next.cache_hit} expected_sha256=${next.expected_sha256} ${next.message}`, next.phase === 'failed' ? 'warning' : next.phase === 'ready' ? 'success' : 'info');
+  engineDownloadSyncing = true;
+  try {
+    if (next?.phase !== 'ready') engineSelectionJob = undefined;
+    if (next?.phase === 'ready' && engineSelectionJob !== next.job_id) {
+      // Only the current catalogue grants a reusable selection. Job history
+      // deliberately contains no source capability.
+      engineArchive = await bridge.SelectedEngineArchive?.() || null;
+      engineSelectionJob = next.job_id;
+      if (!engineArchive) engineDownloadError = 'Download verified. No retained engine archive; choose an archive or download again.';
+    }
+    if ((previous?.active || recovering) && !next?.active && !preparationJob?.active && capabilities?.preparation_available && !preparationTargets.length) {
+      try { setPreparationTargets(await bridge.ListPreparationTargets?.() || []); }
+      catch (error) { preparationError = errorMessage(error); }
+      const target = document.querySelector<HTMLSelectElement>('#preparation-target');
+      if (target) target.innerHTML = '<option value="">Choose a target</option>' + visiblePreparationTargets(preparationTargets, showLargeDrives, preparationTarget).map(item => `<option value="${esc(item.selection_token)}" ${preparationTarget === item.selection_token ? 'selected' : ''}>${preparationTargetLabel(item)}</option>`).join('');
+    }
+  } finally { engineDownloadSyncing = false; }
+}
+async function pollEngineDownload() {
+  if (capabilities?.engine_download !== true || !bridge.EngineDownloadStatus || engineDownloadPolling) return;
+  engineDownloadPolling = true;
+  try {
+    const next = await bridge.EngineDownloadStatus();
+    engineDownloadError = '';
+    await acceptEngineDownload(next);
+  } catch (error) {
+    engineDownloadLoaded = false;
+    engineDownloadStatusError = true;
+    engineDownloadError = `Download status unavailable; operation state retained. ${errorMessage(error)}`;
+  } finally { engineDownloadPolling = false; renderEngineDownload(); scheduleEngineDownloadPoll(); }
+}
+async function startEngineDownload() {
+  if (!bridge.StartEngineDownload || !engineDownloadAllowed()) return;
+  engineDownloadRequest = true; engineDownloadError = ''; renderEngineDownload();
+  try { await acceptEngineDownload(await bridge.StartEngineDownload()); }
+  catch (error) {
+    // A rejected reply does not prove that native work never started.
+    await pollEngineDownload();
+    engineDownloadError = `Download could not start. ${errorMessage(error)}${engineDownloadStatusError ? ' Download status is unknown; retry status.' : ' Retry Download engine or choose an archive.'}`;
+  } finally { engineDownloadRequest = false; renderEngineDownload(); scheduleEngineDownloadPoll(); }
+}
+async function cancelEngineDownload() {
+  if (!bridge.CancelEngineDownload || !engineDownloadJob?.active || engineDownloadJob.cancel_requested || engineDownloadCancelling) return;
+  const job = engineDownloadJob;
+  engineDownloadCancelling = true; renderEngineDownload();
+  try { await bridge.CancelEngineDownload(job.job_id); if (engineDownloadJob?.job_id === job.job_id && engineDownloadJob.active) engineDownloadJob.cancel_requested = true; }
+  catch (error) { engineDownloadError = `Cancellation failed. ${errorMessage(error)}`; }
+  finally { engineDownloadCancelling = false; renderEngineDownload(); scheduleEngineDownloadPoll(); }
+}
 async function pickEngine() {
-  if (!bridge.PickEngineArchive || busy || preparationRequest || pickingImages || releasingImages) return;
+  if (nativeActionsLocked() || !bridge.PickEngineArchive) return;
   preparationRequest = true; preparationError = ''; render();
   try { const result = await bridge.PickEngineArchive(); if (result) { engineArchive = result; log('Engine archive selected', `version=${result.version} bytes=${result.bytes} sha256=${result.sha256}`); } }
   catch (error) { preparationError = errorMessage(error); }
   finally { preparationRequest = false; render(); }
 }
 async function startNativePreparation() {
-  if (!bridge.StartPreparation || !engineArchive || !preparationTarget || busy || preparationRequest || !images.length || images.some(image => !image.sourceId || image.status !== 'hashed' || image.origin !== 'native')) return;
+  if (!bridge.StartPreparation || !nativePreparationAllowed()) return;
   preparationRequest = true; preparationError = ''; preparationPhrase = ''; render();
-  try { preparationJob = await bridge.StartPreparation(preparationTarget, images.map(image => image.sourceId!), engineArchive.archive_id); busy = preparationJob.active; log('Native preparation started', `job=${preparationJob.job_id} sources=${images.length} physical_write_enabled=${capabilities?.physical_preparation === true}`); schedulePreparationPoll(); }
+  try { preparationJob = await bridge.StartPreparation(preparationTarget, images.map(image => image.sourceId!), engineArchive!.archive_id); busy = preparationJob.active; log('Native preparation started', `job=${preparationJob.job_id} sources=${images.length} physical_write_enabled=${capabilities?.physical_preparation === true}`); schedulePreparationPoll(); }
   catch (error) { preparationError = errorMessage(error); }
   finally { preparationRequest = false; render(); }
 }
@@ -307,13 +454,15 @@ async function pollPreparation() {
   finally { preparationPolling = false; schedulePreparationPoll(); }
 }
 async function loadPreparation() {
-  if (!isNative || !capabilities?.preparation_available) return;
-  await pollPreparation();
+  if (!isNative) return;
+  if (capabilities?.preparation_available) await pollPreparation();
+  if (capabilities?.engine_download === true) await pollEngineDownload();
+  if (!capabilities?.preparation_available) return;
   engineArchive = await bridge.SelectedEngineArchive?.() || null;
-  if (!preparationJob?.active) { preparationTargets = await bridge.ListPreparationTargets?.() || []; preparationTarget = ''; }
+  if (!preparationJob?.active && !engineDownloadLocked()) { setPreparationTargets(await bridge.ListPreparationTargets?.() || []); }
 }
 async function probeHelper() {
-  if (busy || !isNative || capabilities?.platform !== 'windows' || capabilities.helper_probe !== true || !bridge.ProbeHelper || probingHelper || refreshing || pickingImages || inspectingHost) return;
+  if (nativeActionsLocked() || !isNative || capabilities?.platform !== 'windows' || capabilities.helper_probe !== true || !bridge.ProbeHelper) return;
   probingHelper = true;
   helperStatus = 'Waiting for Windows elevation and helper response. Cancel in the Windows prompt; Studio remains open until the check finishes.';
   render();
@@ -327,7 +476,7 @@ async function probeHelper() {
   } finally { probingHelper = false; render(); }
 }
 async function removeImages(rowIds: ReadonlySet<string>) {
-  if (busy || pickingImages || releasingImages || sourcesLoading) return;
+  if (nativeActionsLocked()) return;
   releasingImages = true; render();
   try {
     const removed = images.filter(image => rowIds.has(image.id));
@@ -343,23 +492,32 @@ function closeDialog() { deviceDialog = false; render(); document.querySelector<
 document.addEventListener('keydown', event => { if (!deviceDialog && !inventoryDialog) return; if (event.key === 'Escape') { if (inventoryDialog) closeInventory(); else closeDialog(); } if (event.key === 'Tab') { const dialog = document.querySelector(inventoryDialog ? '.inventory-dialog' : '.device-dialog'); const items = Array.from(dialog?.querySelectorAll<HTMLElement>('button:not(:disabled), summary') || []); const first = items[0]; const last = items[items.length - 1]; if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); } else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); } } });
 async function restoreSources() {
   if (!isNative || sourcesLoading || pickingImages || releasingImages) return;
-  sourcesLoading = true; sourcesError = ''; render();
+  sourcesLoading = true; sourcesError = ''; sourceRestoreWarnings = []; render();
   try {
-    if (!bridge.ListSources) throw new Error('Native source listing is unavailable.');
-    const retained = await bridge.ListSources();
+    let retained;
+    if (capabilities?.session_restore === true) {
+      if (!bridge.RestoreSession) throw new Error('Native session restoration is unavailable.');
+      const restored = await bridge.RestoreSession();
+      retained = restored.images;
+      sourceRestoreWarnings = restored.warnings;
+      for (const warning of sourceRestoreWarnings) log('Saved source skipped', warning, 'warning');
+    } else {
+      if (!bridge.ListSources) throw new Error('Native source listing is unavailable.');
+      retained = await bridge.ListSources();
+    }
     const restored = retained.map(record => nativeImageForDisplay(record, crypto.randomUUID()));
     // Rehydration is read-only: even conflicting imported destinations retain
     // their own visible rows and IDs so each handle can be released explicitly.
     images = [...images.filter(image => image.origin !== 'native'), ...restored];
     sourcesLoaded = true;
-    log('Native sources restored', `count=${restored.length} hashes=import-time rehashed=false`);
+    log('Native sources restored', `count=${restored.length} restoration=${capabilities?.session_restore ? 'native-session' : 'retained-catalogue'}`);
   } catch (error) {
     sourcesError = `Native source listing failed: ${errorMessage(error)} Import is disabled until the catalogue is restored.`;
     log('Native source listing failed', sourcesError, 'warning');
   } finally { sourcesLoading = false; render(); }
 }
 async function loadDevices() {
-  if (busy || refreshing || pickingImages || inspectingHost || releasingImages || sourcesLoading) return;
+  if (nativeActionsLocked()) return;
   refreshing = true; capabilities = undefined; deviceError = ''; confirmation = ''; complete = false; render();
   try {
     capabilities = await bridge.Capabilities();
@@ -370,7 +528,7 @@ async function loadDevices() {
       log('Fixture devices refreshed', `source=fixtures count=${disks.length} devices=${disks.map(record => `${record.disk.id}:${record.verdict.state}`).join(', ')} host_enumeration=false`);
     } else {
       selected = undefined; plan = undefined;
-      if (preparationJob?.active) return;
+      if (preparationJob?.active || engineDownloadLocked()) return;
       if (!capabilities.host_inventory || !bridge.InspectDevices) throw new Error('Host inventory is unavailable on this platform.');
       hostInventory = await bridge.InspectDevices(); disks = inspectionRecords(hostInventory);
       log('Host inventory read', `source=${hostInventory.source} disks=${disks.length} warnings=${hostInventory.warnings.length} read_only=true selectable=false`);

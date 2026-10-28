@@ -4,6 +4,14 @@ import { describe, expect, it } from 'vitest';
 import { createNativeBridge, nativeImageForDisplay, nativeMediaImage, type NativePickedImage } from './native';
 const record: NativePickedImage = { name: '/private/media/installer.iso', bytes: 6_000_000_000, verification: { algorithm: 'sha256', digest: 'a'.repeat(64), bytes: 6_000_000_000, status: 'hash-only', publisher_verified: false } };
 describe('native image intake', () => {
+  it('restores the native session without sending source paths or stale tokens', async () => {
+    const calls: unknown[] = [];
+    const result = { images: [record], warnings: ['Changed source skipped.'] };
+    const bridge = createNativeBridge(async <T>(command: string, args?: Record<string, unknown>) => { calls.push({ command, args }); return result as T; });
+    expect(bridge.RestoreSession).toBeTypeOf('function');
+    expect(await bridge.RestoreSession!()).toEqual(result);
+    expect(calls).toEqual([{ command: 'restore_session', args: undefined }]);
+  });
   it('probes only through the native command, without sending paths or process IDs', async () => {
     const calls: unknown[] = [];
     const result = { status: 'connected', protocol: 1, helper_version: '0.1.0', helper_pid: 42, helper_created: '12345', helper_sha256: 'a'.repeat(64), physical_preparation: false };

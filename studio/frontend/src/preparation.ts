@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { relativeImagePath } from './state';
+import type { TargetHint } from './preferences';
 export interface EngineArchive { archive_id: string; name: string; bytes: number; sha256: string; version: string }
-export interface PreparationTarget { selection_token: string; display_id: string; disk: { number: number; friendly_name?: string | null; serial_number?: string | null; size: number | null; logical_sector_size: number | null; physical_sector_size: number | null; bus_type: number | null; [key: string]: unknown } }
+export interface PreparationTarget { selection_token: string; display_id: string; volume_labels?: string[] | null; disk: { number: number; friendly_name?: string | null; serial_number?: string | null; size: number | null; logical_sector_size: number | null; physical_sector_size: number | null; bus_type: number | null; [key: string]: unknown } }
 export interface PreparationSource { relative_path: string; bytes: number; sha256: string }
 export interface PreparationSnapshot {
   job_id: string; phase: string; message: string; active: boolean; cancel_requested: boolean;
@@ -32,5 +33,29 @@ export function preparationSnapshot(value: unknown): PreparationSnapshot {
   return v;
 }
 export function canConfirmPreparation(job: PreparationSnapshot | null, text: string, physicalEnabled: boolean): boolean {
-  return !!(physicalEnabled && job?.active && job.phase === 'await_confirmation' && job.sources_released && job.source_manifest.length > 0 && !job.cancel_requested && job.challenge && job.description_digest && text === job.challenge);
+  return !!(physicalEnabled && job?.active && job.phase === 'await_confirmation' && job.sources_released && !job.cancel_requested && job.challenge && job.description_digest && text === job.challenge);
+}
+export const largeDriveBytes = 256 * 1024 ** 3;
+export function visiblePreparationTargets(targets: PreparationTarget[], showLarge: boolean, current: string): PreparationTarget[] {
+  return targets.filter(target => showLarge || target.selection_token === current || target.disk.size === null || target.disk.size <= largeDriveBytes);
+}
+function eligibleDefault(target: PreparationTarget): boolean {
+  const disk = target.disk;
+  return (disk.bus_type === 7 || disk.bus_type === 12) && Number.isSafeInteger(disk.size) && disk.size! > 0 && ['is_boot', 'is_system', 'is_read_only', 'is_offline', 'is_clustered'].every(key => disk[key] === false);
+}
+export function preparationTargetHint(target?: PreparationTarget): TargetHint | undefined {
+  const disk = target?.disk;
+  if (!disk || typeof disk.serial_number !== 'string' || !disk.serial_number.trim() || !Number.isSafeInteger(disk.size) || disk.size! <= 0 || (disk.bus_type !== 7 && disk.bus_type !== 12)) return;
+  return { serial: disk.serial_number, size: disk.size!, bus: disk.bus_type };
+}
+export function defaultPreparationTarget(targets: PreparationTarget[], current: string, hint?: TargetHint): string {
+  if (targets.some(target => target.selection_token === current)) return current;
+  const eligible = targets.filter(eligibleDefault);
+  if (hint) {
+    const matching = eligible.filter(({ disk }) => disk.serial_number === hint.serial && disk.size === hint.size && disk.bus_type === hint.bus);
+    return matching.length === 1 ? matching[0].selection_token : '';
+  }
+  const small = eligible.filter(target => target.disk.size! <= largeDriveBytes);
+  const named = small.filter(target => [target.disk.friendly_name, ...(target.volume_labels || [])].some(name => name?.trim().toLowerCase() === 'isohopper'));
+  return named.length === 1 ? named[0].selection_token : named.length === 0 && small.length === 1 ? small[0].selection_token : '';
 }
