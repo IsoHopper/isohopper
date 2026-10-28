@@ -47,7 +47,8 @@ use windows_sys::Win32::{
         IO::DeviceIoControl,
         Ioctl::{
             GET_LENGTH_INFORMATION, IOCTL_DISK_GET_LENGTH_INFO, IOCTL_STORAGE_GET_DEVICE_NUMBER,
-            STORAGE_DEVICE_NUMBER,
+            IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery, STORAGE_DEVICE_NUMBER,
+            STORAGE_PROPERTY_QUERY, StorageDeviceProperty,
         },
         Threading::{GetCurrentProcess, OpenProcessToken},
     },
@@ -94,6 +95,7 @@ fn windows_vhd_writer_persists_verified_gpt() -> Result<(), Box<dyn std::error::
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH)
         .open(physical_path)?;
+    describe_test_vhd(&raw)?;
     // SAFETY: this is the new blank VHD owned above, with no formatted/mounted
     // volumes. The synchronous unbuffered write-through handle has no aliases.
     // The VHD owner remains attached for the entire operation.
@@ -168,6 +170,46 @@ fn windows_vhd_writer_persists_verified_gpt() -> Result<(), Box<dyn std::error::
     virtualdisk::verify(&persisted_path)?;
     println!(
         "VHD integration passed: {CAPACITY} bytes written and read back; read-only reattachment digest and primary/backup GPT verified; no USB hardware exercised"
+    );
+    Ok(())
+}
+
+// Print only the descriptor of the newly created test VHD. This is deliberately
+// test-local: production device identifiers are not uploaded to CI logs.
+fn describe_test_vhd(file: &File) -> io::Result<()> {
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceProperty,
+        QueryType: PropertyStandardQuery,
+        ..Default::default()
+    };
+    let mut output = [0u8; 4096];
+    let mut returned = 0;
+    // SAFETY: all buffers and the synchronous retained VHD handle remain live
+    // through the call. The output allocation is fixed and bounded.
+    if unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            (&query as *const STORAGE_PROPERTY_QUERY).cast(),
+            size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            output.as_mut_ptr().cast(),
+            output.len() as u32,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(context(
+            "test VHD descriptor diagnostics",
+            io::Error::last_os_error(),
+        ));
+    }
+    if returned as usize > output.len() {
+        return Err(io::Error::other("oversized test descriptor"));
+    }
+    println!(
+        "New test VHD storage descriptor: returned={returned}, prefix={}",
+        hex::encode(&output[..(returned as usize).min(256)])
     );
     Ok(())
 }
