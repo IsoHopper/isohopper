@@ -30,6 +30,8 @@ mod policy;
 #[cfg(windows)]
 pub use native::MachineInstallation;
 #[cfg(windows)]
+pub(crate) use native::check_stage_object;
+#[cfg(windows)]
 mod state;
 #[cfg(windows)]
 pub(crate) use state::wide_name;

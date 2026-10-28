@@ -181,6 +181,22 @@ jobs:
             exit 1
           fi
 
+      - name: Check private staging ownership without token identity changes
+        shell: bash
+        run: |
+          if cargo +1.98.0 test --locked -p isohopper-helper --lib windows_stage::native::tests::native_owned_stage_disk_has_private_lifetime_without_token_changes -- --ignored --exact --nocapture --test-threads=1 > owned-stage-test.log 2>&1; then
+            cat owned-stage-test.log
+          else
+            python - <<'PY'
+          from pathlib import Path
+          text = Path('owned-stage-test.log').read_text(errors='replace')[-12000:]
+          print(text)
+          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=Windows private staging ownership failed::' + text)
+          PY
+            exit 1
+          fi
+
       - name: Check writable and read-only attachments of an owned VHDX
         shell: bash
         run: |

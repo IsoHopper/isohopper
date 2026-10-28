@@ -171,6 +171,19 @@ fn check_object(file: &File, kind: ObjectKind) -> Result<(), String> {
     unsafe { descriptor_check(sd.0, kind) }
 }
 
+/// Reuse the installation's mutation/owner policy for newly created private
+/// staging objects. Creation supplies a stricter private DACL separately.
+pub(crate) fn check_stage_object(file: &File, directory: bool) -> Result<(), String> {
+    check_object(
+        file,
+        if directory {
+            ObjectKind::Directory
+        } else {
+            ObjectKind::File
+        },
+    )
+}
+
 fn program_files() -> Result<String, String> {
     let mut value = ptr::null_mut();
     // The fixed machine-wide known folder is obtained from Windows, not an

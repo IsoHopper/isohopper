@@ -20,6 +20,7 @@ pub mod windows_pipe;
 pub mod windows_probe;
 pub mod windows_protected;
 pub mod windows_sources;
+pub mod windows_stage;
 pub mod windows_target;
 pub mod writer;
 
