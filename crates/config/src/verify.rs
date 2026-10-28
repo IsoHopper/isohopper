@@ -34,6 +34,19 @@ pub fn stream(
     algorithm: &str,
     expected: Option<&str>,
 ) -> Result<Verification, VerifyError> {
+    stream_with_progress(reader, algorithm, expected, |_| Ok(()))
+}
+
+/// Like `stream`, with a callback before each bounded read. It receives the
+/// bytes hashed so far, starting at zero. Returning an error cancels immediately
+/// without another read or a successful verification result. An in-flight
+/// synchronous read cannot be interrupted by this callback.
+pub fn stream_with_progress(
+    reader: &mut impl Read,
+    algorithm: &str,
+    expected: Option<&str>,
+    mut progress: impl FnMut(u64) -> io::Result<()>,
+) -> Result<Verification, VerifyError> {
     let algorithm = algorithm.to_ascii_lowercase().replace('-', "");
     let digits = match algorithm.as_str() {
         "sha256" => 64,
@@ -51,9 +64,9 @@ pub fn stream(
         })
         .transpose()?;
     let (digest, bytes) = if algorithm == "sha256" {
-        hash::<Sha256>(reader)?
+        hash::<Sha256>(reader, &mut progress)?
     } else {
-        hash::<Sha512>(reader)?
+        hash::<Sha512>(reader, &mut progress)?
     };
     let status = match &expected {
         None => "hash-only",
@@ -98,6 +111,18 @@ pub fn opened_file(
     algorithm: &str,
     expected: Option<&str>,
 ) -> Result<Verification, VerifyError> {
+    opened_file_with_progress(file, algorithm, expected, |_| Ok(()))
+}
+
+/// Like `opened_file`, reporting streamed bytes before each read and allowing
+/// cooperative cancellation. Regular-file/length/mtime and expected-hash checks
+/// still complete before success; partial work never yields a verification.
+pub fn opened_file_with_progress(
+    file: &mut File,
+    algorithm: &str,
+    expected: Option<&str>,
+    progress: impl FnMut(u64) -> io::Result<()>,
+) -> Result<Verification, VerifyError> {
     let before = file.metadata()?;
     if !before.is_file() {
         return Err(VerifyError::Invalid(
@@ -105,7 +130,7 @@ pub fn opened_file(
         ));
     }
     file.rewind()?;
-    let result = exact_length(file, before.len(), algorithm, expected)?;
+    let result = exact_length(file, before.len(), algorithm, expected, progress)?;
     let after = file.metadata()?;
     if before.len() != after.len() || before.modified()? != after.modified()? {
         return Err(VerifyError::Invalid(
@@ -120,11 +145,12 @@ fn exact_length(
     length: u64,
     algorithm: &str,
     expected: Option<&str>,
+    progress: impl FnMut(u64) -> io::Result<()>,
 ) -> Result<Verification, VerifyError> {
     let limit = length
         .checked_add(1)
         .ok_or_else(|| VerifyError::Invalid("checksum input length overflow".into()))?;
-    let result = stream(&mut reader.take(limit), algorithm, expected)?;
+    let result = stream_with_progress(&mut reader.take(limit), algorithm, expected, progress)?;
     if result.bytes != length {
         return Err(VerifyError::Invalid(
             "checksum input grew or shrank while reading".into(),
@@ -133,11 +159,15 @@ fn exact_length(
     Ok(result)
 }
 
-fn hash<D: Digest + Default>(reader: &mut impl Read) -> Result<(String, u64), VerifyError> {
+fn hash<D: Digest + Default>(
+    reader: &mut impl Read,
+    progress: &mut impl FnMut(u64) -> io::Result<()>,
+) -> Result<(String, u64), VerifyError> {
     let mut hash = D::default();
     let mut buffer = vec![0u8; 128 * 1024];
     let mut bytes = 0u64;
     loop {
+        progress(bytes)?;
         let count = match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => count,
@@ -171,9 +201,9 @@ mod tests {
     #[test]
     fn growing_input_stops_at_the_original_length_plus_one() {
         let mut growing = Endless { bytes: 0 };
-        assert!(exact_length(&mut growing, 250_000, "sha256", None).is_err());
+        assert!(exact_length(&mut growing, 250_000, "sha256", None, |_| Ok(())).is_err());
         assert_eq!(growing.bytes, 250_001);
-        assert!(exact_length(&mut Cursor::new(b"short"), 6, "sha256", None).is_err());
+        assert!(exact_length(&mut Cursor::new(b"short"), 6, "sha256", None, |_| Ok(())).is_err());
     }
 
     #[test]

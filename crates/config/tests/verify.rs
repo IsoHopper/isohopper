@@ -96,6 +96,49 @@ fn large_input_streams_with_bounded_buffer() {
 }
 
 #[test]
+fn streaming_cancellation_stops_before_the_next_read() {
+    let mut input = Cursor::new(vec![b'a'; 1_000_000]);
+    let mut observations = Vec::new();
+    let error = verify::stream_with_progress(&mut input, "sha256", None, |bytes| {
+        observations.push(bytes);
+        if bytes > 0 {
+            Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap_err();
+    assert!(matches!(error, VerifyError::Io(ref e) if e.kind() == io::ErrorKind::Interrupted));
+    assert_eq!(observations, [0, 128 * 1024]);
+    assert_eq!(input.position(), 128 * 1024);
+}
+
+#[test]
+fn pre_cancelled_file_is_not_read_and_success_reports_exact_bytes() {
+    use std::io::{Seek, Write};
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(b"abc").unwrap();
+    let error = verify::opened_file_with_progress(&mut file, "sha256", None, |_| {
+        Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+    })
+    .unwrap_err();
+    assert!(matches!(error, VerifyError::Io(ref e) if e.kind() == io::ErrorKind::Interrupted));
+    assert_eq!(file.stream_position().unwrap(), 0);
+    let mut observations = Vec::new();
+    let result = verify::opened_file_with_progress(&mut file, "sha256", None, |bytes| {
+        observations.push(bytes);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(observations, [0, 3]);
+    assert_eq!(result.bytes, 3);
+    assert_eq!(
+        result.digest,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+}
+
+#[test]
 fn file_hashes_regular_inputs_and_rejects_missing_or_directory() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("image.iso");
