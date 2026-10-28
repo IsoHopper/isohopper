@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 S33G
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-const PHYSICAL_PREPARATION_ENABLED: bool = false;
+const PHYSICAL_PREPARATION_ENABLED: bool = true;
 #[tauri::command]
 fn capabilities() -> serde_json::Value {
     serde_json::json!({
@@ -12,7 +12,11 @@ fn capabilities() -> serde_json::Value {
         "helper_probe": cfg!(windows),
         "preparation_available": cfg!(windows),
         "physical_preparation": cfg!(windows) && PHYSICAL_PREPARATION_ENABLED,
-        "preparation_unavailable_reason": "Physical preparation is unavailable. Disk preparation and OS boot integration are unfinished."
+        "preparation_unavailable_reason": if cfg!(windows) && PHYSICAL_PREPARATION_ENABLED {
+            ""
+        } else {
+            "Physical preparation requires the Windows app with preparation enabled."
+        }
     })
 }
 #[tauri::command]
