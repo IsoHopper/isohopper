@@ -199,10 +199,44 @@ fn check_identity(path: &Path, identity: &Handle, size: u64) -> Result<(), Virtu
 }
 
 trait ImageIo: Read + Write + Seek {
+    fn make_sparse(&mut self) -> io::Result<()>;
     fn set_len(&mut self, size: u64) -> io::Result<()>;
     fn sync_all(&mut self) -> io::Result<()>;
 }
 impl ImageIo for File {
+    fn make_sparse(&mut self) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
+            use windows_sys::Win32::{
+                Storage::FileSystem::FILE_ATTRIBUTE_SPARSE_FILE,
+                System::{IO::DeviceIoControl, Ioctl::FSCTL_SET_SPARSE},
+            };
+            let mut returned = 0;
+            // SAFETY: this is the retained, synchronous handle of the newly
+            // created regular file. A null input requests SetSparse = TRUE;
+            // there is no output buffer and returned remains valid for the call.
+            let success = unsafe {
+                DeviceIoControl(
+                    self.as_raw_handle(),
+                    FSCTL_SET_SPARSE,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            };
+            if success == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if self.metadata()?.file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE == 0 {
+                return Err(io::Error::other("Windows did not mark the image sparse"));
+            }
+        }
+        Ok(())
+    }
     fn set_len(&mut self, size: u64) -> io::Result<()> {
         File::set_len(self, size)
     }
@@ -214,6 +248,9 @@ impl ImageIo for File {
 fn populate(image: &mut impl ImageIo, p: &Layout) -> Result<(), VirtualDiskError> {
     layout::validate(p)?;
     let writes = gpt::encode(p)?;
+    // Windows otherwise allocates real storage for the logical image length.
+    // Refuse filesystems that cannot enable sparse files before extending.
+    image.make_sparse()?;
     image.set_len(p.size_bytes)?;
     for (offset, data) in writes {
         if offset > p.size_bytes || data.len() as u64 > p.size_bytes - offset {
@@ -265,6 +302,13 @@ mod tests {
         }
     }
     impl ImageIo for FaultFile {
+        fn make_sparse(&mut self) -> io::Result<()> {
+            if self.failure == "sparse" {
+                Err(io::Error::other("injected sparse setup"))
+            } else {
+                self.file.make_sparse()
+            }
+        }
         fn set_len(&mut self, len: u64) -> io::Result<()> {
             if self.failure == "truncate" {
                 Err(io::Error::other("injected truncate"))
@@ -284,12 +328,17 @@ mod tests {
     #[test]
     fn io_failures_never_report_success() {
         let p = layout::plan(256 << 20, 512, false).unwrap();
-        for failure in ["truncate", "seek", "write", "short", "sync", "read"] {
+        for failure in [
+            "sparse", "truncate", "seek", "write", "short", "sync", "read",
+        ] {
             let mut f = FaultFile {
                 file: tempfile::tempfile().unwrap(),
                 failure,
             };
             let error = populate(&mut f, &p).unwrap_err();
+            if failure == "sparse" {
+                assert_eq!(f.file.metadata().unwrap().len(), 0);
+            }
             match error {
                 VirtualDiskError::Io(e) => assert_eq!(
                     e.kind(),

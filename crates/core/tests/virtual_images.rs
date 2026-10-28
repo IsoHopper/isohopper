@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use isohopper_core::{layout, virtualdisk};
+#[cfg(unix)]
+use std::path::Path;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    path::Path,
 };
 
 fn read_at(f: &mut File, off: u64, len: usize) -> Vec<u8> {
@@ -44,6 +45,37 @@ fn creates_sparse_images_with_real_primary_and_backup_gpt() {
         virtualdisk::verify(&path).unwrap();
         let mut f = File::open(&path).unwrap();
         assert_eq!(f.metadata().unwrap().len(), size);
+        #[cfg(windows)]
+        {
+            use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_ATTRIBUTE_SPARSE_FILE, FILE_STANDARD_INFO, FileStandardInfo,
+                GetFileInformationByHandleEx,
+            };
+            assert_ne!(
+                f.metadata().unwrap().file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE,
+                0,
+                "image must have the Windows sparse-file attribute"
+            );
+            let mut info = FILE_STANDARD_INFO::default();
+            // SAFETY: the live file handle is readable and info is a correctly
+            // sized writable FILE_STANDARD_INFO buffer for the selected class.
+            let success = unsafe {
+                GetFileInformationByHandleEx(
+                    f.as_raw_handle(),
+                    FileStandardInfo,
+                    (&mut info as *mut FILE_STANDARD_INFO).cast(),
+                    std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+                )
+            };
+            assert_ne!(success, 0, "{}", std::io::Error::last_os_error());
+            assert_eq!(info.EndOfFile as u64, size);
+            assert!(
+                (0..=1024 * 1024).contains(&info.AllocationSize),
+                "GPT-only sparse image allocated {} bytes",
+                info.AllocationSize
+            );
+        }
         let m = read_at(&mut f, 0, 512);
         assert_eq!(&m[510..512], &[0x55, 0xaa]);
         assert_eq!(m[450], 0xee);
