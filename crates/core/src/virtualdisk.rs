@@ -10,7 +10,7 @@ use std::{
 };
 use thiserror::Error;
 
-mod gpt;
+pub(crate) mod gpt;
 
 type BootImage<'a> = (&'a [crate::fat::Volume; 2], &'a [u8], Option<&'a [u8]>);
 
@@ -150,11 +150,11 @@ pub fn verify(path: impl AsRef<Path>) -> Result<(), VirtualDiskError> {
     check_identity(path, &identity, before.len())
 }
 
-fn invalid(message: impl Into<String>) -> VirtualDiskError {
+pub(crate) fn invalid(message: impl Into<String>) -> VirtualDiskError {
     VirtualDiskError::Invalid(message.into())
 }
 
-fn open_regular_read(path: &Path) -> Result<File, VirtualDiskError> {
+pub(crate) fn open_regular_read(path: &Path) -> Result<File, VirtualDiskError> {
     if !fs::symlink_metadata(path)?.file_type().is_file() {
         return Err(invalid(
             "image must be a regular file, not a symlink or device",
@@ -188,7 +188,11 @@ fn open_regular_read(path: &Path) -> Result<File, VirtualDiskError> {
     Ok(file)
 }
 
-fn check_identity(path: &Path, identity: &Handle, size: u64) -> Result<(), VirtualDiskError> {
+pub(crate) fn check_identity(
+    path: &Path,
+    identity: &Handle,
+    size: u64,
+) -> Result<(), VirtualDiskError> {
     let file = open_regular_read(path)?;
     let observed_size = file.metadata()?.len();
     let current = Handle::from_file(file)?;
@@ -198,7 +202,7 @@ fn check_identity(path: &Path, identity: &Handle, size: u64) -> Result<(), Virtu
     Ok(())
 }
 
-trait ImageIo: Read + Write + Seek {
+pub(crate) trait ImageIo: Read + Write + Seek {
     fn make_sparse(&mut self) -> io::Result<()>;
     fn set_len(&mut self, size: u64) -> io::Result<()>;
     fn sync_all(&mut self) -> io::Result<()>;

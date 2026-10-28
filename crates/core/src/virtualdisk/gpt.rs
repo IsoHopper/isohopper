@@ -38,7 +38,7 @@ fn crc32(b: &[u8]) -> u32 {
     !crc
 }
 
-fn new_guid() -> Result<[u8; 16], VirtualDiskError> {
+pub(crate) fn new_guid() -> Result<[u8; 16], VirtualDiskError> {
     let mut id = [0; 16];
     getrandom::fill(&mut id).map_err(|err| VirtualDiskError::Entropy(err.to_string()))?;
     id[7] = (id[7] & 15) | 0x40;
@@ -58,14 +58,42 @@ fn guid_bytes(text: &str) -> Result<[u8; 16], VirtualDiskError> {
 }
 
 pub(super) fn encode(p: &Layout) -> Result<Vec<Segment>, VirtualDiskError> {
+    Ok(encode_with_attributes(p, &vec![0; p.partitions.len()])?.writes)
+}
+
+pub(crate) struct Encoded {
+    pub writes: Vec<Segment>,
+    pub disk_guid: [u8; 16],
+    pub partition_guids: Vec<[u8; 16]>,
+}
+
+/// Only the sealed engine plan can select this separate metadata profile.
+/// The existing A/B reader and its zero-attribute policy remain unchanged.
+pub(crate) fn encode_engine(p: &crate::engine::Plan) -> Result<Encoded, VirtualDiskError> {
+    encode_with_attributes(p.layout(), &p.partition_attributes())
+}
+
+fn encode_with_attributes(p: &Layout, attributes: &[u64]) -> Result<Encoded, VirtualDiskError> {
     let mut entries = vec![0; ENTRY_COUNT as usize * ENTRY_SIZE as usize];
     let disk = new_guid()?;
+    let mut partition_guids = Vec::with_capacity(p.partitions.len());
     for (i, part) in p.partitions.iter().enumerate() {
+        let mut unique = None;
+        for _ in 0..8 {
+            let id = new_guid()?;
+            if id != disk && !partition_guids.contains(&id) {
+                unique = Some(id);
+                break;
+            }
+        }
+        let id = unique.ok_or_else(|| invalid("could not generate distinct partition GUIDs"))?;
+        partition_guids.push(id);
         let e = &mut entries[i * 128..(i + 1) * 128];
         e[..16].copy_from_slice(&guid_bytes(&part.type_guid)?);
-        e[16..32].copy_from_slice(&new_guid()?);
+        e[16..32].copy_from_slice(&id);
         put64(e, 32, part.start_lba);
         put64(e, 40, part.end_lba);
+        put64(e, 48, attributes[i]);
         for (j, unit) in part.name.encode_utf16().enumerate() {
             e[56 + j * 2..58 + j * 2].copy_from_slice(&unit.to_le_bytes());
         }
@@ -74,13 +102,17 @@ pub(super) fn encode(p: &Layout) -> Result<Vec<Segment>, VirtualDiskError> {
     let crc = crc32(&entries);
     let primary = header(p, 1, p.total_sectors - 1, 2, &disk, crc);
     let backup = header(p, p.total_sectors - 1, 1, tail, &disk, crc);
-    Ok(vec![
-        (0, protective_mbr(p)),
-        (2 * p.logical_sector_size, entries.clone()),
-        (tail * p.logical_sector_size, entries),
-        ((p.total_sectors - 1) * p.logical_sector_size, backup),
-        (p.logical_sector_size, primary),
-    ])
+    Ok(Encoded {
+        disk_guid: disk,
+        partition_guids,
+        writes: vec![
+            (0, protective_mbr(p)),
+            (2 * p.logical_sector_size, entries.clone()),
+            (tail * p.logical_sector_size, entries),
+            ((p.total_sectors - 1) * p.logical_sector_size, backup),
+            (p.logical_sector_size, primary),
+        ],
+    })
 }
 
 fn protective_mbr(p: &Layout) -> Vec<u8> {
