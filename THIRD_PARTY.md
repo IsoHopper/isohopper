@@ -17,3 +17,7 @@ Ventoy and its dependencies have separate component licenses. Consult the [match
 ## Application dependencies
 
 Exact Rust and JavaScript dependency versions are recorded in the Cargo and npm lockfiles. Archive decoding uses flate2 (MIT/Apache-2.0), tar (MIT/Apache-2.0) and lzma-rust2 (Apache-2.0).
+
+## Windows installer template
+
+The custom NSIS template is adapted from Tauri CLI 2.12.4 under the MIT license. Its attribution and [license text](studio/src-tauri/windows/LICENSE-TAURI) are retained alongside the [template](studio/src-tauri/windows/installer.nsi). IsoHopper replaces the upgrade flow with its protected installation transaction.

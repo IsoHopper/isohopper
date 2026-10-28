@@ -1,92 +1,80 @@
 ; SPDX-License-Identifier: GPL-3.0-or-later
 ; Copyright (C) 2026 S33G
 ;
-; Tauri CLI 2.12.4 includes hooks before all installer Sections. A Section here
-; therefore runs before its SetOutPath (which would create an insecure default
-; owner directory before NSIS_HOOK_PREINSTALL). NSIS executes Sections in order.
-; https://nsis.sourceforge.io/Docs/Chapter4.html#sections
-; https://nsis.sourceforge.io/Docs/System/System.html
-;
-; SECURITY_ATTRIBUTES below is the 12-byte x86 ABI of the NSIS process, not the
-; architecture of the installed application. Refuse another installer ABI.
+; Included by the pinned custom template after its product definitions.
+; SECURITY_ATTRIBUTES is the 12-byte x86 ABI of the NSIS process.
 !if ${NSIS_PTR_SIZE} != 4
   !error "IsoHopper protected installation requires the x86 NSIS installer ABI"
 !endif
+!define ISOHOPPER_PAYLOAD_SD "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;BU)(A;OICI;RC;;;OW)"
 
-Var IsoHopperInstallHandle
+Var IsoHopperStageDirectory
+Var IsoHopperStageHandle
+Var IsoHopperParentHandle
+Var IsoHopperFailureCode
+Var IsoHopperFailureText
+Var IsoHopperUninstallStudio
+Var IsoHopperUninstallHelper
+Var IsoHopperUninstallSelf
 
-; The template's maintenance page can execute a registered uninstaller before
-; any Section, including in /P mode. MUI calls this before its first page.
-; /S has no pages; the same check is called by our first Section below.
-!ifdef MUI_CUSTOMFUNCTION_GUIINIT
-  !error "IsoHopper requires the pre-page fresh-install guard"
-!endif
-!define MUI_CUSTOMFUNCTION_GUIINIT IsoHopperRequireFreshInstall
+!define MUI_CUSTOMFUNCTION_ABORT IsoHopperCleanup
+
+Function IsoHopperCleanup
+  ; Leave the staging directory before removing it. Never recurse into either
+  ; the installed tree or the payload directory, including on failed apply.
+  ${If} $IsoHopperStageDirectory != ""
+    SetOutPath "$PROGRAMFILES64"
+    Delete "$IsoHopperStageDirectory\isohopper-studio.exe"
+    Delete "$IsoHopperStageDirectory\isohopper-helper.exe"
+    Delete "$IsoHopperStageDirectory\uninstall.exe"
+  ${EndIf}
+  ${If} $IsoHopperStageHandle != ""
+    System::Call 'kernel32::CloseHandle(p $IsoHopperStageHandle) i'
+    StrCpy $IsoHopperStageHandle ""
+  ${EndIf}
+  ${If} $IsoHopperStageDirectory != ""
+    RMDir "$IsoHopperStageDirectory"
+    StrCpy $IsoHopperStageDirectory ""
+  ${EndIf}
+  ${If} $IsoHopperParentHandle != ""
+    System::Call 'kernel32::CloseHandle(p $IsoHopperParentHandle) i'
+    StrCpy $IsoHopperParentHandle ""
+  ${EndIf}
+FunctionEnd
+
+Function .onInstFailed
+  Call IsoHopperCleanup
+FunctionEnd
+
+Function .onGUIEnd
+  Call IsoHopperCleanup
+FunctionEnd
 
 Function IsoHopperInstallFailed
-  ${If} $IsoHopperInstallHandle != ""
-    System::Call 'kernel32::CloseHandle(p $IsoHopperInstallHandle) i'
-    StrCpy $IsoHopperInstallHandle ""
-  ${EndIf}
-  SetErrorLevel 3
-  DetailPrint "Fresh protected installation required; no existing installation is reused."
-  ; Do not leave a passive installer waiting on an invisible modal prompt.
+  Call IsoHopperCleanup
+  SetErrorLevel $IsoHopperFailureCode
+  DetailPrint "$IsoHopperFailureText"
   IfSilent isohopper_no_prompt
-  ClearErrors
-  ${GetOptions} $CMDLINE "/P" $0
-  ${If} ${Errors}
-    MessageBox MB_OK|MB_ICONSTOP "Installation requires a fresh Program Files\IsoHopper directory on the Windows system drive. Existing directories are not reused or reset. Uninstall an earlier version first. A failed new installation may require administrator cleanup."
+  ${If} $PassiveMode != 1
+    MessageBox MB_OK|MB_ICONSTOP "$IsoHopperFailureText"
   ${EndIf}
   isohopper_no_prompt:
   Quit
 FunctionEnd
 
-Function IsoHopperRequireFreshInstall
+Function IsoHopperInitialize
   System::Store "s"
+  StrCpy $IsoHopperFailureCode 11
+  StrCpy $IsoHopperFailureText "IsoHopper requires the protected Program Files location on the Windows system drive."
   ${IfNot} ${RunningX64}
     Call IsoHopperInstallFailed
   ${EndIf}
-  ${If} $INSTDIR != "$PROGRAMFILES64\IsoHopper"
+  ; /D cannot select another destination. Registry values never supply a path.
+  ${If} $INSTDIR != "${PLACEHOLDER_INSTALL_DIR}"
+  ${AndIf} $INSTDIR != "$PROGRAMFILES64\IsoHopper"
     Call IsoHopperInstallFailed
   ${EndIf}
-  ; Only explicit absence passes. An empty directory, file, reparse point,
-  ; inaccessible path or another metadata error must stop before maintenance.
-  System::Call 'kernel32::GetFileAttributesW(w "$PROGRAMFILES64\IsoHopper") i.r0 ?e'
-  Pop $1
-  ${If} $0 != -1
-    Call IsoHopperInstallFailed
-  ${EndIf}
-  ${If} $1 != 2 ; ERROR_FILE_NOT_FOUND
-  ${AndIf} $1 != 3 ; ERROR_PATH_NOT_FOUND
-    Call IsoHopperInstallFailed
-  ${EndIf}
-  ; Match both old-install sources consumed by this pinned template, including
-  ; registrations pointing somewhere other than the supported fixed directory.
-  ; Product defines follow this include, so the NSIS key is deliberately fixed.
-  Call FindWixInstall
-  ${If} $R6 != ""
-    Call IsoHopperInstallFailed
-  ${EndIf}
-  ReadRegStr $0 SHCTX "Software\Microsoft\Windows\CurrentVersion\Uninstall\IsoHopper" ""
-  ReadRegStr $1 SHCTX "Software\Microsoft\Windows\CurrentVersion\Uninstall\IsoHopper" "UninstallString"
-  ${If} "$0$1" != ""
-    Call IsoHopperInstallFailed
-  ${EndIf}
-  System::Store "l"
-FunctionEnd
-
-; Hidden, always selected, and read-only in any component selection UI.
-Section "-IsoHopper protected directory"
-  SectionIn RO
-  Call IsoHopperRequireFreshInstall
-  System::Store "s"
-  ${IfNot} ${RunningX64}
-    Call IsoHopperInstallFailed
-  ${EndIf}
-  ${If} $INSTDIR != "$PROGRAMFILES64\IsoHopper"
-    DetailPrint "Unsupported installation location."
-    Call IsoHopperInstallFailed
-  ${EndIf}
+  StrCpy $INSTDIR "$PROGRAMFILES64\IsoHopper"
   System::Call 'kernel32::GetSystemWindowsDirectoryW(w .r2, i ${NSIS_MAX_STRLEN}) i.r3'
   ${If} $3 == 0
   ${OrIf} $3 >= ${NSIS_MAX_STRLEN}
@@ -103,11 +91,47 @@ Section "-IsoHopper protected directory"
   ${OrIf} $4 == 0
     Call IsoHopperInstallFailed
   ${EndIf}
+  System::Store "l"
+FunctionEnd
 
-  ; Create with the owner and ACL already protected. OWNER_RIGHTS suppresses
-  ; implicit owner WRITE_DAC on newly extracted files until their owner is BA.
-  ; No CREATOR_OWNER write grant and no recursive change of an existing tree.
-  System::Call 'advapi32::ConvertStringSecurityDescriptorToSecurityDescriptorW(w "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;BU)(A;OICI;RC;;;OW)", i 1, *p .r0, p 0) i.r2'
+Function IsoHopperCreatePayload
+  System::Store "s"
+  StrCpy $IsoHopperFailureCode 12
+  StrCpy $IsoHopperFailureText "Could not create a protected setup directory. Close other setup windows and run this installer again."
+  ; Hold the fixed parent without delete sharing before creating the child.
+  System::Call 'kernel32::CreateFileW(w "$PROGRAMFILES64", i 0x20080, i 3, p 0, i 3, i 0x02200000, p 0) p.r0'
+  ${If} $0 == -1
+  ${OrIf} $0 == 0
+    Call IsoHopperInstallFailed
+  ${EndIf}
+  StrCpy $IsoHopperParentHandle $0
+  System::Call 'kernel32::GetFileAttributesW(w "$PROGRAMFILES64") i.r0'
+  IntOp $1 $0 & 0x410 ; DIRECTORY | REPARSE_POINT
+  ${If} $0 == -1
+  ${OrIf} $1 != 0x10
+    Call IsoHopperInstallFailed
+  ${EndIf}
+
+  System::Alloc 16
+  Pop $0
+  ${If} $0 == 0
+    Call IsoHopperInstallFailed
+  ${EndIf}
+  System::Call 'ole32::CoCreateGuid(p r0) i.r1'
+  ${If} $1 != 0
+    System::Free $0
+    Call IsoHopperInstallFailed
+  ${EndIf}
+  System::Call 'ole32::StringFromGUID2(p r0, w .r5, i 39) i.r1'
+  System::Free $0
+  ${If} $1 != 39
+    Call IsoHopperInstallFailed
+  ${EndIf}
+  StrCpy $8 "$PROGRAMFILES64\.IsoHopper-setup-$5"
+
+  ; Protect the new directory at creation. OWNER_RIGHTS suppresses the
+  ; extractor owner's implicit WRITE_DAC until each file is owned by BA.
+  System::Call 'advapi32::ConvertStringSecurityDescriptorToSecurityDescriptorW(w "${ISOHOPPER_PAYLOAD_SD}", i 1, *p .r0, p 0) i.r2'
   ${If} $2 == 0
     Call IsoHopperInstallFailed
   ${EndIf}
@@ -116,46 +140,221 @@ Section "-IsoHopper protected directory"
     System::Call 'kernel32::LocalFree(p r0) p'
     Call IsoHopperInstallFailed
   ${EndIf}
-  ; Atomic existing-directory refusal, including empty dirs and reparse points.
-  System::Call 'kernel32::CreateDirectoryW(w "$INSTDIR", p r1) i.r2'
+  System::Call 'kernel32::CreateDirectoryW(w r8, p r1) i.r2'
   System::Free $1
   System::Call 'kernel32::LocalFree(p r0) p'
   ${If} $2 == 0
-    DetailPrint "Protected directory creation failed; existing paths are untouched."
+    ; The path was not created by us. Do not open or clean it up.
     Call IsoHopperInstallFailed
   ${EndIf}
-  ; Keep the new directory open without delete sharing through extraction.
-  System::Call 'kernel32::CreateFileW(w "$INSTDIR", i 0x20080, i 3, p 0, i 3, i 0x02200000, p 0) p.r0'
+  System::Call 'kernel32::CreateFileW(w r8, i 0x20080, i 3, p 0, i 3, i 0x02200000, p 0) p.r0'
   ${If} $0 == -1
   ${OrIf} $0 == 0
     Call IsoHopperInstallFailed
   ${EndIf}
-  StrCpy $IsoHopperInstallHandle $0
+  StrCpy $IsoHopperStageHandle $0
+  Call IsoHopperCheckRetainedPayload
+  ; Only a verified retained object may be used for extraction or cleanup.
+  StrCpy $IsoHopperStageDirectory $8
   System::Store "l"
-SectionEnd
+FunctionEnd
 
-!macro IsoHopperSetNewFileOwner FILE_NAME
-  System::Call 'advapi32::SetNamedSecurityInfoW(w "$INSTDIR\${FILE_NAME}", i 1, i 1, p r0, p 0, p 0, p 0) i.r1'
+Function IsoHopperCheckRetainedPayload
+  System::Store "s"
+  StrCpy $IsoHopperFailureText "The setup directory failed its protection check. Setup did not extract or run its payload."
+  StrCpy $0 0 ; Expected descriptor
+  StrCpy $1 0 ; Expected canonical string
+  StrCpy $2 0 ; Observed descriptor
+  StrCpy $3 0 ; Observed canonical string
+  StrCpy $7 0 ; Verification result
+  System::Alloc 8 ; FILE_ATTRIBUTE_TAG_INFO
+  Pop $4
+  ${If} $4 == 0
+    Goto isohopper_stage_check_done
+  ${EndIf}
+  System::Call 'kernel32::GetFileInformationByHandleEx(p $IsoHopperStageHandle, i 9, p r4, i 8) i.r5'
+  ${If} $5 == 0
+    Goto isohopper_stage_check_done
+  ${EndIf}
+  System::Call '*$4(i .r5, i .r6)'
+  IntOp $5 $5 & 0x410 ; DIRECTORY | REPARSE_POINT
+  ${If} $5 != 0x10
+    Goto isohopper_stage_check_done
+  ${EndIf}
+
+  ; Compare API-normalized OWNER/GROUP/DACL strings, not binary ACL layouts.
+  ; Exact protected DACL and BA owner prevent an attacker-created replacement
+  ; from being accepted even if the parent was misconfigured as writable.
+  System::Call 'advapi32::ConvertStringSecurityDescriptorToSecurityDescriptorW(w "${ISOHOPPER_PAYLOAD_SD}", i 1, *p .r0, p 0) i.r5'
+  ${If} $5 == 0
+    Goto isohopper_stage_check_done
+  ${EndIf}
+  System::Call 'advapi32::ConvertSecurityDescriptorToStringSecurityDescriptorW(p r0, i 1, i 7, *p .r1, p 0) i.r5'
+  ${If} $5 == 0
+    Goto isohopper_stage_check_done
+  ${EndIf}
+  System::Call 'advapi32::GetSecurityInfo(p $IsoHopperStageHandle, i 1, i 7, p 0, p 0, p 0, p 0, *p .r2) i.r5'
+  ${If} $5 != 0
+    Goto isohopper_stage_check_done
+  ${EndIf}
+  ; Windows may mark a created DACL auto-inherited. Clear only that bookkeeping
+  ; bit in our local descriptor, never on the directory. The expected D:P
+  ; descriptor already has it clear. Protection, all ACEs, owner and group stay.
+  System::Call 'advapi32::SetSecurityDescriptorControl(p r2, i 0x0400, i 0) i.r5'
+  ${If} $5 == 0
+    Goto isohopper_stage_check_done
+  ${EndIf}
+  System::Call 'advapi32::ConvertSecurityDescriptorToStringSecurityDescriptorW(p r2, i 1, i 7, *p .r3, p 0) i.r5'
+  ${If} $5 == 0
+    Goto isohopper_stage_check_done
+  ${EndIf}
+  System::Call 'kernel32::CompareStringOrdinal(p r1, i -1, p r3, i -1, i 0) i.r5'
+  ${If} $5 == 2 ; CSTR_EQUAL, with case-sensitive ordinal comparison
+    StrCpy $7 1
+  ${EndIf}
+
+  isohopper_stage_check_done:
+  ${If} $0 != 0
+    System::Call 'kernel32::LocalFree(p r0) p'
+  ${EndIf}
+  ${If} $1 != 0
+    System::Call 'kernel32::LocalFree(p r1) p'
+  ${EndIf}
+  ${If} $2 != 0
+    System::Call 'kernel32::LocalFree(p r2) p'
+  ${EndIf}
+  ${If} $3 != 0
+    System::Call 'kernel32::LocalFree(p r3) p'
+  ${EndIf}
+  ${If} $4 != 0
+    System::Free $4
+  ${EndIf}
+  ${If} $7 != 1
+    Call IsoHopperInstallFailed
+  ${EndIf}
+  System::Store "l"
+FunctionEnd
+
+!macro IsoHopperSetPayloadOwner FILE_NAME
+  System::Call 'advapi32::SetNamedSecurityInfoW(w "$IsoHopperStageDirectory\${FILE_NAME}", i 1, i 1, p r0, p 0, p 0, p 0) i.r1'
   ${If} $1 != 0
     System::Call 'kernel32::LocalFree(p r0) p'
-    DetailPrint "Could not establish protected ownership of a newly installed file."
     Call IsoHopperInstallFailed
   ${EndIf}
 !macroend
 
-!macro NSIS_HOOK_POSTINSTALL
+Function IsoHopperApplyPayload
   System::Store "s"
+  StrCpy $IsoHopperFailureCode 12
+  StrCpy $IsoHopperFailureText "Could not verify the protected setup payload. Run this installer again."
   System::Call 'advapi32::ConvertStringSidToSidW(w "S-1-5-32-544", *p .r0) i.r1'
   ${If} $1 == 0
     Call IsoHopperInstallFailed
   ${EndIf}
-  ; The fixed directory was created above. All three files were created by
-  ; this installer; the inherited OWNER_RIGHTS ACE protected them from birth.
-  !insertmacro IsoHopperSetNewFileOwner "${MAINBINARYNAME}.exe"
-  !insertmacro IsoHopperSetNewFileOwner "isohopper-helper.exe"
-  !insertmacro IsoHopperSetNewFileOwner "uninstall.exe"
+  !insertmacro IsoHopperSetPayloadOwner "isohopper-studio.exe"
+  !insertmacro IsoHopperSetPayloadOwner "isohopper-helper.exe"
+  !insertmacro IsoHopperSetPayloadOwner "uninstall.exe"
   System::Call 'kernel32::LocalFree(p r0) p'
-  System::Call 'kernel32::CloseHandle(p $IsoHopperInstallHandle) i'
-  StrCpy $IsoHopperInstallHandle ""
+
+  isohopper_apply_retry:
+  ; nsExec hides the console and forwards helper diagnostics to setup details.
+  ; Do not set a timeout: killing a file transaction can interrupt rollback.
+  nsExec::ExecToLog '"$IsoHopperStageDirectory\isohopper-helper.exe" --installer-apply-v1 "$IsoHopperStageDirectory"'
+  Pop $IsoHopperFailureCode
+  ${If} $IsoHopperFailureCode == "error"
+  ${OrIf} $IsoHopperFailureCode == "timeout"
+  ${OrIf} $IsoHopperFailureCode == ""
+    StrCpy $IsoHopperFailureCode 13
+    StrCpy $IsoHopperFailureText "Could not complete communication with the protected installer helper. Run this installer again to check and repair the installation."
+    Call IsoHopperInstallFailed
+  ${EndIf}
+  ${If} $IsoHopperFailureCode == 10
+    IfSilent isohopper_apply_no_retry
+    ${If} $PassiveMode != 1
+      MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "Close IsoHopper after any active preparation finishes, then retry." IDRETRY isohopper_apply_retry
+      Call IsoHopperCleanup
+      SetErrorLevel 10
+      Quit
+    ${EndIf}
+  ${EndIf}
+  isohopper_apply_no_retry:
+  ${If} $IsoHopperFailureCode != 0
+    StrCpy $IsoHopperFailureText "Installation did not complete. Close IsoHopper and its helper, then run this installer again."
+    ${If} $IsoHopperFailureCode == 10
+      StrCpy $IsoHopperFailureText "Close IsoHopper after any active preparation finishes, then retry. Setup did not stop it."
+    ${ElseIf} $IsoHopperFailureCode == 11
+      StrCpy $IsoHopperFailureText "The existing installation has unsafe permissions or links. Setup left it unchanged."
+    ${ElseIf} $IsoHopperFailureCode == 12
+      StrCpy $IsoHopperFailureText "The setup payload did not pass verification. Download the installer again."
+    ${ElseIf} $IsoHopperFailureCode == 13
+      StrCpy $IsoHopperFailureText "Installation failed and changes were rolled back. Close IsoHopper and run this installer again."
+    ${ElseIf} $IsoHopperFailureCode == 14
+      StrCpy $IsoHopperFailureText "Installation could not finish restoring the previous files. Run this installer again to repair the installation before opening IsoHopper."
+    ${ElseIf} $IsoHopperFailureCode == 3
+      StrCpy $IsoHopperFailureText "The installer helper rejected its arguments. Download the installer again."
+    ${Else}
+      DetailPrint "Unexpected installer helper exit code: $IsoHopperFailureCode"
+      StrCpy $IsoHopperFailureCode 13
+      StrCpy $IsoHopperFailureText "The installer helper ended unexpectedly. Run this installer again to check and repair the installation."
+    ${EndIf}
+    Call IsoHopperInstallFailed
+  ${EndIf}
+  Call IsoHopperCleanup
+  SetErrorLevel 0
   System::Store "l"
+FunctionEnd
+
+; Standalone uninstall keeps the existing explicit data-deletion checkbox.
+; Hold write handles (without write sharing) across all deletes: an active
+; image/retained helper blocks us, and a new launch cannot start in between.
+!macro IsoHopperUninstallGuard FILE_NAME HANDLE_VAR
+  ClearErrors
+  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR\${FILE_NAME}") i.r0 ?e'
+  Pop $1
+  ${If} $0 == -1
+    ${If} $1 != 2
+    ${AndIf} $1 != 3
+      Call un.IsoHopperBusy
+    ${EndIf}
+  ${Else}
+    System::Call 'kernel32::CreateFileW(w "$INSTDIR\${FILE_NAME}", i 0x40000000, i 5, p 0, i 3, i 0x00200000, p 0) p.r0'
+    ${If} $0 == -1
+    ${OrIf} $0 == 0
+      Call un.IsoHopperBusy
+    ${EndIf}
+    StrCpy ${HANDLE_VAR} $0
+  ${EndIf}
 !macroend
+
+Function un.IsoHopperCheckBusy
+  !insertmacro IsoHopperUninstallGuard "isohopper-studio.exe" $IsoHopperUninstallStudio
+  !insertmacro IsoHopperUninstallGuard "isohopper-helper.exe" $IsoHopperUninstallHelper
+  !insertmacro IsoHopperUninstallGuard "uninstall.exe" $IsoHopperUninstallSelf
+FunctionEnd
+
+Function un.IsoHopperRelease
+  ${If} $IsoHopperUninstallStudio != ""
+    System::Call 'kernel32::CloseHandle(p $IsoHopperUninstallStudio) i'
+    StrCpy $IsoHopperUninstallStudio ""
+  ${EndIf}
+  ${If} $IsoHopperUninstallHelper != ""
+    System::Call 'kernel32::CloseHandle(p $IsoHopperUninstallHelper) i'
+    StrCpy $IsoHopperUninstallHelper ""
+  ${EndIf}
+  ${If} $IsoHopperUninstallSelf != ""
+    System::Call 'kernel32::CloseHandle(p $IsoHopperUninstallSelf) i'
+    StrCpy $IsoHopperUninstallSelf ""
+  ${EndIf}
+FunctionEnd
+
+Function un.IsoHopperBusy
+  Call un.IsoHopperRelease
+  SetErrorLevel 10
+  DetailPrint "Close IsoHopper and its helper before uninstalling."
+  IfSilent isohopper_uninstall_no_prompt
+  ${If} $PassiveMode != 1
+    MessageBox MB_OK|MB_ICONSTOP "Finish or cancel the current operation, then close IsoHopper and its helper before uninstalling."
+  ${EndIf}
+  isohopper_uninstall_no_prompt:
+  Quit
+FunctionEnd
