@@ -149,7 +149,7 @@ macOS and Linux provide local image imports, streaming SHA-256 and read-only dev
 | `isohopper-cli-*` | Standalone CLI, license and build information. |
 | `isohopper-source-*` | Project source at the exact revision below, including build scripts and dependency lockfiles. |
 
-No upstream boot-engine binaries, engine archives or OS images are included. Windows preparation requires a separately supplied, pinned engine archive. Launcher configuration and power-action previews are not applied to the engine USB menu.
+No upstream boot-engine binaries, engine archives or OS images are included. Follow the [Windows preparation guide](https://github.com/IsoHopper/isohopper/blob/{revision}/docs/usb-preparation.md) for the pinned engine archive, staging-space requirements and first boot test. Launcher configuration and power-action previews are not applied to the engine USB menu.
 
 **Signing:** Windows packages are not Authenticode-signed. macOS apps are ad-hoc signed, not Developer ID signed or notarized. SHA-256 checks integrity, not publisher identity. Linux graphics/WebKit compatibility and the oldest advertised macOS version remain untested.
 
