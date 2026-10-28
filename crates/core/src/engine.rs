@@ -21,6 +21,8 @@ use std::{
     path::Path,
 };
 
+pub mod archive;
+
 pub const VERSION: &str = "1.1.18";
 pub const BOOT_BYTES: usize = 512;
 pub const CORE_BYTES: usize = 1_048_064;
