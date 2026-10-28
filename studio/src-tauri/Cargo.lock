@@ -2226,8 +2226,10 @@ dependencies = [
  "cap-std",
  "ed25519-dalek",
  "rustix",
+ "same-file",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.21",
  "url",
 ]
@@ -2236,17 +2238,20 @@ dependencies = [
 name = "isohopper-studio"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.4.3",
  "isohopper-cli",
  "isohopper-config",
  "isohopper-core",
  "isohopper-inventory",
  "isohopper-media",
  "rfd",
+ "same-file",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
