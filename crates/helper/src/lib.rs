@@ -11,6 +11,7 @@ pub mod job;
 pub mod windows_encryption_check;
 pub mod windows_identity;
 pub mod windows_lock;
+pub mod windows_peer;
 pub mod windows_protected;
 pub mod windows_sources;
 pub mod windows_target;
