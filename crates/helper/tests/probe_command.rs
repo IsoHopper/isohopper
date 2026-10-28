@@ -1,4 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#[test]
+fn malformed_preparation_entry_is_refused_before_native_work() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_isohopper-helper"))
+        .args([
+            "--prepare-broker-v1",
+            "--pipe-nonce",
+            "not-a-nonce",
+            "--studio-pid",
+            "1",
+            "--studio-created",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("launch arguments"));
+}
 use std::process::Command;
 
 #[test]

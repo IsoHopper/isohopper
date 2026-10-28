@@ -18,6 +18,7 @@ pub mod windows_lock;
 pub mod windows_peer;
 pub mod windows_pipe;
 pub mod windows_preparation_target;
+pub mod windows_prepare;
 #[cfg(windows)]
 pub mod windows_probe;
 pub mod windows_protected;

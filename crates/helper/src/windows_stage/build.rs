@@ -30,6 +30,9 @@ const FINAL: &str = "final.img";
 #[path = "host.rs"]
 mod host;
 pub use host::TargetBoundStage;
+#[cfg(test)]
+#[path = "coordinator_test.rs"]
+mod coordinator_test;
 fn cancelled(cancel: &AtomicBool) -> Result<(), StageError> {
     if cancel.load(Ordering::Relaxed) {
         Err(StageError::Invalid("staging cancelled"))
@@ -560,6 +563,7 @@ mod tests {
             .is_err()
         );
         assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
+        let entries: Vec<_> = inputs.iter().map(|input| input.entry.clone()).collect();
         let mut phases = Vec::new();
         let mut sealed = build_under(
             make_root(),
@@ -603,7 +607,7 @@ mod tests {
         assert_eq!(&signature, b"EFI PART");
         sealed.revalidate().unwrap();
         let directory = sealed.owner.directory.clone();
-        drop(sealed);
+        coordinator_test::exercise(sealed, make_root(), entries);
         assert!(!directory.exists());
         drop(handle);
         std::fs::remove_dir(&path).unwrap();

@@ -14,6 +14,29 @@ fn main() {
         println!("isohopper-helper {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    if args.first().is_some_and(|arg| arg == "--prepare-broker-v1") {
+        let args = match isohopper_helper::prepare_protocol::PrepareArgs::parse(&args) {
+            Ok(args) => args,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(3);
+            }
+        };
+        #[cfg(windows)]
+        match isohopper_helper::windows_prepare::serve(args) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("Preparation helper failed: {error}");
+                std::process::exit(3);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = args;
+            eprintln!("Elevated preparation helper is Windows-only");
+            std::process::exit(3);
+        }
+    }
     if args.first().is_some_and(|arg| arg == "--probe-broker-v1") {
         let args = match isohopper_helper::broker_probe::ProbeArgs::parse(&args) {
             Ok(args) => args,
@@ -38,7 +61,7 @@ fn main() {
         }
     }
     eprintln!(
-        "Physical-device access is unavailable: platform peer authentication and exclusive device locking require validation. Use isohopper image create for regular-file testing."
+        "Use installed IsoHopper Studio for Windows preparation. This helper does not accept direct device paths or standalone write commands."
     );
     std::process::exit(3);
 }
