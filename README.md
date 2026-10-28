@@ -3,7 +3,7 @@
 > **SUPER EXPERIMENTAL — pending human testing.**
 > Physical disk writes are disabled. Hardware and operating-system boot compatibility have not been established.
 
-IsoHopper is an independent Rust toolkit for inspecting image libraries, reviewing device safety, and developing multiboot media. Studio is a Tauri desktop interface for the same work.
+IsoHopper is a Rust toolkit for image inspection, device safety checks and experimental multiboot media. Studio is its Tauri desktop interface.
 
 ![IsoHopper Studio: image library, device details and partition plan](docs/screenshots/studio.jpg)
 
@@ -13,11 +13,10 @@ IsoHopper is an independent Rust toolkit for inspecting image libraries, reviewi
 
 - Rust CLI: recursive image inspection, streaming checksums, YAML/TOML configuration, supplied-key signed-manifest validation, and partition planning.
 - Studio: native file and folder selection, streaming SHA-256, full checksums, relative folder paths, configuration editing, and operation logs. Browser-only intake is limited to 512 MiB per file.
-- Read-only macOS, Linux and Windows host-device inspection. Unknown safety information remains unknown; inspected host devices cannot be selected for preparation.
-- Explicitly labelled fixture devices for preparation simulation and typed risk confirmation. Simulation performs no disk writes.
-- New regular-file GPT images with primary/backup metadata and optional FAT32 A/B slots containing an x64 EFI application. Existing output files are refused; the data partition remains unformatted.
-- An x64 UEFI launcher with configurable, confirmed reboot/shutdown/firmware-setup actions. Studio power buttons are inert previews, not host power controls.
-- Optional supplied x64 EFI utility in both boot slots, launched through firmware `LoadImage`/`StartImage` after confirmation. Firmware security rejections are preserved.
+- Read-only macOS, Linux and Windows device inspection. Host devices remain blocked from preparation.
+- Labelled mock devices, preparation simulation and typed confirmation; no disk writes.
+- New GPT test images with verified primary/backup metadata and FAT32 A/B boot slots. Existing files are refused; the data partition remains unformatted.
+- An x64 UEFI launcher with confirmed EFI utility handoff and configurable reboot/shutdown/firmware-setup actions. Firmware security policy applies. Studio power controls are inert previews.
 
 Image inspection and checksum calculation do not prove publisher authenticity or boot compatibility. Physical-device preparation, an end-to-end OS boot workflow, and production Secure Boot signing remain unavailable.
 
@@ -54,7 +53,13 @@ cargo test --manifest-path studio/src-tauri/Cargo.toml --locked
 
 The shared script checks Rust, frontend code, and Chromium at desktop and compact widths. Native Studio tests are separate. See [CONTRIBUTING.md](CONTRIBUTING.md) for local development, browser-test discovery without execution, and the optional QEMU firmware smoke test. A passing firmware-entry test is not evidence of OS boot compatibility.
 
-Local validation on 28 October 2026: **164 Rust workspace tests, 4 firmware-handoff tests, 2 native tests, 15 frontend tests and 20 firmware-harness tests passed**. The opt-in 600 MiB native import also passed. QEMU passed firmware entry, EFI test-utility handoff/return, and confirmed guest power requests; the next firmware setup screen was not inspected. A separate QEMU suite passed four Secure Boot cases with disposable keys: signed utility accepted; unsigned, tampered and revoked copies rejected. Windows inventory passed fixtures and cross-compilation; native Windows checks run in a manual workflow. Chromium has 32 automated cases; current CI status is shown in [Actions](https://github.com/IsoHopper/isohopper/actions). No physical-device or operating-system boot tests have passed yet.
+Validation on 28 October 2026:
+
+- **167 Rust workspace tests, 4 firmware-handoff tests, 2 native tests, 15 frontend tests and 25 firmware-harness tests passed.** The opt-in 600 MiB native import also passed. Chromium has 32 automated cases; hosted results are in [Actions](https://github.com/IsoHopper/isohopper/actions).
+- QEMU passed firmware entry, EFI utility handoff/return, and confirmed guest power requests. The next firmware setup screen was not inspected.
+- An Ubuntu 6.8.0-147 kernel reached PID 1 in a tiny diagnostic initramfs and shut down cleanly. With disposable Secure Boot keys, its signed unified kernel image booted; unsigned, tampered and revoked copies were refused. The smaller EFI test utility passed the same four cases.
+
+The diagnostic is not an Ubuntu installer. General ISO booting, installation compatibility, physical hardware and production signing remain unvalidated. Test recipes and mocks are included; generated images and keys are not.
 
 ![Memtest86+ 9.00 running after IsoHopper EFI handoff in QEMU](docs/screenshots/memtest-qemu.png)
 
@@ -62,7 +67,7 @@ Local validation on 28 October 2026: **164 Rust workspace tests, 4 firmware-hand
 
 ## Relation to Ventoy
 
-[Ventoy](https://www.ventoy.net/en/index.html) provides direct booting of image files and publishes an extensive compatibility list. IsoHopper is a separate implementation at an early stage, with an emphasis on inspectable metadata and explicit device authorization. It does not yet provide equivalent boot coverage or serve as a drop-in replacement.
+[Ventoy](https://www.ventoy.net/en/index.html) provides direct image booting and extensive compatibility coverage. IsoHopper is an independent, early-stage implementation focused on inspectable metadata and explicit device authorization. It does not yet offer equivalent coverage or replace Ventoy.
 
 ## License and contact
 
