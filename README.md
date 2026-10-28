@@ -5,6 +5,8 @@
 
 IsoHopper is a Rust toolkit for image inspection, device safety checks and experimental multiboot media. Studio is its Tauri desktop interface.
 
+[Experimental downloads](https://github.com/IsoHopper/isohopper/releases): Windows x64, Linux x64, and macOS Intel/Apple Silicon. Release notes list checksums, build checks and limits. Packages have no trusted publisher signature or Apple notarization; operating-system warnings are expected.
+
 ![IsoHopper Studio: image library, device details and partition plan](docs/screenshots/studio.jpg)
 
 *Screenshot uses a simulated target and tiny local test files with real checksums.*
@@ -40,7 +42,7 @@ Build a local macOS app bundle with the pinned Tauri CLI:
 (cd studio/src-tauri && npx --yes @tauri-apps/cli@2.12.4 build --bundles app)
 ```
 
-This is a development build, not a tested release.
+This builds locally. Published prereleases are built and checked by a manually dispatched workflow; installer use and physical hardware still need human testing.
 
 For the browser preview, run `npm --prefix studio/frontend run dev` and open the local URL printed by Vite. This uses a labelled fixture adapter; native file selection and host inspection require Studio.
 

@@ -28,9 +28,17 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
     "targets": "all",
     "shortDescription": "Experimental multiboot toolkit",
+    "license": "GPL-3.0-or-later",
+    "licenseFile": "../../LICENSE",
+    "homepage": "https://github.com/IsoHopper/isohopper",
+    "publisher": "IsoHopper",
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": "-"
+    },
     "category": "Utility",
     "icon": [
       "icons/32x32.png",
