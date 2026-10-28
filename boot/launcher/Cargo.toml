@@ -5,12 +5,21 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-uefi = { version = "=0.41.0", features = ["panic_handler", "logger"], optional = true }
+uefi = { version = "=0.41.0", features = ["logger"], optional = true }
+
+[target.'cfg(target_os = "uefi")'.dependencies]
+uefi = { version = "=0.41.0", features = ["panic_handler"], optional = true }
 
 [features]
 firmware = ["dep:uefi"]
+test-utility = ["firmware"]
 
 [[bin]]
 name = "isohopper-launcher"
 path = "src/main.rs"
 required-features = ["firmware"]
+
+[[bin]]
+name = "isohopper-test-utility"
+path = "src/test_utility.rs"
+required-features = ["test-utility"]

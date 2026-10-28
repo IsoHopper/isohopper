@@ -3,8 +3,12 @@
 #![cfg_attr(target_os = "uefi", no_std)]
 #![cfg_attr(target_os = "uefi", no_main)]
 
+#[cfg(any(target_os = "uefi", test))]
+mod utility;
+
 #[cfg(target_os = "uefi")]
 mod firmware {
+    use crate::utility;
     use isohopper_launcher::power::{Action, Confirmation, PowerConfig, firmware_indications};
     use uefi::{
         cstr16,
@@ -112,6 +116,58 @@ mod firmware {
             }
         }
     }
+    fn utility_available() -> bool {
+        match utility::available() {
+            Ok(available) => available,
+            Err(status) => {
+                uefi::println!("EFI utility unavailable: {status:?}");
+                false
+            }
+        }
+    }
+    fn menu(config: PowerConfig, supported: bool, has_utility: bool) {
+        uefi::println!("Menu:");
+        if has_utility {
+            uefi::println!("  U  Run user-supplied EFI utility (IHUTIL.EFI)");
+        }
+        if config.allows(Action::Reboot, supported) {
+            uefi::println!("  R  Reboot");
+        }
+        if config.allows(Action::Shutdown, supported) {
+            uefi::println!("  S  Shut down");
+        }
+        if config.mask & 4 != 0 {
+            uefi::println!(
+                "  F  Firmware setup{}",
+                if supported { "" } else { " [unsupported]" }
+            );
+        }
+        uefi::println!("  X  Return to firmware boot manager");
+    }
+    fn run_utility() {
+        uefi::println!("Run user-supplied IHUTIL.EFI? Firmware security policy applies.");
+        uefi::println!("Press Y to confirm. Any other key cancels.");
+        if !key().is_some_and(|key| key.eq_ignore_ascii_case(&'y')) {
+            uefi::println!("Cancelled.");
+            return;
+        }
+        let image = match utility::load() {
+            Ok(image) => image,
+            Err(status) => {
+                uefi::println!("Firmware could not load EFI utility: {status:?}");
+                return;
+            }
+        };
+        serial(b"ISOHOPPER:UTILITY:START\r\n");
+        match uefi::boot::start_image(image) {
+            Ok(()) => {
+                serial(b"ISOHOPPER:UTILITY:RETURN\r\n");
+                uefi::println!("EFI utility returned.");
+            }
+            Err(error) => uefi::println!("EFI utility failed: {:?}", error.status()),
+        }
+        utility::unload_remaining(image);
+    }
     pub fn run() -> Status {
         if uefi::helpers::init().is_err() {
             return Status::ABORTED;
@@ -143,24 +199,18 @@ mod firmware {
         let config = preferences();
         let supported =
             read_u64(cstr16!("OsIndicationsSupported")).is_ok_and(|value| value & 1 != 0);
-        uefi::println!("Power menu:");
-        if config.allows(Action::Reboot, supported) {
-            uefi::println!("  R  Reboot");
-        }
-        if config.allows(Action::Shutdown, supported) {
-            uefi::println!("  S  Shut down");
-        }
-        if config.mask & 4 != 0 {
-            uefi::println!(
-                "  F  Firmware setup{}",
-                if supported { "" } else { " [unsupported]" }
-            );
-        }
-        uefi::println!("  X  Return to firmware boot manager");
+        let mut has_utility = utility_available();
+        menu(config, supported, has_utility);
         serial(b"ISOHOPPER:SMOKE:ENTRY\r\n");
         let mut confirmation = Confirmation::default();
         loop {
             let action = match key().map(|c| c.to_ascii_lowercase()) {
+                Some('u') if has_utility => {
+                    run_utility();
+                    has_utility = utility_available();
+                    menu(config, supported, has_utility);
+                    continue;
+                }
                 Some('r') => Action::Reboot,
                 Some('s') => Action::Shutdown,
                 Some('f') => Action::FirmwareSetup,
