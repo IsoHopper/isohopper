@@ -12,13 +12,55 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 spec = importlib.util.spec_from_file_location('smoke', Path(__file__).with_name('firmware-smoke.py'))
 smoke = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(smoke)
 
 class UtilityEvidence(unittest.TestCase):
+    def test_linux_diagnostic_requires_ordered_boot_userspace_and_clean_poweroff(self):
+        stages = [smoke.MARKER, b'ISOHOPPER:UTILITY:START', b'[    0.000000] Linux version 6.8.0-test (builder)',
+                  b'ISOHOPPER:LINUX:INIT_PID1', b'[    1.000000] reboot: Power down']
+        complete = b'\n'.join(stages)
+        self.assertTrue(smoke.linux_diagnostic_completed(complete, 0))
+        self.assertFalse(smoke.linux_diagnostic_completed(complete, 1))
+        for index in range(len(stages)):
+            with self.subTest(missing=index):
+                self.assertFalse(smoke.linux_diagnostic_completed(b'\n'.join(stages[:index] + stages[index + 1:]), 0))
+        self.assertFalse(smoke.linux_diagnostic_completed(b'\n'.join(reversed(stages)), 0))
+        for failure in [b'Kernel panic - not syncing', b'ISOHOPPER:UTILITY:RETURN',
+                        b'ISOHOPPER:UTILITY:SECURITY_VIOLATION', b'ISOHOPPER:UTILITY:ACCESS_DENIED',
+                        b'ISOHOPPER:LINUX:FAIL']:
+            with self.subTest(failure=failure):
+                self.assertFalse(smoke.linux_diagnostic_completed(complete + b'\n' + failure, 0))
+
+    def test_linux_mode_waits_for_process_exit_and_limits_os_claim(self):
+        real_popen = subprocess.Popen
+        serial = '\n'.join(['ISOHOPPER:SMOKE:ENTRY', 'ISOHOPPER:UTILITY:START',
+                            'Linux version 6.8.0-test (builder)', 'ISOHOPPER:LINUX:INIT_PID1',
+                            'reboot: Power down'])
+        for exit_code in [0, 1]:
+            def fake_qemu(command, **kwargs):
+                return real_popen([sys.executable, '-c', f'print({serial!r}, flush=True); raise SystemExit({exit_code})'], **kwargs)
+            with self.subTest(exit_code=exit_code), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for name in ['image', 'code', 'vars']:
+                    (root/name).write_bytes(b'fixture')
+                argv = ['firmware-smoke.py', '--image', str(root/'image'), '--code', str(root/'code'),
+                        '--vars', str(root/'vars'), '--log', str(root/'serial.log'),
+                        '--action', 'linux-diagnostic', '--timeout', '2']
+                output = io.StringIO()
+                with patch.object(sys, 'argv', argv), patch.object(smoke.subprocess, 'Popen', side_effect=fake_qemu), \
+                     patch.object(smoke.socket, 'socket', return_value=MagicMock()), \
+                     patch.object(smoke, 'read_qmp_line', side_effect=[b'{"QMP":{}}', b'{"return":{}}', b'{"return":{}}', b'{"return":{}}']), \
+                     patch.object(smoke.time, 'sleep'), redirect_stdout(output):
+                    result = smoke.main()
+                evidence = json.loads(output.getvalue())
+                self.assertEqual(result, exit_code)
+                self.assertEqual(evidence['os_boot_tested'], exit_code == 0)
+                self.assertEqual(evidence['os_boot_scope'], 'custom-linux-diagnostic')
+
     def test_power_marker_without_entry_cannot_pass_main(self):
         real_popen = subprocess.Popen
         # Exercise the real selector/EOF path using a child that only emits a

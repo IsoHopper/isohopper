@@ -6,6 +6,7 @@ from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
+import re
 import selectors
 import socket
 import stat
@@ -39,6 +40,24 @@ def utility_returned(output):
         if found < 0:
             return False
         position = found + len(marker)
+    return True
+
+
+def linux_diagnostic_completed(output, returncode):
+    """Prove only this fixture reached PID 1 and powered off the guest."""
+    if returncode != 0 or any(marker in output.lower() for marker in [
+            b'kernel panic', b'not syncing', b'isohopper:utility:return',
+            b'isohopper:utility:security_violation', b'isohopper:utility:access_denied',
+            b'isohopper:linux:fail']):
+        return False
+    position = 0
+    for pattern in [re.escape(MARKER), rb'ISOHOPPER:UTILITY:START',
+                    rb'Linux version [0-9][^\r\n]*', rb'ISOHOPPER:LINUX:INIT_PID1',
+                    rb'reboot: Power down']:
+        match = re.search(pattern, output[position:])
+        if match is None:
+            return False
+        position += match.end()
     return True
 
 
@@ -91,7 +110,7 @@ def main():
     parser.add_argument('--image', required=True, type=Path)
     parser.add_argument('--code', required=True, type=Path, help='OVMF/EDK2 x64 code image')
     parser.add_argument('--vars', required=True, type=Path, help='Matching clean vars template')
-    parser.add_argument('--action', choices=['shutdown', 'reboot', 'firmware-setup', 'utility', 'utility-reject'], help='Exercise a confirmed guest power action or the test EFI utility')
+    parser.add_argument('--action', choices=['shutdown', 'reboot', 'firmware-setup', 'utility', 'utility-reject', 'linux-diagnostic'], help='Exercise a confirmed guest power action, test EFI utility, or custom Linux diagnostic')
     parser.add_argument('--require-secure-boot', action='store_true', help='Require firmware to report enabled; use secure OVMF with enrolled test variables')
     parser.add_argument('--qemu', default='qemu-system-x86_64')
     parser.add_argument('--timeout', type=int, default=45)
@@ -200,7 +219,7 @@ def main():
                                         return reply['return']
                                 raise RuntimeError('QMP event limit exceeded')
                             qmp('qmp_capabilities')
-                            for key_name in [{'shutdown': 's', 'reboot': 'r', 'firmware-setup': 'f', 'utility': 'u', 'utility-reject': 'u'}[args.action], 'y']:
+                            for key_name in [{'shutdown': 's', 'reboot': 'r', 'firmware-setup': 'f', 'utility': 'u', 'utility-reject': 'u', 'linux-diagnostic': 'u'}[args.action], 'y']:
                                 qmp('send-key', {'keys': [{'type': 'qcode', 'data': key_name}], 'hold-time': 50})
                                 time.sleep(0.15)
                         action_sent = True
@@ -221,6 +240,11 @@ def main():
                             and action_markers[args.action] in output and process.returncode == 0):
                         passed = True
                         reason = 'power-action-exited-qemu'
+                    if (args.action == 'linux-diagnostic' and action_sent
+                            and (not args.require_secure_boot or secure_boot_enabled(output))
+                            and linux_diagnostic_completed(output, process.returncode)):
+                        passed = True
+                        reason = 'linux-diagnostic-powered-off'
                     break
         except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
             reason = 'monitor-error'
@@ -241,7 +265,9 @@ def main():
             'transport': 'emulated USB', 'physical_devices_attached': False,
             'secure_boot_tested': args.require_secure_boot,
             'secure_boot_reported_enabled': secure_boot_enabled(output),
-            'os_boot_tested': False, 'log': str(args.log)}, indent=2))
+            'os_boot_tested': passed and args.action == 'linux-diagnostic',
+            **({'os_boot_scope': 'custom-linux-diagnostic'} if args.action == 'linux-diagnostic' else {}),
+            'log': str(args.log)}, indent=2))
         return 0 if passed else 1
 
 
