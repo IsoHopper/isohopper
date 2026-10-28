@@ -9,6 +9,7 @@ use thiserror::Error;
 pub mod broker_probe;
 pub mod framing;
 pub mod job;
+pub mod prepare_protocol;
 pub mod raw_image_job;
 pub mod windows_encryption_check;
 pub mod windows_identity;
