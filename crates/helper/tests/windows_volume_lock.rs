@@ -88,7 +88,6 @@ mod native {
     };
     use super::{lock_image, vhd_support};
     use isohopper_helper::{
-        windows_encryption_check,
         windows_lock::{self, LockError, ObservedLockError, TargetVolumeProbe},
         windows_target::BoundTarget,
         writer::{RetainedDevice, write_image},
@@ -163,7 +162,12 @@ mod native {
         }
         probe.revalidate()?;
         let coverage = probe.coverage().clone();
-        let encryption = windows_encryption_check::observe_for_probe(&mut probe)?;
+        // Bind the provider and encryption observation to this same retained
+        // target; the coordinator must not reconstruct an independent probe.
+        // SAFETY: synchronous read-only handle for this owned VHD only.
+        let mut binding =
+            unsafe { BoundTarget::from_owned_handle(provider_target.into(), &expected)? };
+        let encryption = binding.observe_encryption()?;
         assert_eq!(encryption.coverage, coverage);
         assert_eq!(encryption.partitions.len(), coverage.partitions.len());
         for (report, partition) in encryption.partitions.iter().zip(&coverage.partitions) {
@@ -182,10 +186,6 @@ mod native {
                 .filter(|p| p.observation.is_some())
                 .count()
         );
-        // SAFETY: this duplicates the same synchronous read-only handle for
-        // the owned VHD. The correlation owner performs metadata queries only.
-        let mut binding =
-            unsafe { BoundTarget::from_owned_handle(provider_target.into(), &expected)? };
         assert_eq!(binding.observation().coverage, coverage);
         assert_eq!(binding.observation().partitions.len(), 2);
         let first_binding = binding.observation().clone();

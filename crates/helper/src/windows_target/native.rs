@@ -85,6 +85,24 @@ impl BoundTarget {
         &self.observation
     }
 
+    /// Observe BitLocker for this owner's exact retained volume coverage.
+    /// Recheck native identity, provider records and topology on both sides of
+    /// collection, including when collection fails. The report preserves
+    /// unsupported providers and unknown values; it is not permission to write.
+    /// No independently reconstructed probe or caller-supplied disk is used.
+    pub fn observe_encryption(
+        &mut self,
+    ) -> Result<crate::windows_encryption_check::EncryptionReport, TargetError> {
+        self.revalidate()?;
+        let report = crate::windows_encryption_check::observe_for_probe(&mut self.probe);
+        self.revalidate()?;
+        let report = report?;
+        if report.coverage != self.observation.coverage {
+            return Err(TargetError::Mismatch("encryption target coverage"));
+        }
+        Ok(report)
+    }
+
     /// Requery both retained handles, target volume topology, present disk
     /// interfaces, the current path binding, and exact provider disk/partition
     /// records. Failures do not update the last successful observation.

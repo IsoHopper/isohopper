@@ -54,6 +54,8 @@ pub enum TargetError {
     Coverage(#[from] crate::windows_lock::LockError),
     #[error(transparent)]
     Inventory(#[from] isohopper_inventory::InventoryError),
+    #[error(transparent)]
+    Encryption(#[from] crate::windows_encryption_check::ObservationError),
 }
 
 /// Pure comparison for provider/handle observations. It performs no I/O and
