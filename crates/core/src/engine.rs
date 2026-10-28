@@ -193,6 +193,58 @@ pub fn create(
     payloads: &Payloads<'_>,
 ) -> Result<Image, VirtualDiskError> {
     let path = path.as_ref();
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(invalid("engine image must be a regular file"));
+    }
+    let identity = Handle::from_file(file.try_clone()?)?;
+    let image = initialize_empty_file(&mut file, plan, payloads)?;
+    check_identity(path, &identity, plan.layout.size_bytes)?;
+    Ok(image)
+}
+
+/// Compare a regular file against the exact saved builder receipt, including
+/// generated identifiers, canonical entry fields and complete payload hashes.
+/// This deliberately cannot infer an engine profile from arbitrary disk bytes.
+/// It permits later data-partition formatting; data contents are outside this
+/// metadata/payload check. External writes cannot be frozen by this observation.
+pub fn verify(path: impl AsRef<Path>, expected: &Image) -> Result<(), VirtualDiskError> {
+    let path = path.as_ref();
+    let mut file = open_regular_read(path)?;
+    let identity = Handle::from_file(file.try_clone()?)?;
+    check_identity(path, &identity, expected.plan.layout.size_bytes)?;
+    let before = file.metadata()?;
+    verify_reader(&mut file, expected)?;
+    let after = file.metadata()?;
+    if before.len() != after.len() || before.modified()? != after.modified()? {
+        return Err(invalid("engine image changed during verification"));
+    }
+    check_identity(path, &identity, expected.plan.layout.size_bytes)
+}
+
+/// Initialize a caller-owned empty regular file through its retained handle.
+/// The caller must supply exclusive creation provenance and access control;
+/// this API cannot establish those properties from a handle. It never opens a
+/// path or raw device, and refuses any nonempty or non-regular file before
+/// mutation. On error, the caller owns cleanup of the incomplete file.
+pub fn initialize_empty_file(
+    file: &mut std::fs::File,
+    plan: &Plan,
+    payloads: &Payloads<'_>,
+) -> Result<Image, VirtualDiskError> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != 0 {
+        return Err(invalid(
+            "engine initialization requires an empty regular file",
+        ));
+    }
     let mut encoded = gpt::encode_engine(plan)?;
     let private_identity = gpt::new_guid()?;
     let mbr_signature = new_signature()?;
@@ -226,58 +278,26 @@ pub fn create(
             region(firmware_offset, payloads.firmware),
         ],
     };
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(invalid("engine image must be a regular file"));
-    }
-    let identity = Handle::from_file(file.try_clone()?)?;
     file.make_sparse()?;
     file.set_len(plan.layout.size_bytes)?;
     for (offset, data) in &image.metadata {
-        write_at(&mut file, *offset, data, plan.layout.size_bytes)?;
+        write_at(file, *offset, data, plan.layout.size_bytes)?;
     }
-    write_at(&mut file, 34 * SECTOR, &core, plan.layout.size_bytes)?;
+    write_at(file, 34 * SECTOR, &core, plan.layout.size_bytes)?;
     write_at(
-        &mut file,
+        file,
         firmware_offset,
         payloads.firmware,
         plan.layout.size_bytes,
     )?;
     file.sync_all()?;
     let before = file.metadata()?;
-    verify_reader(&mut file, &image)?;
+    verify_reader(file, &image)?;
     let after = file.metadata()?;
     if before.len() != after.len() || before.modified()? != after.modified()? {
         return Err(invalid("engine image changed during readback"));
     }
-    check_identity(path, &identity, plan.layout.size_bytes)?;
     Ok(image)
-}
-
-/// Compare a regular file against the exact saved builder receipt, including
-/// generated identifiers, canonical entry fields and complete payload hashes.
-/// This deliberately cannot infer an engine profile from arbitrary disk bytes.
-/// It permits later data-partition formatting; data contents are outside this
-/// metadata/payload check. External writes cannot be frozen by this observation.
-pub fn verify(path: impl AsRef<Path>, expected: &Image) -> Result<(), VirtualDiskError> {
-    let path = path.as_ref();
-    let mut file = open_regular_read(path)?;
-    let identity = Handle::from_file(file.try_clone()?)?;
-    check_identity(path, &identity, expected.plan.layout.size_bytes)?;
-    let before = file.metadata()?;
-    verify_reader(&mut file, expected)?;
-    let after = file.metadata()?;
-    if before.len() != after.len() || before.modified()? != after.modified()? {
-        return Err(invalid("engine image changed during verification"));
-    }
-    check_identity(path, &identity, expected.plan.layout.size_bytes)
 }
 
 fn new_signature() -> Result<[u8; 4], VirtualDiskError> {

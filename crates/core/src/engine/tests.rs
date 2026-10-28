@@ -26,6 +26,52 @@ fn payloads() -> Payloads<'static> {
     }
 }
 
+#[test]
+fn retained_empty_file_gets_the_same_verified_engine_profile() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("private.img");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    // A stale cursor must not shift disk offsets.
+    file.seek(SeekFrom::Start(8192)).unwrap();
+    let image =
+        initialize_empty_file(&mut file, &Plan::new(64 << 20, 512).unwrap(), &payloads()).unwrap();
+    assert_eq!(file.metadata().unwrap().len(), 64 << 20);
+    assert_eq!(&read(&path, 512, 8), b"EFI PART");
+    verify(&path, &image).unwrap();
+}
+
+#[test]
+fn retained_initializer_refuses_existing_contents_without_modification() {
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(b"keep existing data").unwrap();
+    assert!(
+        initialize_empty_file(&mut file, &Plan::new(64 << 20, 512).unwrap(), &payloads()).is_err()
+    );
+    file.rewind().unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"keep existing data");
+}
+
+#[test]
+fn retained_initializer_refuses_directories() {
+    let directory = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        let mut file = File::open(directory.path()).unwrap();
+        assert!(
+            initialize_empty_file(&mut file, &Plan::new(64 << 20, 512).unwrap(), &payloads())
+                .is_err()
+        );
+    }
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
 fn read(path: &Path, offset: u64, bytes: usize) -> Vec<u8> {
     let mut file = File::open(path).unwrap();
     file.seek(SeekFrom::Start(offset)).unwrap();
