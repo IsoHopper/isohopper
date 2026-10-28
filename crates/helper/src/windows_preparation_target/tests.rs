@@ -223,18 +223,108 @@ fn stage_host_partial_use_does_not_bypass_identity_or_membership_checks() {
 }
 
 #[test]
-fn stage_host_refuses_unknown_disk_serial_even_when_pool_metadata_agrees() {
+fn stage_host_accepts_jointly_absent_serials_without_relaxing_target_policy() {
+    let (device, mut disk, mut pools) = fixture();
+    for disk_serial in [None, Some(""), Some("   ")] {
+        for pool_serial in [None, Some(""), Some("   ")] {
+            disk.serial_number = disk_serial.map(str::to_owned);
+            pools.physical_disks[0].serial_number = pool_serial.map(str::to_owned);
+            for partial in [false, true] {
+                pools.physical_disks[0].is_partial = Some(partial);
+                for format in [1, 2, 3, 8] {
+                    disk.unique_id_format = Some(format);
+                    pools.physical_disks[0].unique_id_format = Some(format);
+                    assert!(require_stage_host_pool(&disk, &pools).is_ok());
+                    assert!(matches!(
+                        require_standalone_pool(&disk, &pools),
+                        Err(PreparationError::Refused(
+                            "physical storage serial is unknown"
+                        ))
+                    ));
+                    assert!(require_target_policy(&device, &disk, &[]).is_err());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn stage_host_requires_exact_serial_agreement_when_either_provider_reports_one() {
     let (_, mut disk, mut pools) = fixture();
-    for serial in [None, Some(String::new()), Some("   ".into())] {
-        disk.serial_number = serial.clone();
-        pools.physical_disks[0].serial_number = serial;
-        assert!(matches!(
-            require_stage_host_pool(&disk, &pools),
-            Err(PreparationError::Refused(
-                "physical storage serial is unknown"
-            ))
-        ));
+    for (disk_serial, pool_serial) in [
+        (Some("serial"), None),
+        (Some("serial"), Some("")),
+        (Some("serial"), Some("   ")),
+        (None, Some("serial")),
+        (Some(""), Some("serial")),
+        (Some("   "), Some("serial")),
+        (Some("serial"), Some("Serial")),
+        (Some("serial"), Some(" serial ")),
+    ] {
+        disk.serial_number = disk_serial.map(str::to_owned);
+        pools.physical_disks[0].serial_number = pool_serial.map(str::to_owned);
+        assert!(require_stage_host_pool(&disk, &pools).is_err());
         assert!(require_standalone_pool(&disk, &pools).is_err());
+    }
+    disk.serial_number = Some(" serial ".into());
+    pools.physical_disks[0].serial_number = disk.serial_number.clone();
+    assert!(require_stage_host_pool(&disk, &pools).is_ok());
+    assert!(require_standalone_pool(&disk, &pools).is_ok());
+}
+
+#[test]
+fn serialless_stage_host_still_requires_exact_complete_pool_identity() {
+    for change in 0..23 {
+        let (_, mut disk, mut pools) = fixture();
+        disk.serial_number = None;
+        let record = &mut pools.physical_disks[0];
+        record.serial_number = None;
+        match change {
+            0 => disk.unique_id = None,
+            1 => disk.unique_id = Some("   ".into()),
+            2 => disk.unique_id = Some("Opaque ID".into()),
+            3 => record.unique_id = "  opaque id  ".into(),
+            4 => record.unique_id = disk.number.to_string(),
+            5 => disk.unique_id_format = None,
+            6 => disk.unique_id_format = Some(0),
+            7 => {
+                disk.unique_id_format = Some(9);
+                record.unique_id_format = Some(9);
+            }
+            8 => record.unique_id_format = None,
+            9 => record.unique_id_format = Some(3),
+            10 => disk.size = None,
+            11 => {
+                disk.size = Some(0);
+                record.size_bytes = Some(0);
+            }
+            12 => record.size_bytes = None,
+            13 => record.size_bytes = Some(disk.size.unwrap() + 512),
+            14 => {
+                disk.bus_type = None;
+                record.bus_type = None;
+            }
+            15 => record.bus_type = None,
+            16 => record.bus_type = Some(17),
+            17 => record.is_partial = None,
+            18 => record.primordial_pools.clear(),
+            19 => record.nonprimordial_pools = record.primordial_pools.clone(),
+            20 => pools.physical_disks.push(pools.physical_disks[0].clone()),
+            21 => pools.physical_disks.clear(),
+            22 => {
+                disk.unique_id_format = Some(0);
+                record.unique_id_format = Some(0);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            require_stage_host_pool(&disk, &pools).is_err(),
+            "case {change}"
+        );
+        assert!(
+            require_standalone_pool(&disk, &pools).is_err(),
+            "case {change}"
+        );
     }
 }
 

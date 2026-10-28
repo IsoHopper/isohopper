@@ -31,7 +31,7 @@ pub fn require_standalone_pool<'a>(
     disk: &WindowsDiskRecord,
     pools: &'a PoolObservation,
 ) -> Result<&'a PhysicalDiskPools, PreparationError> {
-    let record = matched_physical_disk(disk, pools)?;
+    let record = matched_physical_disk(disk, pools, SerialRequirement::Required)?;
     match record.is_partial {
         Some(false) => (),
         Some(true) => {
@@ -49,9 +49,16 @@ pub fn require_standalone_pool<'a>(
     Ok(record)
 }
 
+enum SerialRequirement {
+    Required,
+    #[cfg(any(windows, test))]
+    BothAbsentOnStageHost,
+}
+
 fn matched_physical_disk<'a>(
     disk: &WindowsDiskRecord,
     pools: &'a PoolObservation,
+    serial_requirement: SerialRequirement,
 ) -> Result<&'a PhysicalDiskPools, PreparationError> {
     let refused = PreparationError::Refused;
     let id = disk
@@ -80,13 +87,19 @@ fn matched_physical_disk<'a>(
     let serial = disk
         .serial_number
         .as_deref()
-        .filter(|serial| !serial.trim().is_empty())
-        .ok_or(refused("physical storage serial is unknown"))?;
+        .filter(|serial| !serial.trim().is_empty());
+    if matches!(serial_requirement, SerialRequirement::Required) && serial.is_none() {
+        return Err(refused("physical storage serial is unknown"));
+    }
+    let pool_serial = record
+        .serial_number
+        .as_deref()
+        .filter(|serial| !serial.trim().is_empty());
     if disk.size.is_none_or(|size| size == 0)
         || disk.bus_type.is_none()
         || record.size_bytes != disk.size
         || record.bus_type != disk.bus_type
-        || record.serial_number.as_deref() != Some(serial)
+        || pool_serial != serial
     {
         return Err(refused("physical storage metadata does not match"));
     }
@@ -111,12 +124,16 @@ fn require_primordial_only(record: &PhysicalDiskPools) -> Result<(), Preparation
 /// is permitted here, but never by the destructive-target policy above. The
 /// caller must still bind native geometry/extents, exclude the target and
 /// reject unsupported backing. This grants no permission to write a device.
+/// Both providers may omit the serial: exact VPD identity/format, size and bus
+/// still correlate their records, while the caller retains and revalidates
+/// hardware-derived native identity. A serial reported by either provider must
+/// agree exactly with the other. Destructive targets always require a serial.
 #[cfg(any(windows, test))]
 pub(crate) fn require_stage_host_pool<'a>(
     disk: &WindowsDiskRecord,
     pools: &'a PoolObservation,
 ) -> Result<&'a PhysicalDiskPools, PreparationError> {
-    let record = matched_physical_disk(disk, pools)?;
+    let record = matched_physical_disk(disk, pools, SerialRequirement::BothAbsentOnStageHost)?;
     if record.is_partial.is_none() {
         return Err(PreparationError::Refused(
             "physical storage partial-use status is unknown",
