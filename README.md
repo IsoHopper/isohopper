@@ -57,7 +57,7 @@ The shared script checks Rust, frontend code, and Chromium at desktop and compac
 
 Validation on 28 October 2026:
 
-- **235 Rust workspace tests, 17 native tests, 34 frontend tests, 41 Python tests and 58 Chromium cases passed locally.** The workspace includes 12 catalogue tests also covered by native tests. Browser bridge tests use mocks; filesystem tests use real temporary files. Hosted results are in [Actions](https://github.com/IsoHopper/isohopper/actions).
+- **310 Rust workspace tests, 17 native tests, 34 frontend tests, 41 Python tests and 58 Chromium cases passed locally.** The workspace includes 12 catalogue tests also covered by native tests. Browser bridge tests use mocks; filesystem tests use real temporary files. Hosted results are in [Actions](https://github.com/IsoHopper/isohopper/actions).
 - [Windows storage integration](https://github.com/IsoHopper/isohopper/actions/runs/40708807100) passed source-handle protection, nested copies, a 256 MiB VHD write/readback, reattachment, GPT validation, FAT32 volume locks, source-to-disk mapping, source-change rejection and read-only disk refusal. This exercised real Windows storage APIs on disposable virtual disks, not USB hardware.
 - QEMU passed firmware entry, EFI utility handoff/return, and confirmed guest power requests. The next firmware setup screen was not inspected.
 - An Ubuntu 6.8.0-147 kernel reached PID 1 in a tiny diagnostic initramfs and shut down cleanly. With disposable Secure Boot keys, its signed unified kernel image booted; unsigned, tampered and revoked copies were refused. The smaller EFI test utility passed the same four cases.
