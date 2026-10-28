@@ -1,18 +1,62 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import importlib.util
 from pathlib import Path
+from contextlib import redirect_stdout
+import io
+import json
 import os
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('smoke', Path(__file__).with_name('firmware-smoke.py'))
 smoke = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(smoke)
 
 class UtilityEvidence(unittest.TestCase):
+    def test_power_marker_without_entry_cannot_pass_main(self):
+        real_popen = subprocess.Popen
+        # Exercise the real selector/EOF path using a child that only emits a
+        # power marker. It never starts QEMU or executes the input fixtures.
+        def fake_qemu(command, **kwargs):
+            return real_popen([sys.executable, '-c',
+                "print('ISOHOPPER:POWER:SHUTDOWN', flush=True)"], **kwargs)
+        for require_secure in [False, True]:
+            with self.subTest(require_secure=require_secure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for name in ['image', 'code', 'vars']:
+                    (root/name).write_bytes(b'fixture')
+                argv = ['firmware-smoke.py', '--image', str(root/'image'),
+                    '--code', str(root/'code'), '--vars', str(root/'vars'),
+                    '--log', str(root/'serial.log'), '--action', 'shutdown', '--timeout', '2']
+                if require_secure:
+                    argv.append('--require-secure-boot')
+                output = io.StringIO()
+                with patch.object(sys, 'argv', argv), patch.object(smoke.subprocess, 'Popen', side_effect=fake_qemu), redirect_stdout(output):
+                    result = smoke.main()
+                self.assertEqual(result, 1)
+                evidence = json.loads(output.getvalue())
+                self.assertEqual(evidence['status'], 'failed')
+                self.assertFalse(evidence['secure_boot_reported_enabled'])
+
+    def test_secure_boot_requires_explicit_enabled_state(self):
+        enabled = b'ISOHOPPER:SECURE_BOOT:ENABLED'
+        self.assertTrue(smoke.secure_boot_enabled(enabled + smoke.MARKER))
+        for state in [b'', b'ISOHOPPER:SECURE_BOOT:UNKNOWN', b'ISOHOPPER:SECURE_BOOT:DISABLED', enabled + b'ISOHOPPER:SECURE_BOOT:DISABLED']:
+            self.assertFalse(smoke.secure_boot_enabled(state + smoke.MARKER))
+
+    def test_rejection_requires_security_violation_without_child_start(self):
+        rejected = b'ISOHOPPER:UTILITY:SECURITY_VIOLATION'
+        self.assertTrue(smoke.utility_rejected(rejected))
+        self.assertTrue(smoke.utility_rejected(b'ISOHOPPER:UTILITY:ACCESS_DENIED'))
+        for invalid in [b'', b'not found', b'ISOHOPPER:UTILITY:START' + rejected, rejected + b'ISOHOPPER:TEST_UTILITY:ENTRY', rejected + b'ISOHOPPER:UTILITY:RETURN']:
+            self.assertFalse(smoke.utility_rejected(invalid))
+
     def test_utility_requires_start_child_entry_and_return(self):
         start = b'ISOHOPPER:UTILITY:START'
         child = b'ISOHOPPER:TEST_UTILITY:ENTRY'

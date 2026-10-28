@@ -13,17 +13,15 @@ mod firmware {
     use uefi::{
         cstr16,
         prelude::*,
-        proto::console::{serial::Serial, text::Key},
+        proto::console::text::Key,
         proto::media::file::{File, FileAttribute, FileMode},
         runtime::{self, ResetType, VariableAttributes, VariableVendor},
     };
 
-    fn serial(message: &[u8]) {
-        if let Ok(handle) = uefi::boot::get_handle_for_protocol::<Serial>() {
-            if let Ok(mut serial) = uefi::boot::open_protocol_exclusive::<Serial>(handle) {
-                let _ = serial.write(message);
-            }
-        }
+    fn trace(message: &str) {
+        // Use the firmware console: opening Serial exclusively disconnects its
+        // console driver and hides all subsequent menu/error messages.
+        uefi::println!("{message}");
     }
     fn read_u64(name: &uefi::CStr16) -> Result<u64, Status> {
         let mut buffer = [0; 8];
@@ -76,11 +74,11 @@ mod firmware {
     fn perform(action: Action) {
         match action {
             Action::Reboot => {
-                serial(b"ISOHOPPER:POWER:REBOOT\r\n");
+                trace("ISOHOPPER:POWER:REBOOT");
                 runtime::reset(ResetType::COLD, Status::SUCCESS, None)
             }
             Action::Shutdown => {
-                serial(b"ISOHOPPER:POWER:SHUTDOWN\r\n");
+                trace("ISOHOPPER:POWER:SHUTDOWN");
                 runtime::reset(ResetType::SHUTDOWN, Status::SUCCESS, None)
             }
             Action::FirmwareSetup => {
@@ -106,7 +104,7 @@ mod firmware {
                     &firmware_indications(existing).to_le_bytes(),
                 ) {
                     Ok(()) => {
-                        serial(b"ISOHOPPER:POWER:FIRMWARE_SETUP\r\n");
+                        trace("ISOHOPPER:POWER:FIRMWARE_SETUP");
                         runtime::reset(ResetType::COLD, Status::SUCCESS, None)
                     }
                     Err(error) => {
@@ -154,14 +152,20 @@ mod firmware {
         let image = match utility::load() {
             Ok(image) => image,
             Err(status) => {
+                if status == Status::SECURITY_VIOLATION {
+                    trace("ISOHOPPER:UTILITY:SECURITY_VIOLATION");
+                }
+                if status == Status::ACCESS_DENIED {
+                    trace("ISOHOPPER:UTILITY:ACCESS_DENIED");
+                }
                 uefi::println!("Firmware could not load EFI utility: {status:?}");
                 return;
             }
         };
-        serial(b"ISOHOPPER:UTILITY:START\r\n");
+        trace("ISOHOPPER:UTILITY:START");
         match uefi::boot::start_image(image) {
             Ok(()) => {
-                serial(b"ISOHOPPER:UTILITY:RETURN\r\n");
+                trace("ISOHOPPER:UTILITY:RETURN");
                 uefi::println!("EFI utility returned.");
             }
             Err(error) => uefi::println!("EFI utility failed: {:?}", error.status()),
@@ -195,13 +199,18 @@ mod firmware {
             _ => "unknown",
         };
         uefi::println!("Firmware Secure Boot: {secure_state}");
+        trace(match secure_state {
+            "enabled" => "ISOHOPPER:SECURE_BOOT:ENABLED",
+            "disabled" => "ISOHOPPER:SECURE_BOOT:DISABLED",
+            _ => "ISOHOPPER:SECURE_BOOT:UNKNOWN",
+        });
         uefi::println!("No OS boot provider installed. OS compatibility untested.");
         let config = preferences();
         let supported =
             read_u64(cstr16!("OsIndicationsSupported")).is_ok_and(|value| value & 1 != 0);
         let mut has_utility = utility_available();
         menu(config, supported, has_utility);
-        serial(b"ISOHOPPER:SMOKE:ENTRY\r\n");
+        trace("ISOHOPPER:SMOKE:ENTRY");
         let mut confirmation = Confirmation::default();
         loop {
             let action = match key().map(|c| c.to_ascii_lowercase()) {

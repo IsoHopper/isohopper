@@ -10,15 +10,7 @@ fn main() -> uefi::Status {
     if uefi::helpers::init().is_err() {
         return uefi::Status::ABORTED;
     }
-    if let Ok(handle) =
-        uefi::boot::get_handle_for_protocol::<uefi::proto::console::serial::Serial>()
-    {
-        if let Ok(mut serial) =
-            uefi::boot::open_protocol_exclusive::<uefi::proto::console::serial::Serial>(handle)
-        {
-            let _ = serial.write(b"ISOHOPPER:TEST_UTILITY:ENTRY\r\n");
-        }
-    }
+    uefi::println!("ISOHOPPER:TEST_UTILITY:ENTRY");
     uefi::Status::SUCCESS
 }
 

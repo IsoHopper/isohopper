@@ -18,6 +18,19 @@ MAX_QMP_LINE = 65536
 MARKER = b'ISOHOPPER:SMOKE:ENTRY'
 
 
+def secure_boot_enabled(output):
+    return (b'ISOHOPPER:SECURE_BOOT:ENABLED' in output
+        and b'ISOHOPPER:SECURE_BOOT:DISABLED' not in output
+        and b'ISOHOPPER:SECURE_BOOT:UNKNOWN' not in output)
+
+
+def utility_rejected(output):
+    return (any(marker in output for marker in [b'ISOHOPPER:UTILITY:SECURITY_VIOLATION',
+            b'ISOHOPPER:UTILITY:ACCESS_DENIED'])
+        and not any(marker in output for marker in [b'ISOHOPPER:UTILITY:START',
+            b'ISOHOPPER:TEST_UTILITY:ENTRY', b'ISOHOPPER:UTILITY:RETURN']))
+
+
 def utility_returned(output):
     """Require the parent start, test child's entry, and parent return in order."""
     position = 0
@@ -78,7 +91,8 @@ def main():
     parser.add_argument('--image', required=True, type=Path)
     parser.add_argument('--code', required=True, type=Path, help='OVMF/EDK2 x64 code image')
     parser.add_argument('--vars', required=True, type=Path, help='Matching clean vars template')
-    parser.add_argument('--action', choices=['shutdown', 'reboot', 'firmware-setup', 'utility'], help='Exercise a confirmed guest power action or the test EFI utility')
+    parser.add_argument('--action', choices=['shutdown', 'reboot', 'firmware-setup', 'utility', 'utility-reject'], help='Exercise a confirmed guest power action or the test EFI utility')
+    parser.add_argument('--require-secure-boot', action='store_true', help='Require firmware to report enabled; use secure OVMF with enrolled test variables')
     parser.add_argument('--qemu', default='qemu-system-x86_64')
     parser.add_argument('--timeout', type=int, default=45)
     parser.add_argument('--log', type=Path, help='New log file; existing files are refused')
@@ -125,6 +139,9 @@ def main():
             '-device', 'qemu-xhci,id=xhci', '-device', 'usb-kbd,bus=xhci.0',
             '-drive', f'if=none,id=usbdrive,format=raw,snapshot=on,file={fd_prefix}/{image_fd}',
             '-device', 'usb-storage,drive=usbdrive,bus=xhci.0,bootindex=1']
+        if args.require_secure_boot:
+            command[2] += ',smm=on'
+            command.extend(['-global', 'driver=cfi.pflash01,property=secure,value=on'])
         started = time.monotonic()
         passed = False
         reason = 'timeout'
@@ -149,6 +166,9 @@ def main():
                     reason = 'output-limit'
                     break
                 if MARKER in output:
+                    if args.require_secure_boot and not secure_boot_enabled(output):
+                        reason = 'secure-boot-not-enabled'
+                        break
                     if args.action is None:
                         passed = True
                         reason = 'firmware-entry'
@@ -180,7 +200,7 @@ def main():
                                         return reply['return']
                                 raise RuntimeError('QMP event limit exceeded')
                             qmp('qmp_capabilities')
-                            for key_name in [{'shutdown': 's', 'reboot': 'r', 'firmware-setup': 'f', 'utility': 'u'}[args.action], 'y']:
+                            for key_name in [{'shutdown': 's', 'reboot': 'r', 'firmware-setup': 'f', 'utility': 'u', 'utility-reject': 'u'}[args.action], 'y']:
                                 qmp('send-key', {'keys': [{'type': 'qcode', 'data': key_name}], 'hold-time': 50})
                                 time.sleep(0.15)
                         action_sent = True
@@ -188,10 +208,17 @@ def main():
                         passed = True
                         reason = 'utility-started-and-returned'
                         break
+                    if args.action == 'utility-reject' and utility_rejected(output):
+                        passed = True
+                        reason = 'utility-rejected-by-firmware'
+                        break
                 if not selector.get_map():
                     reason = 'qemu-exited'
                     process.wait(timeout=5)
-                    if args.action in action_markers and action_markers[args.action] in output and process.returncode == 0:
+                    if (MARKER in output and action_sent
+                            and (not args.require_secure_boot or secure_boot_enabled(output))
+                            and args.action in action_markers
+                            and action_markers[args.action] in output and process.returncode == 0):
                         passed = True
                         reason = 'power-action-exited-qemu'
                     break
@@ -212,7 +239,9 @@ def main():
         print(json.dumps({'status': 'passed' if passed else 'failed', 'reason': reason,
             'marker': MARKER.decode(), 'action': args.action, 'elapsed_seconds': round(time.monotonic() - started, 2),
             'transport': 'emulated USB', 'physical_devices_attached': False,
-            'secure_boot_tested': False, 'os_boot_tested': False, 'log': str(args.log)}, indent=2))
+            'secure_boot_tested': args.require_secure_boot,
+            'secure_boot_reported_enabled': secure_boot_enabled(output),
+            'os_boot_tested': False, 'log': str(args.log)}, indent=2))
         return 0 if passed else 1
 
 
