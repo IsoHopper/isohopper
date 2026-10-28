@@ -19,6 +19,7 @@ on:
       - crates/media/**
       - crates/virtualdisk/**
       - scripts/stage-windows-helper.py
+      - scripts/test-windows-installer.ps1
 
 permissions:
   contents: read
@@ -62,6 +63,13 @@ jobs:
           key: native-windows-nodebug-${{ hashFiles('Cargo.lock', 'studio/src-tauri/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             native-windows-nodebug-
+      - name: Check installer integration script syntax
+        shell: pwsh
+        run: |
+          $parseErrors = $null
+          $tokens = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $env:GITHUB_WORKSPACE 'scripts/test-windows-installer.ps1'), [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
       - name: Stage the real helper and build frontend
         run: |
           cargo build --locked -p isohopper-helper
@@ -94,6 +102,18 @@ jobs:
           PY
             exit 1
           fi
+      - name: Test native installer handles using owned temporary files
+        run: |
+          if cargo test --locked -p isohopper-helper --lib native_installer_retained_file_operations_and_empty_root_recovery -- --ignored --nocapture > installer-native.log 2>&1; then
+            cat installer-native.log
+          else
+            python - <<'PYERR'
+          from pathlib import Path
+          detail = Path('installer-native.log').read_text(errors='replace')[-3000:]
+          print('::error title=Native installer handles failed::' + detail.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A'))
+          PYERR
+            exit 1
+          fi
       - name: Build a diagnostic NSIS installer without WebView installation
         working-directory: studio/src-tauri
         run: |
@@ -110,65 +130,20 @@ jobs:
           PY
             exit 1
           fi
-      - name: Install only on this disposable runner and verify the real protection
+      - name: Test fresh install, upgrades and repair on this disposable runner
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $installation = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'IsoHopper'
-          if (Test-Path -LiteralPath $installation) { throw 'Refusing an existing installation directory' }
           $installers = @(Get-ChildItem -LiteralPath 'studio/src-tauri/target/debug/bundle/nsis' -Filter '*.exe' -File)
           if ($installers.Count -ne 1) { throw 'Expected exactly one diagnostic installer' }
-          $skipCleanup = $false
           try {
-            $process = Start-Process -FilePath $installers[0].FullName -ArgumentList '/S' -PassThru -Wait
-            if ($process.ExitCode -ne 0) { throw "Fresh installation failed: $($process.ExitCode)" }
-            & (Join-Path $installation 'isohopper-helper.exe') --version
-            if ($LASTEXITCODE -ne 0) { throw 'Installed helper cannot execute normally' }
-            & cargo test --manifest-path studio/src-tauri/Cargo.toml --locked native_installed_helper_is_protected_and_matches_build -- --ignored --nocapture *> installed-check.log
-            $testExit = $LASTEXITCODE
-            Get-Content installed-check.log
-            if ($testExit -ne 0) {
-              $detail = (Get-Content installed-check.log -Raw)
-              if ($detail.Length -gt 1000) { $detail = $detail.Substring($detail.Length - 1000) }
-              $detail = $detail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
-              Write-Output "::error title=Installed helper protection failed::$detail"
-              throw 'Installed helper protection or checksum failed'
-            }
-            $installedFiles = @(Get-ChildItem -LiteralPath $installation -Filter '*.exe' -File)
-            if ($installedFiles.Count -ne 3) { throw 'Expected application, helper and uninstaller' }
-            $original = @{}
-            foreach ($file in $installedFiles) {
-              $original[$file.FullName] = @{
-                Hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
-                Sddl = (Get-Acl -LiteralPath $file.FullName).Sddl
-              }
-            }
-            foreach ($mode in @('/S', '/P')) {
-              $retry = Start-Process -FilePath $installers[0].FullName -ArgumentList $mode -PassThru
-              if (-not $retry.WaitForExit(60000)) {
-                # Kill is asynchronous. Runner disposal avoids overlapping cleanup.
-                $skipCleanup = $true
-                $retry.Kill($true)
-                throw "Existing-install refusal timed out: $mode"
-              }
-              if ($retry.ExitCode -ne 3) { throw "Expected refusal 3 for $mode, got $($retry.ExitCode)" }
-              foreach ($file in $installedFiles) {
-                $before = $original[$file.FullName]
-                if ((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash -ne $before.Hash) {
-                  throw "Existing executable changed during refusal: $mode"
-                }
-                if ((Get-Acl -LiteralPath $file.FullName).Sddl -ne $before.Sddl) {
-                  throw "Existing executable protection changed during refusal: $mode"
-                }
-              }
-            }
-            Write-Output '::notice title=Windows installer check::Fresh NSIS installation, protected helper and matching checksum, repeated silent/passive refusal with unchanged executables and ACLs passed; no UAC interaction or device operation tested'
-          } finally {
-            $uninstaller = Join-Path $installation 'uninstall.exe'
-            if (-not $skipCleanup -and (Test-Path -LiteralPath $uninstaller)) {
-              $cleanup = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
-              if ($cleanup.ExitCode -ne 0) { Write-Warning "Disposable runner uninstall returned $($cleanup.ExitCode)" }
-            }
+            & ./scripts/test-windows-installer.ps1 -Installer $installers[0].FullName
+          } catch {
+            $detail = $_.ToString()
+            if ($detail.Length -gt 3000) { $detail = $detail.Substring($detail.Length - 3000) }
+            $detail = $detail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Windows installer integration failed::$detail"
+            throw
           }
       - name: Record bounded installed-file backing observations
         if: always()
