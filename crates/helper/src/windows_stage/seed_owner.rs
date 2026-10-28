@@ -89,7 +89,12 @@ fn security(file: &File) -> Result<(Vec<u8>, Vec<u8>), StageError> {
         return Err(StageError::Invalid("seed DACL bound"));
     }
     let acl = unsafe { std::slice::from_raw_parts(acl.cast::<u8>(), size) }.to_vec();
-    build_policy::validate_seed_acl(&acl)?;
+    build_policy::validate_seed_acl(&acl).map_err(|_| {
+        error(
+            "seed inherited security",
+            io::Error::other(build_policy::seed_acl_diagnostic(&acl)),
+        )
+    })?;
     Ok((unsafe { sid_bytes(owner) }?, acl))
 }
 

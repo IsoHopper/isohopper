@@ -21,6 +21,45 @@ pub(super) const SYSTEM_SID: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
 pub(super) const ADMIN_SID: &[u8] = &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0];
 pub(super) const OWNER_RIGHTS_SID: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 3, 4, 0, 0, 0];
 
+/// Numeric, bounded diagnostics only. Unknown trustees remain unnamed; no
+/// machine/user SID or arbitrary descriptor bytes reach public build logs.
+pub(super) fn seed_acl_diagnostic(acl: &[u8]) -> String {
+    if acl.len() < 8 {
+        return "truncated ACL header".into();
+    }
+    let count = u16::from_le_bytes([acl[4], acl[5]]);
+    let mut result = format!("revision={} bytes={} ace_count={count}", acl[0], acl.len());
+    let mut offset = 8;
+    for _ in 0..count.min(8) {
+        let Some(header) = acl.get(offset..offset + 4) else {
+            result.push_str("; truncated ACE header");
+            break;
+        };
+        let size = u16::from_le_bytes([header[2], header[3]]) as usize;
+        if size < 8 {
+            result.push_str("; invalid ACE size");
+            break;
+        }
+        let Some(ace) = acl.get(offset..offset + size) else {
+            result.push_str("; truncated ACE");
+            break;
+        };
+        let principal = match &ace[8..] {
+            s if s == SYSTEM_SID => "system",
+            s if s == ADMIN_SID => "administrators",
+            s if s == OWNER_RIGHTS_SID => "owner_rights",
+            _ => "other",
+        };
+        let mask = u32::from_le_bytes(ace[4..8].try_into().unwrap());
+        result.push_str(&format!(
+            "; type={} flags={} mask={mask:#010x} principal={principal}",
+            header[0], header[1]
+        ));
+        offset += size;
+    }
+    result
+}
+
 /// A seed starts with the private parent's inherited DACL, including OWNER
 /// RIGHTS read-control only. Its token-default owner receives no implicit DAC
 /// mutation right. This accepts only those exact three inherited file ACEs.
@@ -361,5 +400,10 @@ mod tests {
             assert!(validate_seed_acl(&bad).is_err());
         }
         assert!(validate_seed_acl(&acl[..acl.len() - 1]).is_err());
+        let description = seed_acl_diagnostic(&acl);
+        assert!(description.contains("principal=owner_rights"));
+        assert!(description.contains("principal=administrators"));
+        assert!(description.contains("mask=0x001f01ff"));
+        assert!(!description.contains("S-1-"));
     }
 }
