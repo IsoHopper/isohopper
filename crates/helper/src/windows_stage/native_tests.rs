@@ -10,12 +10,12 @@ use windows_sys::Win32::{
     },
 };
 
-struct Privilege {
+pub(super) struct Privilege {
     token: OwnedHandle,
     previous: TOKEN_PRIVILEGES,
 }
 impl Privilege {
-    fn set(enabled: bool) -> Self {
+    pub(super) fn set(enabled: bool) -> Self {
         let mut raw = ptr::null_mut();
         // SAFETY: current process; the fixture retains and restores its token.
         assert_ne!(
@@ -85,7 +85,7 @@ impl Drop for Privilege {
     }
 }
 
-fn modified_id() -> (u32, i32) {
+pub(super) fn modified_id() -> (u32, i32) {
     let mut raw = ptr::null_mut();
     assert_ne!(
         unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) },

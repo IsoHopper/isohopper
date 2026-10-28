@@ -197,6 +197,39 @@ jobs:
             exit 1
           fi
 
+      - name: Fetch the exact external engine fixture
+        shell: python
+        run: |
+          import hashlib, os, pathlib, tempfile, urllib.request
+          root = pathlib.Path(tempfile.mkdtemp(prefix='isohopper-engine-', dir=os.environ['RUNNER_TEMP']))
+          request = urllib.request.Request(
+              'https://github.com/ventoy/Ventoy/releases/download/v1.1.18/ventoy-1.1.18-linux.tar.gz',
+              headers={'User-Agent': 'IsoHopper-native-validation'})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              data = response.read(20_320_549)
+          if len(data) != 20_320_548 or hashlib.sha256(data).hexdigest() != 'd86ff9de63d94c8b8f1f6b14d23c55af4b88e8207bf2893890892a6a97b1ad54':
+              raise SystemExit('External engine fixture size or SHA-256 mismatch')
+          archive = root / 'engine.tar.gz'
+          archive.write_bytes(data)
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+              env.write(f'ISOHOPPER_ENGINE_ARCHIVE={archive}\n')
+
+      - name: Build and seal a private engine image using the production staging path
+        shell: bash
+        run: |
+          if cargo +1.98.0 test --locked -p isohopper-helper --lib windows_stage::native::build::tests::native_stage_builds_persists_and_seals_pinned_engine -- --ignored --exact --nocapture --test-threads=1 > sealed-stage-test.log 2>&1; then
+            cat sealed-stage-test.log
+          else
+            python - <<'PY'
+          from pathlib import Path
+          text = Path('sealed-stage-test.log').read_text(errors='replace')[-12000:]
+          print(text)
+          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=Windows production image staging failed::' + text)
+          PY
+            exit 1
+          fi
+
       - name: Check writable and read-only attachments of an owned VHDX
         shell: bash
         run: |

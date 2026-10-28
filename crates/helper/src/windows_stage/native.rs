@@ -229,6 +229,7 @@ pub struct OwnedStageDisk {
     attached: bool,
     cleanup_attempted: bool,
     geometry: Geometry,
+    owned_files: Vec<&'static str>,
 }
 impl OwnedStageDisk {
     pub fn create(
@@ -265,6 +266,7 @@ impl OwnedStageDisk {
             attached: false,
             cleanup_attempted: false,
             geometry,
+            owned_files: vec![BACKING_NAME],
         };
         owned.revalidate()?;
         let name = wide(&owned.directory.join(BACKING_NAME))?;
@@ -400,10 +402,12 @@ impl OwnedStageDisk {
         self.cleanup_attempted = true;
         self.detach()?;
         drop(self.disk.take());
-        match std::fs::remove_file(self.directory.join(BACKING_NAME)) {
-            Ok(()) => (),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-            Err(e) => return Err(error("remove owned VHD backing", e)),
+        for name in &self.owned_files {
+            match std::fs::remove_file(self.directory.join(name)) {
+                Ok(()) => (),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                Err(e) => return Err(error("remove owned stage file", e)),
+            }
         }
         drop(self.directory_handle.take());
         std::fs::remove_dir(&self.directory).map_err(|e| error("remove empty job directory", e))
@@ -418,3 +422,9 @@ impl Drop for OwnedStageDisk {
 #[cfg(test)]
 #[path = "native_tests.rs"]
 mod tests;
+
+#[path = "build.rs"]
+mod build;
+#[path = "device.rs"]
+mod device;
+pub use build::{SealedStage, build};
