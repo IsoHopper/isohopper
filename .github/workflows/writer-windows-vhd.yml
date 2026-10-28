@@ -221,6 +221,7 @@ jobs:
         if: always()
         shell: python
         run: |
+          import json
           import re
           from pathlib import Path
           patterns = {
@@ -239,3 +240,32 @@ jobs:
               if path.exists():
                   for message in re.findall(pattern, path.read_text(errors='replace')):
                       print('::notice title=Windows observation::' + message)
+          path = Path('windows_protected.log')
+          seen = set()
+          for raw in re.findall(r'^PROTECTED_BACKING_DIAGNOSTIC (\{[^\r\n]{1,2048}\})$', path.read_text(errors='replace') if path.exists() else '', re.M):
+              try:
+                  record = json.loads(raw)
+              except (ValueError, RecursionError):
+                  continue
+              if not isinstance(record, dict) or record.get('event') != 'protected_external_backing':
+                  continue
+              role = record.get('role')
+              if role not in ('helper', 'caller') or role in seen:
+                  continue
+              seen.add(role)
+              safe = {'role': role}
+              for component in ('retained_handle', 'filesystem', 'file', 'wof_wim', 'wof_file'):
+                  item = record.get(component)
+                  if not isinstance(item, dict):
+                      continue
+                  result = {}
+                  if item.get('status') in ('ok', 'error', 'invalid', 'not_queried', 'unsupported'):
+                      result['status'] = item['status']
+                  for key in ('flags', 'attributes', 'hresult', 'version', 'win32_error', 'maximum_component_length'):
+                      value = item.get(key)
+                      if type(value) is int and 0 <= value <= 0xffffffff:
+                          result[key] = value
+                  if component == 'filesystem' and item.get('name') in ('NTFS', 'ReFS', 'FAT', 'FAT32', 'exFAT', 'UDF', 'CDFS', 'CSVFS', 'other'):
+                      result['name'] = item['name']
+                  safe[component] = result
+              print('::notice title=Windows backing diagnostic::' + json.dumps(safe, separators=(',', ':')))

@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#![cfg(windows)]
-
+use isohopper_helper::{windows_protected::ProtectedError, windows_sources::SourceError};
+#[cfg(windows)]
 use isohopper_helper::{
-    windows_protected::{self, ImageRole, ProtectedError},
-    windows_sources::{SourceError, SourceExtent},
+    windows_protected::{self, ImageRole},
+    windows_sources::SourceExtent,
     writer::{DeviceSnapshot, Geometry},
 };
+use std::io;
+#[cfg(windows)]
 use std::{
     fs::{File, OpenOptions},
-    io,
     mem::{offset_of, size_of},
     os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
     ptr,
 };
+#[cfg(windows)]
 use windows_sys::Win32::{
     Storage::FileSystem::{
         FILE_SHARE_READ, FILE_SHARE_WRITE, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
@@ -23,12 +25,14 @@ use windows_sys::Win32::{
     },
 };
 
+#[cfg(windows)]
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 // Independently decode the SDK layout instead of reusing production parsing.
 // The only handles opened are volume GUIDs returned by the protected mapping.
+#[cfg(windows)]
 fn independent_extents(guid: &str) -> io::Result<Vec<(u32, u64, u64)>> {
     let volume = OpenOptions::new()
         .read(true)
@@ -96,6 +100,7 @@ fn independent_extents(guid: &str) -> io::Result<Vec<(u32, u64, u64)>> {
     Ok(result)
 }
 
+#[cfg(windows)]
 fn compare_extents(guid: &str, extents: &[SourceExtent]) -> io::Result<()> {
     let mut observed = extents
         .iter()
@@ -110,6 +115,7 @@ fn compare_extents(guid: &str, extents: &[SourceExtent]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn synthetic_target() -> DeviceSnapshot {
     // No target handle is opened. This intentionally synthetic nonmatching
     // number exercises mapping, not real target authentication or preparation.
@@ -124,6 +130,163 @@ fn synthetic_target() -> DeviceSnapshot {
             physical_sector_size: 512,
         },
     }
+}
+
+// Return a fixed filesystem class, never arbitrary driver-supplied text. The
+// native buffer is MAX_PATH + 1 WCHARs as required by the volume API.
+fn filesystem_label(units: &[u16]) -> Result<&'static str, &'static str> {
+    if units.len() > 261 {
+        return Err("oversized_filesystem_name");
+    }
+    let end = units
+        .iter()
+        .position(|&unit| unit == 0)
+        .filter(|&end| end > 0)
+        .ok_or("invalid_filesystem_name")?;
+    let name = String::from_utf16(&units[..end]).map_err(|_| "invalid_filesystem_encoding")?;
+    Ok(match name.as_str() {
+        "NTFS" => "NTFS",
+        "ReFS" => "ReFS",
+        "FAT" => "FAT",
+        "FAT32" => "FAT32",
+        "exFAT" => "exFAT",
+        "UDF" => "UDF",
+        "CDFS" => "CDFS",
+        "CSVFS" => "CSVFS",
+        _ => "other",
+    })
+}
+
+fn wof_observation(hresult: i32, version: u32) -> serde_json::Value {
+    serde_json::json!({
+        "status": if hresult >= 0 { "ok" } else { "error" },
+        "hresult": hresult as u32,
+        "version": (hresult >= 0).then_some(version),
+    })
+}
+
+#[cfg(windows)]
+fn backing_diagnostic(role: ImageRole, retained: Result<&File, &io::Error>) -> serde_json::Value {
+    use serde_json::json;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle, GetVolumeInformationByHandleW,
+        WOF_PROVIDER_FILE, WOF_PROVIDER_WIM, WofGetDriverVersion,
+    };
+
+    // Fixed keys, labels and bounded numeric fields only. Do not request volume
+    // names or serials, and do not serialize file IDs, pathnames or OS messages.
+    let mut result = json!({
+        "event": "protected_external_backing",
+        "role": match role { ImageRole::Helper => "helper", ImageRole::Caller => "caller" },
+        "external_backing_win32": 1,
+        "retained_handle": { "status": "ok" },
+        "filesystem": { "status": "not_queried" },
+        "file": { "status": "not_queried" },
+        "wof_wim": { "status": "not_queried" },
+        "wof_file": { "status": "not_queried" },
+    });
+    let file = match retained {
+        Ok(file) => file,
+        Err(error) => {
+            result["retained_handle"] = json!({
+                "status": "unsupported", "win32_error": error.raw_os_error().map(|code| code as u32),
+            });
+            return result;
+        }
+    };
+
+    let mut filesystem = [0u16; 261];
+    let mut flags = 0;
+    let mut component_length = 0;
+    // SAFETY: this duplicate retains the exact synchronous readable file object
+    // used by the failed binding. All output pointers are live, correctly typed
+    // and bounded. Null name/serial outputs deliberately omit private metadata.
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getvolumeinformationbyhandlew
+    let volume_ok = unsafe {
+        GetVolumeInformationByHandleW(
+            file.as_raw_handle(),
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            &mut component_length,
+            &mut flags,
+            filesystem.as_mut_ptr(),
+            filesystem.len() as u32,
+        )
+    };
+    result["filesystem"] = if volume_ok != 0 {
+        match filesystem_label(&filesystem) {
+            Ok(name) => json!({
+                "status": "ok", "name": name, "flags": flags,
+                "maximum_component_length": component_length,
+            }),
+            Err(reason) => json!({ "status": "invalid", "reason": reason }),
+        }
+    } else {
+        let error = io::Error::last_os_error();
+        json!({ "status": "error", "win32_error": error.raw_os_error().map(|code| code as u32) })
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: same retained file and a live initialized SDK output structure.
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileinformationbyhandle
+    let file_ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+    result["file"] = if file_ok != 0 {
+        json!({ "status": "ok", "attributes": information.dwFileAttributes })
+    } else {
+        let error = io::Error::last_os_error();
+        json!({ "status": "error", "win32_error": error.raw_os_error().map(|code| code as u32) })
+    };
+
+    for (key, provider) in [
+        ("wof_wim", WOF_PROVIDER_WIM),
+        ("wof_file", WOF_PROVIDER_FILE),
+    ] {
+        let mut version = 0;
+        // SAFETY: documented read-only version query accepts a file handle;
+        // the retained file and typed version output live throughout the call.
+        // An absent provider returns an HRESULT, never negative backing proof.
+        // https://learn.microsoft.com/en-us/windows/win32/api/wofapi/nf-wofapi-wofgetdriverversion
+        let status = unsafe { WofGetDriverVersion(file.as_raw_handle(), provider, &mut version) };
+        result[key] = wof_observation(status, version);
+    }
+    result
+}
+
+#[test]
+fn backing_diagnostic_classifies_filesystems_without_printing_untrusted_names() {
+    for name in [
+        "NTFS", "ReFS", "FAT", "FAT32", "exFAT", "UDF", "CDFS", "CSVFS",
+    ] {
+        let units: Vec<_> = name.encode_utf16().chain(Some(0)).collect();
+        assert_eq!(filesystem_label(&units).unwrap(), name);
+    }
+    for name in ["private-path", "C:\\private", "unknown\nname", "🦀"] {
+        let units: Vec<_> = name.encode_utf16().chain(Some(0)).collect();
+        assert_eq!(filesystem_label(&units).unwrap(), "other");
+    }
+    for units in [vec![], vec![0], vec![b'N' as u16], vec![0xd800, 0]] {
+        assert!(filesystem_label(&units).is_err());
+    }
+    let mut maximum = vec![b'X' as u16; 260];
+    maximum.push(0);
+    assert_eq!(filesystem_label(&maximum).unwrap(), "other");
+    maximum.push(0);
+    assert_eq!(filesystem_label(&maximum), Err("oversized_filesystem_name"));
+}
+
+#[test]
+fn backing_diagnostic_preserves_hresult_and_never_reports_failed_output_as_version() {
+    let failure = wof_observation(0x8007_0001u32 as i32, u32::MAX);
+    assert_eq!(failure["status"], "error");
+    assert_eq!(failure["hresult"], 0x8007_0001u32);
+    assert_eq!(failure["version"], serde_json::Value::Null);
+    let success = wof_observation(0, 0x0a00_1234);
+    assert_eq!(success["status"], "ok");
+    assert_eq!(success["hresult"], 0);
+    assert_eq!(success["version"], 0x0a00_1234);
+    assert!(failure.to_string().len() < 128);
+    assert!(success.to_string().len() < 128);
 }
 
 fn unsupported_external_backing(error: &ProtectedError) -> bool {
@@ -165,6 +328,7 @@ fn protected_smoke_only_classifies_exact_unsupported_external_backing() {
     )));
 }
 
+#[cfg(windows)]
 #[test]
 #[ignore = "read-only mapping of the actual Windows directory and current test executable; no physical writes"]
 fn windows_protected_system_and_executable_mappings_are_read_only()
@@ -199,6 +363,10 @@ fn windows_protected_system_and_executable_mappings_are_read_only()
     let image_path = std::env::current_exe()?;
     for role in [ImageRole::Helper, ImageRole::Caller] {
         let image = File::open(&image_path)?;
+        // Duplicate the existing file object before bind_file takes ownership.
+        // A clone error affects diagnostics only, not the original test result.
+        // No pathname is reopened to diagnose a failed binding.
+        let diagnostic_image = image.try_clone();
         // SAFETY: File::open is readable and synchronous without OVERLAPPED.
         let binding = match unsafe { windows_protected::bind_file(role, image, &target) } {
             Ok(binding) => binding,
@@ -210,6 +378,10 @@ fn windows_protected_system_and_executable_mappings_are_read_only()
                 // https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/fsctl-get-external-backing
                 println!(
                     "UNSUPPORTED executable role={role:?}: external-backing query returned Win32 1; mapping remains blocked"
+                );
+                println!(
+                    "PROTECTED_BACKING_DIAGNOSTIC {}",
+                    backing_diagnostic(role, diagnostic_image.as_ref())
                 );
                 unsupported += 1;
                 continue;
