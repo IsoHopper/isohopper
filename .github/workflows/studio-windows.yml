@@ -170,3 +170,25 @@ jobs:
               if ($cleanup.ExitCode -ne 0) { Write-Warning "Disposable runner uninstall returned $($cleanup.ExitCode)" }
             }
           }
+      - name: Record bounded installed-file backing observations
+        if: always()
+        shell: python
+        run: |
+          import json
+          import re
+          from pathlib import Path
+          path = Path('installed-check.log')
+          seen = set()
+          for raw in re.findall(r'INSTALLED_WOF_DIAGNOSTIC (\{[^\r\n]{1,256}\})$', path.read_text(errors='replace') if path.exists() else '', re.M):
+              value = json.loads(raw)
+              role = value.get('role')
+              result = value.get('hresult')
+              external = value.get('is_external')
+              provider = value.get('provider')
+              if (role not in ('studio', 'helper') or role in seen
+                  or type(result) is not int or not 0 <= result <= 0xffffffff
+                  or external is not None and type(external) is not bool
+                  or provider is not None and (type(provider) is not int or provider not in (1, 2))):
+                  raise ValueError('invalid installed backing observation')
+              seen.add(role)
+              print(f'::notice title=Installed backing observation::role={role}; hresult={result}; is_external={external}; provider={provider}; diagnostic only')
