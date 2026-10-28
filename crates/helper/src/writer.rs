@@ -91,7 +91,7 @@ pub struct DeviceSnapshot {
 }
 
 impl DeviceSnapshot {
-    fn validate_identity(&self) -> Result<(), Failure> {
+    pub(crate) fn validate_identity(&self) -> Result<(), Failure> {
         if (self.serial.is_empty() && self.device_id.is_none())
             || (!self.serial.is_empty() && self.serial.trim().is_empty())
             || self.serial.len() > 4096

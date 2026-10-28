@@ -108,6 +108,7 @@ struct Fake {
     snapshots: usize,
     enumerations: usize,
     writable_opens: usize,
+    opens: BTreeMap<VolumeName, usize>,
 }
 impl Fake {
     fn new(fault: &'static str) -> Self {
@@ -124,6 +125,7 @@ impl Fake {
             snapshots: 0,
             enumerations: 0,
             writable_opens: 0,
+            opens: BTreeMap::new(),
         }
     }
 }
@@ -162,6 +164,9 @@ impl Backend for Fake {
         Ok(result)
     }
     fn open(&mut self, name: &VolumeName, write: bool) -> Result<Self::Volume, LockError> {
+        let opens = self.opens.entry(name.clone()).or_default();
+        *opens += 1;
+        let reopened_read_only = !write && *opens > 1;
         if write {
             self.writable_opens += 1;
         }
@@ -176,6 +181,9 @@ impl Backend for Fake {
         if (self.fault == "reopen" || (self.fault == "reopen_second" && name == &self::name(2)))
             && write
         {
+            extents.as_mut().unwrap()[0].disk = 99;
+        }
+        if self.fault == "probe_reopen" && reopened_read_only {
             extents.as_mut().unwrap()[0].disk = 99;
         }
         if self.fault == "foreign_volume_changed" && self.enumerations > 1 && name == &self::name(3)
@@ -206,6 +214,167 @@ fn capability_retains_only_target_locks_and_unwinds_on_drop() {
     assert_eq!(backend.events.borrow().entries.len(), 4);
     drop(held);
     assert_eq!(backend.events.borrow().active, 0);
+}
+
+#[test]
+fn read_only_probe_retains_exact_coverage_without_writable_opens_or_locks() {
+    let mut backend = Fake::new("");
+    let mut observed = probe(&mut backend, &target()).unwrap();
+    assert_eq!(observed.held.len(), 2);
+    assert_eq!(observed.coverage.device, target());
+    assert_eq!(observed.coverage.partition_style, 1);
+    assert_eq!(observed.coverage.layout_identity, [1; 16]);
+    assert_eq!(observed.coverage.partitions.len(), 2);
+    let first = &observed.coverage.partitions[0];
+    assert_eq!(first.partition_number, 1);
+    assert_eq!(first.start_offset, 1024 * 1024);
+    assert_eq!(first.length_bytes, 1024 * 1024);
+    assert_eq!(first.partition_type, [1; 16]);
+    assert_eq!(first.partition_identity, [2; 16]);
+    assert_eq!(first.volume_guid, Some(name(1).0));
+    assert!(first.volume_required);
+    let target_opens = [backend.opens[&name(1)], backend.opens[&name(2)]];
+    revalidate_probe(&mut backend, &mut observed).unwrap();
+    assert_eq!(
+        [backend.opens[&name(1)], backend.opens[&name(2)]],
+        target_opens.map(|count| count + 1)
+    );
+    assert_eq!(backend.writable_opens, 0);
+    assert_eq!(backend.events.borrow().active, 0);
+    assert!(backend.events.borrow().entries.is_empty());
+}
+
+#[test]
+fn read_only_probe_rejects_rebound_guid_with_unchanged_retained_handle() {
+    let mut backend = Fake::new("");
+    let mut observed = probe(&mut backend, &target()).unwrap();
+    let original = observed.held[0].volume.extents().unwrap();
+    backend
+        .volumes
+        .insert(name(1), Some(vec![extent(99, 1024 * 1024)]));
+
+    assert_eq!(observed.held[0].volume.extents().unwrap(), original);
+    assert!(matches!(
+        revalidate_probe(&mut backend, &mut observed),
+        Err(LockError::VolumeChanged)
+    ));
+    assert_eq!(observed.held[0].volume.extents().unwrap(), original);
+    assert_eq!(backend.writable_opens, 0);
+    assert_eq!(backend.events.borrow().active, 0);
+    assert!(backend.events.borrow().entries.is_empty());
+}
+
+#[test]
+fn read_only_probe_rejects_retained_extent_or_topology_changes() {
+    for change in 0..7 {
+        let mut backend = Fake::new("");
+        let mut observed = probe(&mut backend, &target()).unwrap();
+        match change {
+            0 => backend.fault = "identity",
+            1 => backend.layout.identity[0] ^= 1,
+            2 => backend.layout.partitions[0].identity[0] ^= 1,
+            3 => {
+                observed.held[0].volume.extents.as_mut().unwrap()[0].start += 512;
+            }
+            4 => {
+                backend.volumes.remove(&name(1));
+            }
+            5 => {
+                let extents = backend.volumes.remove(&name(1)).unwrap();
+                backend.volumes.insert(name(5), extents);
+            }
+            6 => {
+                backend
+                    .volumes
+                    .insert(name(5), Some(vec![extent(99, 1024 * 1024)]));
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            revalidate_probe(&mut backend, &mut observed).is_err(),
+            "change {change}"
+        );
+        assert_eq!(backend.writable_opens, 0);
+        assert_eq!(backend.events.borrow().active, 0);
+        assert!(backend.events.borrow().entries.is_empty());
+    }
+}
+
+#[test]
+fn read_only_probe_preserves_blank_and_reserved_partition_evidence() {
+    let mut backend = Fake::new("");
+    backend.layout = DiskLayout {
+        style: 2,
+        identity: [0; 16],
+        partitions: vec![],
+    };
+    backend.volumes.retain(|name, _| name > &self::name(2));
+    let mut observed = probe(&mut backend, &target()).unwrap();
+    assert!(observed.held.is_empty());
+    assert!(observed.coverage.partitions.is_empty());
+    assert_eq!(observed.coverage.partition_style, 2);
+    revalidate_probe(&mut backend, &mut observed).unwrap();
+
+    for guid in [
+        "21686148-6449-6e6f-744e-656564454649",
+        "e3c9e316-0b5c-4db8-817d-f92df00215ae",
+    ] {
+        backend.layout = parse_layout(&table(1, &gpt_type(guid)), &target().geometry).unwrap();
+        let observed = probe(&mut backend, &target()).unwrap();
+        assert!(observed.held.is_empty());
+        assert_eq!(observed.coverage.partitions.len(), 1);
+        assert_eq!(observed.coverage.partitions[0].volume_guid, None);
+        assert!(!observed.coverage.partitions[0].volume_required);
+    }
+    assert_eq!(backend.writable_opens, 0);
+    assert!(backend.events.borrow().entries.is_empty());
+}
+
+#[test]
+fn read_only_probe_refuses_incomplete_or_changing_discovery_without_actions() {
+    for fault in [
+        "identity",
+        "identity_after",
+        "layout_after",
+        "arrival",
+        "foreign_volume_changed",
+        "probe_reopen",
+        "enumerate",
+        "unclassifiable",
+        "duplicate",
+        "volume_limit",
+    ] {
+        let mut backend = Fake::new(fault);
+        assert!(probe(&mut backend, &target()).is_err(), "{fault}");
+        assert_eq!(backend.writable_opens, 0, "{fault}");
+        assert!(backend.events.borrow().entries.is_empty(), "{fault}");
+    }
+    let mut backend = Fake::new("");
+    backend.volumes.remove(&name(2));
+    assert!(probe(&mut backend, &target()).is_err());
+    assert_eq!(backend.writable_opens, 0);
+    assert!(backend.events.borrow().entries.is_empty());
+}
+
+#[test]
+fn read_only_probe_requires_stable_identity_before_discovery() {
+    for serial in [
+        String::new(),
+        " ".into(),
+        "bad\nserial".into(),
+        "x".repeat(4097),
+    ] {
+        let mut expected = target();
+        expected.serial = serial;
+        let mut backend = Fake::new("");
+        assert!(matches!(
+            probe(&mut backend, &expected),
+            Err(LockError::MissingEvidence("stable target identity"))
+        ));
+        assert_eq!(backend.snapshots, 0);
+        assert_eq!(backend.writable_opens, 0);
+        assert!(backend.events.borrow().entries.is_empty());
+    }
 }
 
 fn assert_unmapped_partition_refused(backend: &mut Fake) {

@@ -1,14 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::{
-    LockError,
+    LockError, TargetCoverage,
     state::{self, Backend, DiskLayout, Extent, Held, Volume, VolumeName},
 };
-use crate::writer::{DeviceSnapshot, RetainedDevice, windows::WindowsRawDevice};
+use crate::writer::{
+    DeviceSnapshot, Geometry, RetainedDevice,
+    windows::{self, WindowsRawDevice},
+};
 use std::{
     fs::{File, OpenOptions},
     io,
     mem::{offset_of, size_of},
-    os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+    os::windows::{
+        fs::OpenOptionsExt,
+        io::{AsRawHandle, OwnedHandle},
+    },
     ptr,
 };
 use windows_sys::Win32::{
@@ -38,6 +44,59 @@ const _: () = {
     assert!(offset_of!(PARTITION_INFORMATION_EX, Anonymous) == 32);
     assert!(offset_of!(DRIVE_LAYOUT_INFORMATION_EX, PartitionEntry) == 48);
 };
+
+/// Retained read-only device/volume observations. This owner never locks,
+/// dismounts, flushes or writes, and exposes no handle or writer capability.
+/// Coverage is not an encryption verdict or permission to prepare a device.
+pub struct TargetVolumeProbe {
+    handle: OwnedHandle,
+    observed: state::ProbeState<NativeVolume>,
+}
+
+impl TargetVolumeProbe {
+    /// Inspect one already-opened device and retain its exact target volumes.
+    /// No supplied path is opened and no writable volume handle is requested.
+    /// The expected identity must include a hardware serial or supported ID.
+    ///
+    /// # Safety
+    /// `handle` must be a live whole-device handle opened synchronously without
+    /// FILE_FLAG_OVERLAPPED, with read access. It should be opened read-only;
+    /// this API does not use or require write access. Driver calls may block.
+    pub unsafe fn from_owned_handle(
+        handle: OwnedHandle,
+        expected: &DeviceSnapshot,
+    ) -> Result<Self, LockError> {
+        let observed = state::probe(
+            &mut ReadOnlyNative {
+                handle: &handle,
+                geometry: &expected.geometry,
+            },
+            expected,
+        )?;
+        Ok(Self { handle, observed })
+    }
+
+    /// Last validated diagnostic snapshot. Call `revalidate` before using it
+    /// for a fresh observation; retaining handles does not freeze disk topology.
+    pub fn coverage(&self) -> &TargetCoverage {
+        &self.observed.coverage
+    }
+
+    /// Requery this exact device and retained volumes and the full volume list.
+    /// A changed identity, partition layout or volume mapping is an error.
+    /// Success still does not freeze encryption state or authorize writing.
+    pub fn revalidate(&mut self) -> Result<&TargetCoverage, LockError> {
+        let geometry = self.observed.coverage.device.geometry.clone();
+        state::revalidate_probe(
+            &mut ReadOnlyNative {
+                handle: &self.handle,
+                geometry: &geometry,
+            },
+            &mut self.observed,
+        )?;
+        Ok(self.coverage())
+    }
+}
 
 /// A retained raw device and the volume locks acquired for its current layout.
 ///
@@ -133,6 +192,35 @@ fn query(
 struct Native<'a> {
     device: &'a mut WindowsRawDevice,
 }
+struct ReadOnlyNative<'a> {
+    handle: &'a OwnedHandle,
+    geometry: &'a Geometry,
+}
+
+impl Backend for ReadOnlyNative<'_> {
+    type Volume = NativeVolume;
+    fn snapshot(&mut self) -> Result<DeviceSnapshot, LockError> {
+        // SAFETY: only TargetVolumeProbe constructs this backend; its unsafe
+        // constructor establishes a live synchronous handle retained by owner.
+        unsafe { windows::inspect(self.handle) }
+            .map_err(|e| io_error("read-only device revalidation", e))
+    }
+    fn layout(&mut self) -> Result<DiskLayout, LockError> {
+        read_layout(self.handle, self.geometry)
+    }
+    fn enumerate(&mut self) -> Result<Vec<VolumeName>, LockError> {
+        enumerate()
+    }
+    fn open(&mut self, name: &VolumeName, write: bool) -> Result<NativeVolume, LockError> {
+        if write {
+            return Err(LockError::MissingEvidence(
+                "read-only probe requested write access",
+            ));
+        }
+        open_volume(name, false)
+    }
+}
+
 impl Backend for Native<'_> {
     type Volume = NativeVolume;
     fn snapshot(&mut self) -> Result<DeviceSnapshot, LockError> {
@@ -141,37 +229,48 @@ impl Backend for Native<'_> {
             .map_err(|e| io_error("device revalidation", e))
     }
     fn layout(&mut self) -> Result<DiskLayout, LockError> {
-        let bytes = query(
-            self.device.retained_handle().as_raw_handle(),
-            IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
-            48 + state::MAX_PARTITIONS * 144,
-            "whole-device partition layout",
-        )?;
-        state::parse_layout(&bytes, &self.device.initial_snapshot().geometry)
+        read_layout(
+            self.device.retained_handle(),
+            &self.device.initial_snapshot().geometry,
+        )
     }
     fn enumerate(&mut self) -> Result<Vec<VolumeName>, LockError> {
         enumerate()
     }
     fn open(&mut self, name: &VolumeName, write: bool) -> Result<NativeVolume, LockError> {
-        // Remove only the final backslash from the validated GUID path. Keeping
-        // it would open the root directory rather than the volume device.
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
-        if write {
-            options.write(true);
-        } else {
-            options.access_mode(0);
-        }
-        let file = options
-            .open(&name.0[..name.0.len() - 1])
-            .map_err(|e| io_error("open enumerated volume", e))?;
-        Ok(NativeVolume {
-            file,
-            locked: false,
-        })
+        open_volume(name, write)
     }
+}
+
+fn read_layout(handle: &OwnedHandle, geometry: &Geometry) -> Result<DiskLayout, LockError> {
+    let bytes = query(
+        handle.as_raw_handle(),
+        IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
+        48 + state::MAX_PARTITIONS * 144,
+        "whole-device partition layout",
+    )?;
+    state::parse_layout(&bytes, geometry)
+}
+
+fn open_volume(name: &VolumeName, write: bool) -> Result<NativeVolume, LockError> {
+    // Remove only the final backslash from the validated GUID path. Keeping
+    // it would open the root directory rather than the volume device.
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    if write {
+        options.write(true);
+    } else {
+        options.access_mode(0);
+    }
+    let file = options
+        .open(&name.0[..name.0.len() - 1])
+        .map_err(|e| io_error("open enumerated volume", e))?;
+    Ok(NativeVolume {
+        file,
+        locked: false,
+    })
 }
 
 struct NativeVolume {

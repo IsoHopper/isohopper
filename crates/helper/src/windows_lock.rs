@@ -3,6 +3,31 @@
 //! Target authorization, source binding, encryption/container checks, device
 //! arrival coordination and elevation remain the caller's responsibility.
 
+/// Read-only diagnostic coverage, not authorization to write or an encryption
+/// verdict. All ranges refer to the retained device in `device`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetCoverage {
+    pub device: crate::writer::DeviceSnapshot,
+    /// Windows partition style: 0 = MBR, 1 = GPT, 2 = RAW.
+    pub partition_style: u32,
+    /// GPT disk GUID, or MBR signature in the first four bytes.
+    pub layout_identity: [u8; 16],
+    pub partitions: Vec<PartitionCoverage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartitionCoverage {
+    pub partition_number: u32,
+    pub start_offset: u64,
+    pub length_bytes: u64,
+    /// GPT type in Windows GUID byte order, or MBR type in the first byte.
+    pub partition_type: [u8; 16],
+    pub partition_identity: [u8; 16],
+    /// None is allowed only for the exact GPT BIOS Boot and MSR types.
+    pub volume_guid: Option<String>,
+    pub volume_required: bool,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
     #[error("missing volume-lock evidence: {0}")]
@@ -24,7 +49,7 @@ pub enum LockError {
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
-pub use native::{LockedWindowsDevice, lock};
+pub use native::{LockedWindowsDevice, TargetVolumeProbe, lock};
 
 #[cfg(any(windows, test))]
 mod state;

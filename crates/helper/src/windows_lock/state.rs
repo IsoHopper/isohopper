@@ -215,6 +215,95 @@ pub(super) struct Held<V: Volume> {
     pub(super) name: VolumeName,
     pub(super) volume: V,
 }
+pub(super) struct ProbeState<V: Volume> {
+    pub(super) held: Vec<Held<V>>,
+    pub(super) coverage: super::TargetCoverage,
+    discovery: Discovery,
+}
+
+pub(super) fn probe<B: Backend>(
+    backend: &mut B,
+    expected: &DeviceSnapshot,
+) -> Result<ProbeState<B::Volume>, LockError> {
+    expected
+        .validate_identity()
+        .map_err(|_| LockError::MissingEvidence("stable target identity"))?;
+    let discovery = discover(backend, expected)?;
+    let mut held = Vec::with_capacity(discovery.names.len());
+    for name in &discovery.names {
+        let mut volume = backend.open(name, false)?;
+        if volume.extents()? != discovery.before[name] {
+            return Err(LockError::VolumeChanged);
+        }
+        held.push(Held {
+            name: name.clone(),
+            volume,
+        });
+    }
+    let coverage = super::TargetCoverage {
+        device: expected.clone(),
+        partition_style: discovery.layout.style,
+        layout_identity: discovery.layout.identity,
+        partitions: discovery
+            .layout
+            .partitions
+            .iter()
+            .map(|partition| super::PartitionCoverage {
+                partition_number: partition.number,
+                start_offset: partition.start,
+                length_bytes: partition.length,
+                partition_type: partition.kind,
+                partition_identity: partition.identity,
+                volume_required: requires_volume(discovery.layout.style, partition),
+                volume_guid: discovery.names.iter().find_map(|name| {
+                    let extent = discovery.before[name].as_ref()?.first()?;
+                    (extent.start == partition.start && extent.length == partition.length)
+                        .then(|| name.0.clone())
+                }),
+            })
+            .collect(),
+    };
+    let mut result = ProbeState {
+        held,
+        coverage,
+        discovery,
+    };
+    revalidate_probe(backend, &mut result)?;
+    Ok(result)
+}
+
+pub(super) fn revalidate_probe<B: Backend>(
+    backend: &mut B,
+    probe: &mut ProbeState<B::Volume>,
+) -> Result<(), LockError> {
+    if backend.snapshot()? != probe.coverage.device {
+        return Err(LockError::DeviceChanged);
+    }
+    if backend.layout()? != probe.discovery.layout
+        || survey(backend, &mut probe.held)? != probe.discovery.before
+    {
+        return Err(LockError::VolumeChanged);
+    }
+    // Coverage exposes GUID names for subsequent provider queries. The old
+    // handle can remain valid even when that name resolves to another volume,
+    // so check both the fresh read-only binding and the retained handle against
+    // the original extents. The lock path intentionally keeps its own survey.
+    for held in &mut probe.held {
+        let expected = &probe.discovery.before[&held.name];
+        let mut current = backend.open(&held.name, false)?;
+        if current.extents()? != *expected || held.volume.extents()? != *expected {
+            return Err(LockError::VolumeChanged);
+        }
+    }
+    if backend.layout()? != probe.discovery.layout {
+        return Err(LockError::VolumeChanged);
+    }
+    if backend.snapshot()? != probe.coverage.device {
+        return Err(LockError::DeviceChanged);
+    }
+    Ok(())
+}
+
 type Survey = BTreeMap<VolumeName, Option<Vec<Extent>>>;
 fn survey<B: Backend>(backend: &mut B, held: &mut [Held<B::Volume>]) -> Result<Survey, LockError> {
     let names = backend.enumerate()?;
@@ -235,10 +324,20 @@ fn survey<B: Backend>(backend: &mut B, held: &mut [Held<B::Volume>]) -> Result<S
     Ok(result)
 }
 
-pub(super) fn acquire<B: Backend>(
+struct Discovery {
+    layout: DiskLayout,
+    before: Survey,
+    names: Vec<VolumeName>,
+}
+
+fn requires_volume(style: u32, partition: &Partition) -> bool {
+    !(style == 1 && [BIOS_BOOT, MICROSOFT_RESERVED].contains(&partition.kind))
+}
+
+fn discover<B: Backend>(
     backend: &mut B,
     expected: &DeviceSnapshot,
-) -> Result<Vec<Held<B::Volume>>, LockError> {
+) -> Result<Discovery, LockError> {
     if backend.snapshot()? != *expected {
         return Err(LockError::DeviceChanged);
     }
@@ -274,9 +373,8 @@ pub(super) fn acquire<B: Backend>(
     // one classified volume with the exact retained layout range. Hidden,
     // unformatted and unknown types are not evidence of safe absence.
     if layout.partitions.iter().any(|partition| {
-        let reserved =
-            layout.style == 1 && [BIOS_BOOT, MICROSOFT_RESERVED].contains(&partition.kind);
-        !reserved && !ranges.contains(&(partition.start, partition.length))
+        requires_volume(layout.style, partition)
+            && !ranges.contains(&(partition.start, partition.length))
     }) {
         return Err(LockError::MissingEvidence(
             "target partition has no classified volume",
@@ -285,6 +383,22 @@ pub(super) fn acquire<B: Backend>(
     if backend.snapshot()? != *expected {
         return Err(LockError::DeviceChanged);
     }
+    Ok(Discovery {
+        layout,
+        before,
+        names,
+    })
+}
+
+pub(super) fn acquire<B: Backend>(
+    backend: &mut B,
+    expected: &DeviceSnapshot,
+) -> Result<Vec<Held<B::Volume>>, LockError> {
+    let Discovery {
+        layout,
+        before,
+        names,
+    } = discover(backend, expected)?;
     let mut held = Vec::new();
     // Open and validate every target before taking any lock or dismounting.
     // Each Volume owns its lock and releases it when dropped, including all

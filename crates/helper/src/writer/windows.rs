@@ -113,7 +113,8 @@ impl WindowsRawDevice {
         if unsafe { GetFileType(handle.as_raw_handle()) } != FILE_TYPE_DISK {
             return Err(invalid("handle is not a disk device"));
         }
-        let initial = inspect(&handle)?;
+        // SAFETY: synchronous live device handle is required by this constructor.
+        let initial = unsafe { inspect(&handle)? };
         initial
             .validate_identity()
             .map_err(|_| invalid("device has no hardware serial or supported NAA-6 device ID"))?;
@@ -161,7 +162,8 @@ impl WindowsRawDevice {
 
 impl RetainedDevice for WindowsRawDevice {
     fn snapshot(&mut self) -> io::Result<DeviceSnapshot> {
-        let snapshot = inspect(&self.handle)?;
+        // SAFETY: the owner preserves the constructor's synchronous-handle invariant.
+        let snapshot = unsafe { inspect(&self.handle)? };
         self.check_write_readiness()?;
         Ok(snapshot)
     }
@@ -290,7 +292,11 @@ fn value<T: Default>(
     Ok(output)
 }
 
-fn inspect(handle: &OwnedHandle) -> io::Result<DeviceSnapshot> {
+/// Read device metadata without testing or changing writability.
+///
+/// # Safety
+/// The handle must remain live and synchronous (no FILE_FLAG_OVERLAPPED).
+pub(crate) unsafe fn inspect(handle: &OwnedHandle) -> io::Result<DeviceSnapshot> {
     let number: STORAGE_DEVICE_NUMBER = value(handle, IOCTL_STORAGE_GET_DEVICE_NUMBER, None)?;
     if number.DeviceType != FILE_DEVICE_DISK || number.PartitionNumber != 0 {
         return Err(invalid(

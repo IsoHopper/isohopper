@@ -88,10 +88,16 @@ mod native {
     };
     use super::{lock_image, vhd_support};
     use isohopper_helper::{
-        windows_lock::{self, LockError},
+        windows_lock::{self, LockError, TargetVolumeProbe},
         writer::{RetainedDevice, write_image},
     };
-    use std::{fs::File, io, sync::atomic::AtomicBool};
+    use std::{
+        fs::{File, OpenOptions},
+        io,
+        os::windows::fs::OpenOptionsExt,
+        sync::atomic::AtomicBool,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
     pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
         let _privilege = vhd_support::ManageVolumePrivilege::enable()?;
@@ -130,6 +136,34 @@ mod native {
         // Acquired-lock rollback is covered by the portable state tests.
         let mut held_file = open_payload(&volumes[1])?;
         verify_payload(&mut held_file)?;
+        let (device_path, number) = vhd.physical_path()?;
+        let read_only = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(device_path)?;
+        vhd_support::assert_readback_binding(&read_only, number)?;
+        // SAFETY: synchronous read-only whole-device handle from this owned
+        // VHD only. No FILE_FLAG_OVERLAPPED and no other handle aliases.
+        let mut probe =
+            unsafe { TargetVolumeProbe::from_owned_handle(read_only.into(), &expected)? };
+        assert_eq!(probe.coverage().device, expected);
+        assert_eq!(probe.coverage().partition_style, 1);
+        assert_eq!(probe.coverage().partitions.len(), 2);
+        for partition in &probe.coverage().partitions {
+            let independent = volumes
+                .iter()
+                .find(|volume| Some(volume.name.as_str()) == partition.volume_guid.as_deref())
+                .expect("probe must bind the independently discovered volume GUID");
+            assert_eq!(partition.start_offset, independent.start);
+            assert_eq!(partition.length_bytes, independent.length);
+            assert!(partition.volume_required);
+        }
+        probe.revalidate()?;
+        // A held ordinary file cannot prevent read-only probing. Fresh file
+        // opens while the probe lives independently show no volume lock/dismount.
+        verify_payload(&mut held_file)?;
+        verify_payload(&mut open_payload(&volumes[0])?)?;
+        drop(probe);
         match windows_lock::lock(device, &expected) {
             Err(LockError::Io {
                 stage: "lock target volume",
@@ -167,7 +201,7 @@ mod native {
         }
         vhd.detach()?;
         println!(
-            "VHD lock integration passed: two exact FAT32 extents; open-file lock refusal followed by readable payloads and successful retry; retained locks deny file opens; drop restores both payloads; no USB hardware exercised"
+            "VHD lock integration passed: read-only retained probe matches two independently discovered FAT32 extents without blocking payload access; open-file lock refusal followed by readable payloads and successful retry; retained locks deny file opens; drop restores both payloads; no USB hardware exercised"
         );
         Ok(())
     }
