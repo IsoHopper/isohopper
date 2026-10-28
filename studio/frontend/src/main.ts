@@ -39,6 +39,8 @@ let toastTimer: ReturnType<typeof setTimeout>;
 let deviceDialog = false;
 let inventoryDialog = false;
 let inspectingHost = false;
+let probingHelper = false;
+let helperStatus = '';
 let hostInventory: HostInventory | undefined;
 let inventoryError = '';
 let query = '';
@@ -106,6 +108,7 @@ function nativeTargetPanel() {
     ${!isNative ? `<div class="inventory-note"><p>Native desktop runtime unavailable.</p><p>${nativeHost ? 'The desktop bridge did not initialize. Restart the application.' : 'Open the desktop application for local file import and host inventory.'}</p>${nativeHost ? '' : '<a class="text-button" href="?demo=1">Open browser demo</a>'}</div>` : ''}
     ${deviceError && isNative ? `<div class="error-notice">${esc(deviceError)}</div>` : ''}
     <div class="inventory-note"><strong>Preparation unavailable</strong><p>${esc(capabilities?.preparation_unavailable_reason || preparationUnavailable)}</p></div>
+    ${isNative && capabilities?.platform === 'windows' && capabilities.helper_probe === true ? `<div class="inventory-note"><button class="secondary-button" id="probe-helper" ${probingHelper || refreshing || pickingImages || inspectingHost ? 'disabled' : ''}>${probingHelper ? 'Checking elevated helper…' : 'Check elevated helper'}</button><p>Requests Windows elevation for a read-only connection test. No disk access. Publisher not verified.</p>${helperStatus ? `<p id="helper-status" role="status">${esc(helperStatus)}</p>` : ''}</div>` : ''}
     ${hostInventory ? `<p class="inventory-note"><code>source=${esc(hostInventory.source)} · disks=${hostInventory.disks.length}</code><br/>Read-only observations. No device is selected for writing.</p>${hostInventory.warnings.length ? `<div class="inventory-warnings">${hostInventory.warnings.map(warning => `<p><code>${esc(warning.code)}${warning.disk_id ? ` [${esc(warning.disk_id)}]` : ''}</code>: ${esc(warning.message)}</p>`).join('')}</div>` : ''}<div class="native-device-list">${hostInventory.disks.map(disk => `<article class="host-device"><h3>${esc(disk.model || disk.id)}</h3><dl class="device-details"><div><dt>Device ID</dt><dd>${esc(disk.id)}</dd></div><div><dt>Serial</dt><dd>${esc(disk.serial || 'Not reported')}</dd></div><div><dt>Capacity</dt><dd>${formatBytes(disk.size_bytes)}<br/>${exactBytes(disk.size_bytes)}</dd></div><div><dt>Bus</dt><dd>${esc(disk.bus || 'Unknown')}</dd></div><div><dt>Logical sector</dt><dd>${disk.logical_sector_size} bytes</dd></div><div><dt>Physical sector</dt><dd>${typeof disk.physical_sector_size === 'number' ? `${disk.physical_sector_size} bytes` : 'Not reported'}</dd></div><div><dt>Safety complete</dt><dd>${typeof disk.safety_checks_complete === 'boolean' ? String(disk.safety_checks_complete) : 'Not reported'}</dd></div></dl></article>`).join('') || '<p class="empty-inline">No disks returned by the host adapter.</p>'}</div>` : ''}
     ${isNative && capabilities?.host_inventory ? `<button class="text-button inspect-host" id="inspect-host" ${inspectingHost || refreshing || pickingImages ? 'disabled' : ''}>Inspect host devices (read only)</button>` : ''}
   </section>`;
@@ -165,6 +168,7 @@ function bindEvents() {
   document.querySelector('.modal-backdrop:not(.inventory-backdrop)')?.addEventListener('click', event => { if (event.target === event.currentTarget) closeDialog(); });
   document.querySelectorAll<HTMLButtonElement>('[data-disk]').forEach(button => button.onclick = async () => { const record = disks.find(item => item.disk.id === button.dataset.disk); if (!isDemo || !record || record.verdict.state === 'blocked' || busy) return; selected = record; confirmation = ''; complete = false; deviceDialog = false; log('Fixture selected', `id=${record.disk.id} serial=${record.disk.serial} model=${record.disk.model} bytes=${record.disk.size_bytes} bus=${record.disk.bus} logical_sector=${record.disk.logical_sector_size} physical_sector=${record.disk.physical_sector_size ?? 'unknown'} verdict=${record.verdict.state} risks=${(record.verdict.risks || []).map(reason => reason.code).join(',') || 'none'}`, record.verdict.state === 'confirm' ? 'warning' : 'info'); await loadPlan(); });
   document.querySelector('#refresh-drives')?.addEventListener('click', loadDevices);
+  document.querySelector('#probe-helper')?.addEventListener('click', probeHelper);
   const confirmationInput = document.querySelector<HTMLInputElement>('#confirmation');
   if (confirmationInput) {
     confirmationInput.onpaste = event => { event.preventDefault(); notify('Type the phrase yourself to review this fixture.'); };
@@ -201,6 +205,20 @@ function bindImageActions() {
   const clear = document.querySelector<HTMLButtonElement>('#clear-images');
   if (clear) clear.onclick = () => void removeImages(new Set(images.map(image => image.id)));
   document.querySelectorAll<HTMLButtonElement>('.copy-hash').forEach(button => button.onclick = async () => { const image = images.find(item => item.id === button.dataset.id); if (!image?.hash) return; try { await navigator.clipboard.writeText(image.hash); notify(`SHA-256 copied: ${image.hash}`); } catch { notify('Clipboard access failed. Select and copy the full checksum from the table.'); } });
+}
+async function probeHelper() {
+  if (!isNative || capabilities?.platform !== 'windows' || capabilities.helper_probe !== true || !bridge.ProbeHelper || probingHelper || refreshing || pickingImages || inspectingHost) return;
+  probingHelper = true;
+  helperStatus = 'Waiting for Windows elevation and helper response. Cancel in the Windows prompt; Studio remains open until the check finishes.';
+  render();
+  try {
+    const result = await bridge.ProbeHelper();
+    helperStatus = result.status === 'cancelled' ? 'Windows elevation cancelled. No disk access.' : `Read-only helper connected and exited. protocol=${result.protocol} version=${result.helper_version} pid=${result.helper_pid} created=${result.helper_created} sha256=${result.helper_sha256} physical_preparation=false`;
+    log('Elevated helper check', helperStatus, result.status === 'cancelled' ? 'info' : 'success');
+  } catch (error) {
+    helperStatus = `Helper check failed: ${errorMessage(error)}`;
+    log('Elevated helper check failed', helperStatus, 'warning');
+  } finally { probingHelper = false; render(); }
 }
 async function removeImages(rowIds: ReadonlySet<string>) {
   if (busy || pickingImages || releasingImages || sourcesLoading) return;

@@ -3,6 +3,7 @@
 import { expect, test, type Page } from '@playwright/test';
 
 interface NativeScenario {
+  helperOutcome?: 'connected' | 'cancelled' | 'error';
   capabilityError?: string;
   inventoryError?: string;
   pickerOutcome?: 'image' | 'cancel' | 'error';
@@ -11,7 +12,7 @@ interface NativeScenario {
 }
 
 async function installNativeBridge(page: Page, scenario: NativeScenario = {}) {
-  await page.addInitScript(({ capabilityError, inventoryError, pickerOutcome, releaseFailures, sourceListError }) => {
+  await page.addInitScript(({ capabilityError, inventoryError, pickerOutcome, releaseFailures, sourceListError, helperOutcome }) => {
     const host = window as unknown as { __TAURI__: unknown; nativeCommands: string[]; releasedSourceIds: string[][]; publishNativeSource: (source: StoredSource) => void; nativeSourceListError?: string; pauseSourceListing: () => void; finishSourceListing: () => void };
     host.nativeCommands = [];
     host.releasedSourceIds = [];
@@ -27,7 +28,12 @@ async function installNativeBridge(page: Page, scenario: NativeScenario = {}) {
       host.nativeCommands.push(command);
       if (command === 'capabilities') {
         if (capabilityError) throw new Error(capabilityError);
-        return { mode: 'native', platform: 'windows', file_import: true, host_inventory: true, physical_preparation: false, preparation_unavailable_reason: 'Privileged preparation helper is not available.' };
+        return { mode: 'native', platform: 'windows', file_import: true, host_inventory: true, helper_probe: !!helperOutcome, physical_preparation: false, preparation_unavailable_reason: 'Privileged preparation helper is not available.' };
+      }
+      if (command === 'probe_helper') {
+        if (helperOutcome === 'error') throw new Error('Helper user or logon mismatch');
+        if (helperOutcome === 'cancelled') return { status: 'cancelled', physical_preparation: false };
+        return { status: 'connected', protocol: 1, helper_version: '0.1.0', helper_pid: 42, helper_created: '133721455931234567', helper_sha256: 'a'.repeat(64), physical_preparation: false };
       }
       if (command === 'inspect_devices') {
         if (inventoryError) throw new Error(inventoryError);
@@ -73,6 +79,22 @@ async function expectNoDemoContent(page: Page) {
   await expect(page.getByRole('button', { name: 'Simulate preparation' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Load samples' })).toHaveCount(0);
   await expect(page.getByText('Explicit browser demo · mock devices · no physical disk writes')).toHaveCount(0);
+}
+
+for (const helperOutcome of ['connected', 'cancelled', 'error'] as const) {
+  test(`explicit helper probe ${helperOutcome} keeps physical preparation unavailable`, async ({ page }) => {
+    await installNativeBridge(page, { helperOutcome });
+    await page.goto('/');
+    const button = page.getByRole('button', { name: 'Check elevated helper', exact: true });
+    await expect(button).toBeEnabled();
+    expect(await nativeCommands(page)).not.toContain('probe_helper');
+    await button.click();
+    await expect(page.locator('#helper-status')).toContainText(helperOutcome === 'connected' ? 'Read-only helper connected and exited' : helperOutcome === 'cancelled' ? 'Windows elevation cancelled' : 'Helper check failed');
+    await expect(page.getByText('Preparation unavailable', { exact: true })).toBeVisible();
+    expect((await nativeCommands(page)).filter(command => command === 'probe_helper')).toHaveLength(1);
+    await expectNoDemoContent(page);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  });
 }
 
 test('bare browser reports unavailable native runtime and requires an explicit demo choice', async ({ page }) => {

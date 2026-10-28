@@ -4,6 +4,19 @@ import { describe, expect, it } from 'vitest';
 import { createNativeBridge, nativeImageForDisplay, nativeMediaImage, type NativePickedImage } from './native';
 const record: NativePickedImage = { name: '/private/media/installer.iso', bytes: 6_000_000_000, verification: { algorithm: 'sha256', digest: 'a'.repeat(64), bytes: 6_000_000_000, status: 'hash-only', publisher_verified: false } };
 describe('native image intake', () => {
+  it('probes only through the native command, without sending paths or process IDs', async () => {
+    const calls: unknown[] = [];
+    const result = { status: 'connected', protocol: 1, helper_version: '0.1.0', helper_pid: 42, helper_created: '12345', helper_sha256: 'a'.repeat(64), physical_preparation: false };
+    const bridge = createNativeBridge(async <T>(command: string, args?: Record<string, unknown>) => { calls.push({ command, args }); return result as T; });
+    expect(await bridge.ProbeHelper!()).toEqual(result);
+    expect(calls).toEqual([{ command: 'probe_helper', args: undefined }]);
+  });
+  it('never accepts helper probe output as preparation permission', async () => {
+    const bridge = createNativeBridge(async <T>() => ({ status: 'connected', physical_preparation: true }) as T);
+    await expect(bridge.ProbeHelper!()).rejects.toThrow('helper probe');
+    const cancelled = createNativeBridge(async <T>() => ({ status: 'cancelled', physical_preparation: false }) as T);
+    expect(await cancelled.ProbeHelper!()).toEqual({ status: 'cancelled', physical_preparation: false });
+  });
   it('accepts a streamed large image without exposing a full path or claiming publisher trust', () => {
     expect(nativeMediaImage(record, 'test')).toEqual({ id: 'test', name: 'installer.iso', size: 6_000_000_000, sample: false, origin: 'native', status: 'hashed', hash: 'a'.repeat(64) });
   });
