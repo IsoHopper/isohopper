@@ -152,6 +152,16 @@ fn execute(program: &Path, args: &[&str]) -> io::Result<CommandOutput> {
     })
 }
 
+/// Tests replace only CIM responses, while retaining the production executable,
+/// environment, output bounds and timeout. Never part of the runtime allowlist.
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) fn test_powershell_script(script: &str) -> io::Result<CommandOutput> {
+    execute(
+        &powershell_path()?,
+        &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -330,3 +330,168 @@ fn canonical_guid(value: &str) -> Result<String, InventoryError> {
 fn invalid(message: &str) -> InventoryError {
     InventoryError::Invalid(format!("BitLocker evidence: {message}"))
 }
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+    use crate::CommandOutput;
+    use std::io;
+
+    // Replace only external CIM operations. The production script still imports
+    // its trusted modules, invokes methods, projects nulls and serializes JSON.
+    // Each method returns only its own documented output fields, so an incorrect
+    // field name in the production projection cannot pass using another method.
+    const CIM_FIXTURES: &str = r#"
+function Get-TestEncryptionVolume {
+    [CmdletBinding()]
+    param([string]$Namespace, [string]$ClassName, [uint32]$OperationTimeoutSec)
+    if ($Namespace -ne 'Root\CIMV2\Security\MicrosoftVolumeEncryption' -or $ClassName -ne 'Win32_EncryptableVolume') { throw 'Unexpected test query' }
+    if ($script:EmptyEncryptionQuery) { return }
+    $states = @(
+        @{conversion=0; percentage=0; protection=0; lock=0; method=0},
+        @{conversion=1; percentage=100; protection=1; lock=0; method=7},
+        @{conversion=0; percentage=0; protection=0; lock=1; method=5},
+        @{conversion=1; percentage=100; protection=2; lock=1; method=[uint32]::MaxValue}
+    )
+    foreach ($case in 0..6) {
+        [pscustomobject]@{
+            DeviceID = '\\?\Volume{00000000-0000-0000-0000-' + $case.ToString('D12') + '}\'
+            TestCase = $case
+            State = $states[[Math]::Min($case, 3)]
+        }
+    }
+}
+function Invoke-TestEncryptionMethod {
+    [CmdletBinding()]
+    param($InputObject, [string]$MethodName, [hashtable]$Arguments, [uint32]$OperationTimeoutSec)
+    if ($InputObject.TestCase -eq 5) { throw 'Synthetic method failure' }
+    $state = $InputObject.State
+    $result = switch ($MethodName) {
+        'GetConversionStatus' {
+            if ($Arguments.Count -ne 1 -or $Arguments.PrecisionFactor -ne 0) { throw 'Unexpected conversion arguments' }
+            @{ConversionStatus=[uint32]$state.conversion; EncryptionPercentage=[uint32]$state.percentage; EncryptionFlags=[uint32]0; WipingStatus=[uint32]0; WipingPercentage=[uint32]0}
+        }
+        'GetProtectionStatus' { @{ProtectionStatus=[uint32]$state.protection} }
+        'GetLockStatus' { @{LockStatus=[uint32]$state.lock} }
+        'GetEncryptionMethod' { @{EncryptionMethod=[uint32]$state.method; SelfEncryptionDriveEncryptionMethod=$null} }
+        default { throw 'Unexpected test method' }
+    }
+    if ($InputObject.TestCase -ne 6) {
+        $result.ReturnValue = if ($InputObject.TestCase -eq 4) { [uint32]2150694912 } else { [uint32]0 }
+    }
+    [pscustomobject]$result
+}
+"#;
+
+    struct ProjectionRunner;
+    impl CommandRunner for ProjectionRunner {
+        fn run(&self, program: &str, args: &[&str]) -> io::Result<CommandOutput> {
+            assert_eq!(program, windows::POWERSHELL);
+            assert_eq!(args, ARGS);
+            let script = projected_script(false);
+            let output = crate::native::test_powershell_script(&script)?;
+            assert!(
+                output.success,
+                "synthetic PowerShell projection failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(output)
+        }
+    }
+
+    fn projected_script(empty: bool) -> String {
+        // These checks guard the test boundary: never accidentally enumerate a
+        // real volume if the production query spelling changes.
+        assert_eq!(SCRIPT.matches("CimCmdlets\\Get-CimInstance").count(), 1);
+        assert_eq!(SCRIPT.matches("CimCmdlets\\Invoke-CimMethod").count(), 4);
+        assert_eq!(SCRIPT.matches("$provider = 'available'").count(), 1);
+        let script = SCRIPT
+            .replace("CimCmdlets\\Get-CimInstance", "Get-TestEncryptionVolume")
+            .replace("CimCmdlets\\Invoke-CimMethod", "Invoke-TestEncryptionMethod")
+            .replacen(
+                "$provider = 'available'",
+                &format!(
+                    "{CIM_FIXTURES}\n$script:EmptyEncryptionQuery = ${empty}\n$provider = 'available'"
+                ),
+                1,
+            );
+        assert!(!script.contains("CimCmdlets\\Get-"));
+        assert!(!script.contains("CimCmdlets\\Invoke-"));
+        script
+    }
+
+    #[test]
+    fn windows_projects_bitlocker_methods_without_inventing_success() {
+        let observation = collect_with(&ProjectionRunner)
+            .expect("production PowerShell projection must preserve synthetic CIM method outputs");
+        assert_eq!(observation.provider, ProviderStatus::Available);
+        assert_eq!(observation.volumes.len(), 7);
+        let values = &observation.volumes;
+        let expected = [
+            (
+                ConversionStatus::FullyDecrypted,
+                0,
+                ProtectionStatus::Off,
+                LockStatus::Unlocked,
+                EncryptionMethod::None,
+            ),
+            (
+                ConversionStatus::FullyEncrypted,
+                100,
+                ProtectionStatus::On,
+                LockStatus::Unlocked,
+                EncryptionMethod::XtsAes256,
+            ),
+            (
+                ConversionStatus::FullyDecrypted,
+                0,
+                ProtectionStatus::Off,
+                LockStatus::Locked,
+                EncryptionMethod::Hardware,
+            ),
+            (
+                ConversionStatus::FullyEncrypted,
+                100,
+                ProtectionStatus::Unknown,
+                LockStatus::Locked,
+                EncryptionMethod::Unknown,
+            ),
+        ];
+        for (volume, (conversion, percentage, protection, lock, method)) in
+            values.iter().zip(expected)
+        {
+            assert_eq!(volume.conversion.return_code, Some(0));
+            assert_eq!(volume.conversion.value, Some(conversion));
+            assert_eq!(volume.encryption_percentage, Some(percentage));
+            assert_eq!(volume.protection.return_code, Some(0));
+            assert_eq!(volume.protection.value, Some(protection));
+            assert_eq!(volume.lock.return_code, Some(0));
+            assert_eq!(volume.lock.value, Some(lock));
+            assert_eq!(volume.encryption_method.return_code, Some(0));
+            assert_eq!(volume.encryption_method.value, Some(method));
+        }
+        for (volume, code) in values[4..].iter().zip([Some(2_150_694_912), None, None]) {
+            assert_eq!(volume.conversion.return_code, code);
+            assert_eq!(volume.protection.return_code, code);
+            assert_eq!(volume.lock.return_code, code);
+            assert_eq!(volume.encryption_method.return_code, code);
+            assert_eq!(volume.conversion.value, None);
+            assert_eq!(volume.encryption_percentage, None);
+            assert_eq!(volume.protection.value, None);
+            assert_eq!(volume.lock.value, None);
+            assert_eq!(volume.encryption_method.value, None);
+        }
+
+        let empty = crate::native::test_powershell_script(&projected_script(true))
+            .expect("empty synthetic query must finish");
+        assert!(
+            empty.success,
+            "empty synthetic query failed: {}",
+            String::from_utf8_lossy(&empty.stderr)
+        );
+        assert!(empty.stderr.is_empty());
+        let empty: serde_json::Value = serde_json::from_slice(&empty.stdout).unwrap();
+        assert_eq!(empty["provider"], "available");
+        assert_eq!(empty["volumes"], serde_json::json!([]));
+    }
+}
