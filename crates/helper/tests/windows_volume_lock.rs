@@ -88,6 +88,7 @@ mod native {
     };
     use super::{lock_image, vhd_support};
     use isohopper_helper::{
+        windows_encryption_check,
         windows_lock::{self, LockError, TargetVolumeProbe},
         writer::{RetainedDevice, write_image},
     };
@@ -159,6 +160,26 @@ mod native {
             assert!(partition.volume_required);
         }
         probe.revalidate()?;
+        let coverage = probe.coverage().clone();
+        let encryption = windows_encryption_check::observe_for_probe(&mut probe)?;
+        assert_eq!(encryption.coverage, coverage);
+        assert_eq!(encryption.partitions.len(), coverage.partitions.len());
+        for (report, partition) in encryption.partitions.iter().zip(&coverage.partitions) {
+            assert_eq!(&report.partition, partition);
+            assert!(!report.findings.is_empty());
+        }
+        // Missing provider/volume/method data is a legitimate unknown result,
+        // never evidence that these target volumes are unencrypted or safe.
+        println!(
+            "VHD BitLocker observation: provider={:?}, target_partitions={}, returned_volume_records={}",
+            encryption.provider,
+            encryption.partitions.len(),
+            encryption
+                .partitions
+                .iter()
+                .filter(|p| p.observation.is_some())
+                .count()
+        );
         // A held ordinary file cannot prevent read-only probing. Fresh file
         // opens while the probe lives independently show no volume lock/dismount.
         verify_payload(&mut held_file)?;

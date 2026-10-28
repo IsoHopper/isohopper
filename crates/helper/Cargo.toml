@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 isohopper-core = { path = "../core" }
+isohopper-inventory = { path = "../inventory" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -17,7 +18,6 @@ thiserror.workspace = true
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Storage_Vhd", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
-isohopper-inventory = { path = "../inventory" }
 tempfile.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
