@@ -376,6 +376,15 @@ fn windows_vhd_provider_path_binds_to_retained_target() -> Result<(), Box<dyn st
     assert_readback_binding(&target, number)?;
     // SAFETY: this owned VHD's handle is live, read-only and synchronous.
     let identity = unsafe { query_identity(&target) };
+    // Record only typed issue categories and numeric disk/partition keys. This
+    // is a separate read-only observation, not the binding's exact snapshot.
+    let diagnostic = isohopper_inventory::windows::collect_evidence()?;
+    eprintln!(
+        "Provider observation before target binding: completeness={:?}; issue_count={}; first_issues={:?}",
+        diagnostic.completeness,
+        diagnostic.issues.len(),
+        &diagnostic.issues[..diagnostic.issues.len().min(16)]
+    );
     // SAFETY: the target was opened with read access only, without OVERLAPPED;
     // the expected snapshot came from this same still-attached disposable VHD.
     let result = unsafe { BoundTarget::from_owned_handle(target.into(), &expected) };
