@@ -51,6 +51,72 @@ fn windows_pipe_child_waits_for_parent() {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "internal controlled child for Windows pipe cross-process roundtrip"]
+fn windows_pipe_child_echoes_parent() -> Result<(), Box<dyn std::error::Error>> {
+    use isohopper_helper::{windows_peer::ProcessPeer, windows_pipe::connect};
+    use std::{
+        io::{Read, Write},
+        os::windows::io::{FromRawHandle, OwnedHandle},
+        sync::atomic::AtomicBool,
+        time::{Duration, Instant},
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+
+    // General ignored-test runs must neither block on stdin nor open a process.
+    if std::env::var_os("ISOHOPPER_PIPE_ECHO_CHILD").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return Ok(());
+    }
+    // Test-only bootstrap: public routing/identity fields, no secret. Reading
+    // at most 129 bytes distinguishes a valid bounded message from oversize.
+    let mut input = String::new();
+    std::io::stdin().take(129).read_to_string(&mut input)?;
+    assert!(input.len() <= 128, "oversized child bootstrap");
+    let fields: Vec<_> = input.split_ascii_whitespace().collect();
+    assert_eq!(fields.len(), 3, "invalid child bootstrap");
+    let endpoint = Endpoint::from_nonce(fields[0])?;
+    let parent_id: u32 = fields[1].parse()?;
+    let creation_time: u64 = fields[2].parse()?;
+    // SAFETY: this guarded test child receives its live test parent's PID from
+    // inherited stdin. The retained observation must match creation time too.
+    let raw = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            parent_id,
+        )
+    };
+    if raw.is_null() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: successful OpenProcess returned one newly owned handle.
+    let expected = ProcessPeer::from_owned_handle(unsafe { OwnedHandle::from_raw_handle(raw) })?;
+    assert!(
+        expected.evidence().process_id == parent_id
+            && expected.evidence().creation_time == creation_time,
+        "parent identity mismatch"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let cancel = AtomicBool::new(false);
+    let mut connection = connect(&endpoint, expected, deadline, &cancel)?;
+    let payload = connection
+        .read_frame(deadline, &cancel)?
+        .ok_or("missing parent frame")?;
+    assert_eq!(payload, b"cross-process roundtrip");
+    connection.write_frame(&payload, deadline, &cancel)?;
+    // Separate test-only lifecycle signal: let the parent know the echo's
+    // terminal peer check finished before it closes the production connection.
+    std::io::stderr().write_all(&[0x5a])?;
+    assert!(
+        connection.read_frame(deadline, &cancel)?.is_none(),
+        "unexpected frame after echo"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
 #[ignore = "disposable local pipe and own child only; no UAC or device access"]
 fn windows_pipe_checks_peers_deadlines_and_frames() -> Result<(), Box<dyn std::error::Error>> {
     use isohopper_helper::{
@@ -59,7 +125,7 @@ fn windows_pipe_checks_peers_deadlines_and_frames() -> Result<(), Box<dyn std::e
         windows_pipe::{Connection, PipeError, Server, connect},
     };
     use std::{
-        io::Write,
+        io::{Read, Write},
         os::windows::io::{AsHandle, FromRawHandle, OwnedHandle},
         process::{Child, Command, Stdio},
         ptr,
@@ -185,6 +251,177 @@ fn windows_pipe_checks_peers_deadlines_and_frames() -> Result<(), Box<dyn std::e
     thread::sleep(Duration::from_millis(80));
     drop(client);
     eof.join().unwrap();
+
+    // The peer process is still this live test process, but its pipe handle has
+    // already closed before read_frame starts. Exercise both native PID-query
+    // directions; clean EOF must not depend on winning a close/read race.
+    let (mut server, client) = pair();
+    drop(client);
+    assert!(
+        server
+            .read_frame(deadline(), &AtomicBool::new(false))?
+            .is_none(),
+        "server did not report clean EOF after the client handle closed"
+    );
+    assert!(matches!(
+        server.read_frame(deadline(), &AtomicBool::new(false)),
+        Err(PipeError::Closed)
+    ));
+    let (server, mut client) = pair();
+    drop(server);
+    assert!(
+        client
+            .read_frame(deadline(), &AtomicBool::new(false))?
+            .is_none(),
+        "client did not report clean EOF after the server handle closed"
+    );
+    assert!(matches!(
+        client.read_frame(deadline(), &AtomicBool::new(false)),
+        Err(PipeError::Closed)
+    ));
+
+    // A complete length header followed by only one of four payload bytes is
+    // not clean EOF. Keep the raw client alive while the receiver starts, then
+    // close only its pipe and require the framing error, not an arbitrary error.
+    let server = Server::create()?;
+    let name: Vec<_> = server
+        .endpoint()
+        .local_name()
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    let (written, wait_written) = mpsc::channel();
+    let (close, wait_close) = mpsc::channel();
+    let partial_client = thread::spawn(move || {
+        // SAFETY: fixed disposable endpoint, exact data rights, synchronous
+        // noninheritable handle and identification-only security context.
+        let raw = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                0x0012_0083,
+                0,
+                ptr::null(),
+                OPEN_EXISTING,
+                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            raw, INVALID_HANDLE_VALUE,
+            "partial payload client open failed"
+        );
+        // SAFETY: CreateFileW returned one new owned handle.
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let bytes = [0, 0, 0, 4, 0x5a];
+        let mut count = 0;
+        // SAFETY: synchronous handle and fixed live input/output buffers.
+        assert_ne!(
+            unsafe { WriteFile(raw, bytes.as_ptr(), 5, &mut count, ptr::null_mut()) },
+            0,
+            "partial payload write failed"
+        );
+        assert_eq!(count, 5);
+        written.send(()).unwrap();
+        wait_close.recv_timeout(Duration::from_secs(10)).unwrap();
+        drop(handle);
+    });
+    let mut server = server.accept(current(), deadline(), &AtomicBool::new(false))?;
+    wait_written.recv_timeout(Duration::from_secs(10))?;
+    let (reading, wait_reading) = mpsc::channel();
+    let partial_reader = thread::spawn(move || {
+        reading.send(()).unwrap();
+        let result = server.read_frame(deadline(), &AtomicBool::new(false));
+        assert!(
+            matches!(result, Err(PipeError::Io { stage: "read frame", ref source })
+                if source.kind() == std::io::ErrorKind::UnexpectedEof),
+            "partial payload close must return a framing EOF error: {result:?}"
+        );
+        assert!(matches!(
+            server.read_frame(deadline(), &AtomicBool::new(false)),
+            Err(PipeError::Closed)
+        ));
+    });
+    wait_reading.recv_timeout(Duration::from_secs(10))?;
+    thread::sleep(Duration::from_millis(80));
+    close.send(())?;
+    partial_client.join().unwrap();
+    partial_reader.join().unwrap();
+
+    // Positive roundtrip across real processes. The parent uses the actual
+    // spawned child's retained handle; the child independently checks this
+    // parent's retained identity before production pipe peer validation.
+    let server = Server::create()?;
+    let parent = current();
+    let bootstrap = format!(
+        "{} {} {}\n",
+        server.endpoint().nonce(),
+        parent.evidence().process_id,
+        parent.evidence().creation_time
+    );
+    let mut echo_child = OwnChild(
+        Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "windows_pipe_child_echoes_parent",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("ISOHOPPER_PIPE_ECHO_CHILD", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    let mut child_stderr = echo_child
+        .0
+        .stderr
+        .take()
+        .ok_or("missing echo child stderr")?;
+    let (completed, wait_completed) = mpsc::channel();
+    let completion = thread::spawn(move || {
+        let mut signal = [0];
+        let result = child_stderr.read_exact(&mut signal).map(|()| signal);
+        // Return and retain the pipe even after the signal, so child errors can
+        // still write diagnostics without receiving a broken stderr pipe.
+        let _ = completed.send((result, child_stderr));
+    });
+    let expected_child =
+        ProcessPeer::from_owned_handle(echo_child.0.as_handle().try_clone_to_owned()?)?;
+    echo_child
+        .0
+        .stdin
+        .take()
+        .ok_or("missing echo child stdin")?
+        .write_all(bootstrap.as_bytes())?;
+    let mut connection = server.accept(expected_child, deadline(), &AtomicBool::new(false))?;
+    connection.write_frame(
+        b"cross-process roundtrip",
+        deadline(),
+        &AtomicBool::new(false),
+    )?;
+    assert_eq!(
+        connection
+            .read_frame(deadline(), &AtomicBool::new(false))?
+            .ok_or("missing child echo")?,
+        b"cross-process roundtrip"
+    );
+    let (signal, _child_stderr) = wait_completed.recv_timeout(Duration::from_secs(10))?;
+    assert_eq!(signal?, [0x5a], "child echo completion signal mismatch");
+    completion.join().unwrap();
+    // Both frame operations and their terminal peer checks are now complete.
+    // Dropping exercises the child's pending or already-closed EOF.
+    drop(connection);
+    let exit_deadline = deadline();
+    loop {
+        if let Some(status) = echo_child.0.try_wait()? {
+            assert!(status.success(), "cross-process pipe child failed");
+            break;
+        }
+        if Instant::now() >= exit_deadline {
+            return Err("cross-process pipe child exit timed out".into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 
     // First-instance creation refuses an existing endpoint. The client DACL
     // additionally grants no FILE_CREATE_PIPE_INSTANCE alias (bit 4).
@@ -385,7 +622,7 @@ fn windows_pipe_checks_peers_deadlines_and_frames() -> Result<(), Box<dyn std::e
     child.0.stdin.take().unwrap().write_all(&[0x5a])?;
     assert!(child.0.wait()?.success());
     println!(
-        "Windows pipe transport passed: roundtrip=1 immediate_io=1 clean_eof=1 first_instance=1 wrong_peer=1 connect_timeout=1 connect_cancel=1 read_timeout=1 read_cancel=1 write_timeout=1 partial_header_timeout=1; no UAC or device access"
+        "Windows pipe transport passed: roundtrip=1 cross_process=1 immediate_io=1 clean_eof=1 immediate_eof=1 partial_payload_eof=1 first_instance=1 wrong_peer=1 connect_timeout=1 connect_cancel=1 read_timeout=1 read_cancel=1 write_timeout=1 partial_header_timeout=1; no UAC or device access"
     );
     Ok(())
 }
