@@ -88,6 +88,7 @@ jobs:
           from pathlib import Path
           text = Path('native-checks.log').read_text(errors='replace')[-12000:]
           print(text)
+          text = text.encode('utf-8')[-3500:].decode('utf-8', errors='replace')
           text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
           print('::error title=Windows Studio checks failed::' + text)
           PY
@@ -103,6 +104,7 @@ jobs:
           from pathlib import Path
           text = Path('installer-build.log').read_text(errors='replace')[-12000:]
           print(text)
+          text = text.encode('utf-8')[-3500:].decode('utf-8', errors='replace')
           text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
           print('::error title=Windows installer build failed::' + text)
           PY
@@ -127,7 +129,7 @@ jobs:
             Get-Content installed-check.log
             if ($testExit -ne 0) {
               $detail = (Get-Content installed-check.log -Raw)
-              if ($detail.Length -gt 12000) { $detail = $detail.Substring($detail.Length - 12000) }
+              if ($detail.Length -gt 1000) { $detail = $detail.Substring($detail.Length - 1000) }
               $detail = $detail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
               Write-Output "::error title=Installed helper protection failed::$detail"
               throw 'Installed helper protection or checksum failed'
