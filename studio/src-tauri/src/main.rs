@@ -20,6 +20,14 @@ fn check_config(text: String, format: String) -> serde_json::Value {
     }
 }
 mod imports;
+#[tauri::command]
+fn release_sources(ids: Vec<String>) -> Result<(), String> {
+    imports::release_sources(&ids)
+}
+#[tauri::command]
+fn list_sources() -> Result<Vec<imports::ImportedImage>, String> {
+    imports::list_sources()
+}
 use std::sync::atomic::{AtomicBool, Ordering};
 static NATIVE_JOB_ACTIVE: AtomicBool = AtomicBool::new(false);
 struct NativeJob;
@@ -48,10 +56,7 @@ async fn pick_images() -> Result<Vec<imports::ImportedImage>, String> {
         else {
             return Ok(Vec::new());
         };
-        paths
-            .iter()
-            .map(|path| imports::import_file(path))
-            .collect()
+        imports::import_files(&paths)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -89,8 +94,32 @@ fn main() {
             check_config,
             pick_images,
             pick_directory,
+            release_sources,
+            list_sources,
             inspect_devices
         ])
         .run(tauri::generate_context!())
         .expect("could not start IsoHopper Studio");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn release_command_retains_leased_sources_and_releases_after_the_lease_ends() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("boot.iso");
+        std::fs::write(&path, b"abc").unwrap();
+        let image = super::imports::import_file(&path).unwrap();
+        let lease = super::imports::source_catalog()
+            .lock()
+            .unwrap()
+            .lease(&image.source_id)
+            .unwrap();
+        assert!(super::release_sources(vec![image.source_id.clone()]).is_err());
+        drop(lease);
+        super::release_sources(vec![image.source_id.clone()]).unwrap();
+        assert!(super::release_sources(vec![image.source_id]).is_err());
+        assert!(super::release_sources(vec![path.display().to_string()]).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"abc");
+    }
 }
