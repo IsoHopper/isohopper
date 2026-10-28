@@ -5,7 +5,7 @@
 
 IsoHopper is a Rust toolkit for image inspection, device safety checks and experimental multiboot media. Studio is its Tauri desktop interface.
 
-Public releases are on hold until real USB preparation and operating-system boot tests pass. Current CI packages are development artifacts, not a working multiboot release.
+Public releases are on hold until real USB preparation and operating-system boot tests pass. The first human-test target is the Windows app preparing a USB for an x64 UEFI PC. Current CI packages are development artifacts, not a working multiboot release.
 
 ![IsoHopper Studio: image library, device details and partition plan](docs/screenshots/studio.jpg)
 
@@ -57,8 +57,8 @@ The shared script checks Rust, frontend code, and Chromium at desktop and compac
 
 Validation on 28 October 2026:
 
-- **217 Rust workspace tests, 17 native tests, 34 frontend tests, 41 Python tests and 58 Chromium cases passed locally.** The workspace includes 12 catalogue tests also covered by native tests. Browser bridge tests use mocks; filesystem tests use real temporary files. Hosted results are in [Actions](https://github.com/IsoHopper/isohopper/actions).
-- [Windows storage integration](https://github.com/IsoHopper/isohopper/actions/runs/40706382285) passed retained-source protection, nested-file copies, a 256 MiB VHD write/readback, reattachment, GPT checks and two-volume FAT32 lock/refusal/release checks. This exercised real Windows storage APIs, not USB hardware.
+- **235 Rust workspace tests, 17 native tests, 34 frontend tests, 41 Python tests and 58 Chromium cases passed locally.** The workspace includes 12 catalogue tests also covered by native tests. Browser bridge tests use mocks; filesystem tests use real temporary files. Hosted results are in [Actions](https://github.com/IsoHopper/isohopper/actions).
+- [Windows storage integration](https://github.com/IsoHopper/isohopper/actions/runs/40708807100) passed source-handle protection, nested copies, a 256 MiB VHD write/readback, reattachment, GPT validation, FAT32 volume locks, source-to-disk mapping, source-change rejection and read-only disk refusal. This exercised real Windows storage APIs on disposable virtual disks, not USB hardware.
 - QEMU passed firmware entry, EFI utility handoff/return, and confirmed guest power requests. The next firmware setup screen was not inspected.
 - An Ubuntu 6.8.0-147 kernel reached PID 1 in a tiny diagnostic initramfs and shut down cleanly. With disposable Secure Boot keys, its signed unified kernel image booted; unsigned, tampered and revoked copies were refused. The smaller EFI test utility passed the same four cases.
 
