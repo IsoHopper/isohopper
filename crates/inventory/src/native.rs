@@ -18,6 +18,7 @@ fn allowed(program: &str, args: &[&str]) -> bool {
             && (args == windows::ARGS
                 || args == crate::windows_encryption::ARGS
                 || args == crate::windows_pagefiles::ARGS
+                || args == crate::windows_labels::ARGS
                 || args == crate::windows_pools::ARGS))
 }
 

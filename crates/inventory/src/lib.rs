@@ -10,6 +10,7 @@ mod macos;
 mod native;
 pub mod windows;
 pub mod windows_encryption;
+pub mod windows_labels;
 pub mod windows_pagefiles;
 pub mod windows_pools;
 pub use native::NativeCommandRunner;

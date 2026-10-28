@@ -93,7 +93,8 @@ jobs:
           failed=0
           for test_name in \
             windows_encryption::tests::windows_projects_bitlocker_methods_without_inventing_success \
-            windows::projection_tests::windows_projects_typed_disk_evidence_from_controlled_cim; do
+            windows::projection_tests::windows_projects_typed_disk_evidence_from_controlled_cim \
+            windows_labels::tests::windows_projects_volume_labels_from_controlled_records; do
             if cargo +1.98.0 test --locked -p isohopper-inventory --lib "$test_name" -- --exact --nocapture > projection.log 2>&1; then
               cat projection.log
             else
@@ -230,6 +231,7 @@ jobs:
           evidence = [
               'OWNED_COORDINATOR_OK stage_host_bound=true confirmation=true cm_write_handoff=true persisted_raw_sha256=true nested_files=true physical_target=false',
               'OWNED_STAGE_SEALED_OK nested_files=4 persisted=true raw_sha256=true engine_regions=true physical_write=false',
+              'OWNED_EMPTY_STAGE_OK sources=0 exfat=true persisted_raw_sha256=true physical_write=false',
           ]
           if not all(line in text for line in evidence):
               raise SystemExit('Expected production staging evidence is missing')

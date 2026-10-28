@@ -12,6 +12,7 @@ use std::{
 pub struct TargetSelection {
     pub selection_token: String,
     pub display_id: String,
+    pub volume_labels: Option<Vec<String>>,
     pub disk: WindowsDiskRecord,
 }
 struct Selection {
@@ -32,6 +33,10 @@ pub fn token() -> Result<String, String> {
 #[cfg(windows)]
 pub fn refresh() -> Result<Vec<TargetSelection>, String> {
     let evidence = isohopper_inventory::windows::collect_evidence().map_err(|e| e.to_string())?;
+    let labels = isohopper_inventory::windows_labels::collect_with(
+        &isohopper_inventory::NativeCommandRunner,
+    )
+    .ok();
     let mut next = BTreeMap::new();
     let mut report = Vec::new();
     for disk in evidence.disks {
@@ -58,6 +63,9 @@ pub fn refresh() -> Result<Vec<TargetSelection>, String> {
         report.push(TargetSelection {
             selection_token,
             display_id: format!(r"\\.\PhysicalDrive{}", disk.number),
+            volume_labels: labels
+                .as_ref()
+                .map(|labels| labels.get(&disk.number).cloned().unwrap_or_default()),
             disk,
         });
     }
