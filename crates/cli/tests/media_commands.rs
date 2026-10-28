@@ -49,7 +49,138 @@ fn efi() -> Vec<u8> {
     data[148..150].copy_from_slice(&240u16.to_le_bytes());
     data[152..154].copy_from_slice(&0x20bu16.to_le_bytes());
     data[220..222].copy_from_slice(&10u16.to_le_bytes());
+    data[150..152].copy_from_slice(&0x22u16.to_le_bytes());
+    data[168..172].copy_from_slice(&448u32.to_le_bytes());
+    data[184..188].copy_from_slice(&32u32.to_le_bytes());
+    data[188..192].copy_from_slice(&32u32.to_le_bytes());
+    data[208..212].copy_from_slice(&512u32.to_le_bytes());
+    data[212..216].copy_from_slice(&448u32.to_le_bytes());
+    data[260..264].copy_from_slice(&16u32.to_le_bytes());
+    data[400..404].copy_from_slice(&64u32.to_le_bytes());
+    data[404..408].copy_from_slice(&448u32.to_le_bytes());
+    data[408..412].copy_from_slice(&64u32.to_le_bytes());
+    data[412..416].copy_from_slice(&448u32.to_le_bytes());
+    data[428..432].copy_from_slice(&0x6000_0020u32.to_le_bytes());
     data
+}
+
+#[test]
+fn utility_image_cli_verifies_exact_bytes_without_claiming_authentication() {
+    let directory = tempfile::tempdir().unwrap();
+    let image = directory.path().join("utility.img");
+    let launcher = directory.path().join("launcher.efi");
+    let utility = directory.path().join("diagnostic.efi");
+    fs::write(&launcher, efi()).unwrap();
+    let mut tool = efi();
+    tool[449] = 0x55;
+    fs::write(&utility, &tool).unwrap();
+    let create = json(&cli(&[
+        "image",
+        "create",
+        image.to_str().unwrap(),
+        "--size-mib",
+        "256",
+        "--efi",
+        launcher.to_str().unwrap(),
+        "--utility",
+        utility.to_str().unwrap(),
+    ]));
+    assert_eq!(create["status"], "firmware-test-only");
+    assert_eq!(create["utility"]["boot_path"], "\\IHUTIL.EFI");
+    assert_eq!(create["utility"]["signature_verified"], false);
+    let verified = json(&cli(&[
+        "image",
+        "verify",
+        image.to_str().unwrap(),
+        "--efi",
+        launcher.to_str().unwrap(),
+        "--utility",
+        utility.to_str().unwrap(),
+    ]));
+    assert_eq!(verified["secure_boot_verified"], false);
+    assert_eq!(verified["firmware_boot_tested"], false);
+    tool[449] ^= 1;
+    fs::write(&utility, tool).unwrap();
+    let wrong = cli(&[
+        "image",
+        "verify",
+        image.to_str().unwrap(),
+        "--efi",
+        launcher.to_str().unwrap(),
+        "--utility",
+        utility.to_str().unwrap(),
+    ]);
+    assert!(!wrong.status.success());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("mismatch"));
+}
+
+#[test]
+fn utility_requires_launcher_and_bounded_regular_input_before_creation() {
+    let directory = tempfile::tempdir().unwrap();
+    let image = directory.path().join("utility.img");
+    let launcher = directory.path().join("launcher.efi");
+    let utility = directory.path().join("bad.efi");
+    fs::write(&launcher, efi()).unwrap();
+    fs::write(&utility, b"not an EFI application").unwrap();
+    let no_launcher = cli(&[
+        "image",
+        "create",
+        image.to_str().unwrap(),
+        "--size-mib",
+        "256",
+        "--utility",
+        utility.to_str().unwrap(),
+    ]);
+    assert_eq!(no_launcher.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&no_launcher.stderr).contains("--efi"));
+    let malformed = cli(&[
+        "image",
+        "create",
+        image.to_str().unwrap(),
+        "--size-mib",
+        "256",
+        "--efi",
+        launcher.to_str().unwrap(),
+        "--utility",
+        utility.to_str().unwrap(),
+    ]);
+    assert!(String::from_utf8_lossy(&malformed.stderr).contains("DOS header"));
+    assert!(!image.exists());
+    fs::File::create(&utility)
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+    let oversized = cli(&[
+        "image",
+        "create",
+        image.to_str().unwrap(),
+        "--size-mib",
+        "256",
+        "--efi",
+        launcher.to_str().unwrap(),
+        "--utility",
+        utility.to_str().unwrap(),
+    ]);
+    assert!(String::from_utf8_lossy(&oversized.stderr).contains("exceeds"));
+    assert!(!image.exists());
+    #[cfg(unix)]
+    {
+        fs::remove_file(&utility).unwrap();
+        std::os::unix::fs::symlink(&launcher, &utility).unwrap();
+        let symlink = cli(&[
+            "image",
+            "create",
+            image.to_str().unwrap(),
+            "--size-mib",
+            "256",
+            "--efi",
+            launcher.to_str().unwrap(),
+            "--utility",
+            utility.to_str().unwrap(),
+        ]);
+        assert!(String::from_utf8_lossy(&symlink.stderr).contains("regular file"));
+        assert!(!image.exists());
+    }
 }
 
 #[test]

@@ -125,15 +125,77 @@ pub fn validate_efi_x64(payload: &[u8]) -> Result<(), FatError> {
     let section_end = optional_end
         .checked_add(sections * 40)
         .ok_or_else(|| bad("section table overflow"))?;
-    if sections == 0 || section_end > payload.len() {
+    if sections == 0 || sections > 96 || section_end > payload.len() {
         return Err(bad("missing or truncated section table"));
     }
+    let image_size = u64::from(read32(&payload[coff_end + 56..coff_end + 60]));
+    let header_size = u64::from(read32(&payload[coff_end + 60..coff_end + 64]));
+    let entry = u64::from(read32(&payload[coff_end + 16..coff_end + 20]));
+    let directories = u64::from(read32(&payload[coff_end + 108..coff_end + 112]));
+    let section_alignment = u64::from(read32(&payload[coff_end + 32..coff_end + 36]));
+    let file_alignment = u64::from(read32(&payload[coff_end + 36..coff_end + 40]));
+    if !file_alignment.is_power_of_two()
+        || !section_alignment.is_power_of_two()
+        || file_alignment > 65536
+        || section_alignment < file_alignment
+        || (section_alignment < 4096 && section_alignment != file_alignment)
+        || (section_alignment >= 4096 && file_alignment < 512)
+        || !image_size.is_multiple_of(section_alignment)
+        || !header_size.is_multiple_of(file_alignment)
+    {
+        return Err(bad("invalid PE section or file alignment"));
+    }
+    if read16(&payload[pe + 22..pe + 24]) & 2 == 0
+        || header_size < section_end as u64
+        || header_size > payload.len() as u64
+        || image_size < header_size
+        || directories * 8 > (optional_len - 112) as u64
+    {
+        return Err(bad("invalid executable, image, header, or directory size"));
+    }
+    let mut entry_in_code = false;
+    let mut raw_ranges = Vec::new();
+    let mut virtual_ranges = Vec::new();
     for section in payload[optional_end..section_end].as_chunks::<40>().0 {
         let size = u64::from(read32(&section[16..20]));
         let start = u64::from(read32(&section[20..24]));
-        if size != 0 && start + size > payload.len() as u64 {
-            return Err(bad("section contents exceed payload"));
+        let address = u64::from(read32(&section[12..16]));
+        let mapped = size.max(u64::from(read32(&section[8..12])));
+        if size != 0 {
+            if start < header_size
+                || start + size > payload.len() as u64
+                || !start.is_multiple_of(file_alignment)
+                || !size.is_multiple_of(file_alignment)
+                || (section_alignment < 4096 && start != address)
+            {
+                return Err(bad("section contents overlap headers or exceed payload"));
+            }
+            raw_ranges.push((start, start + size));
         }
+        if mapped != 0 {
+            if address < header_size
+                || address + mapped > image_size
+                || !address.is_multiple_of(section_alignment)
+            {
+                return Err(bad("section virtual extent exceeds image"));
+            }
+            virtual_ranges.push((address, address + mapped));
+        }
+        if entry >= address && entry < address + size && read32(&section[36..40]) & 0x2000_0000 != 0
+        {
+            entry_in_code = true;
+        }
+    }
+    for ranges in [&mut raw_ranges, &mut virtual_ranges] {
+        ranges.sort_unstable();
+        if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            return Err(bad("section extents overlap"));
+        }
+    }
+    if entry == 0 || !entry_in_code {
+        return Err(bad(
+            "entry point is outside file-backed executable sections",
+        ));
     }
     Ok(())
 }
@@ -146,6 +208,7 @@ pub(crate) struct Volume {
     id: u32,
     geometry: Geometry,
     power_mask: u8,
+    utility_clusters: u32,
 }
 
 fn power_bytes(mask: u8) -> Result<[u8; 8], FatError> {
@@ -165,10 +228,18 @@ fn decode_power(bytes: &[u8; 8]) -> Result<u8, FatError> {
     Ok(bytes[5])
 }
 
-fn planned_volumes(p: &Layout, payload: &[u8], power_mask: u8) -> Result<[Volume; 2], FatError> {
+fn planned_volumes(
+    p: &Layout,
+    payload: &[u8],
+    power_mask: u8,
+    utility: Option<&[u8]>,
+) -> Result<[Volume; 2], FatError> {
     power_bytes(power_mask)?;
     layout::validate(p)?;
     validate_efi_x64(payload)?;
+    if let Some(utility) = utility {
+        validate_efi_x64(utility)?;
+    }
     let make = |part: &Partition| -> Result<Volume, FatError> {
         let bytes = (part.end_lba - part.start_lba + 1) * p.logical_sector_size;
         let offset = part.start_lba * p.logical_sector_size;
@@ -180,20 +251,38 @@ fn planned_volumes(p: &Layout, payload: &[u8], power_mask: u8) -> Result<[Volume
             .as_bytes()
             .try_into()
             .map_err(|_| FatError::Geometry("boot label must be 11 bytes".into()))?;
+        let geometry = geometry(bytes, p.logical_sector_size, payload.len() as u64)?;
+        let utility_clusters = utility.map_or(0, |bytes| {
+            (bytes.len() as u64).div_ceil(p.logical_sector_size)
+        });
+        if utility.is_some_and(|bytes| bytes.len() > u32::MAX as usize)
+            || u64::from(geometry.file_clusters) + utility_clusters + u64::from(METADATA_CLUSTERS)
+                > u64::from(geometry.data_clusters)
+        {
+            return Err(FatError::Geometry(
+                "launcher and utility do not fit boot volume".into(),
+            ));
+        }
         Ok(Volume {
             offset,
             start_lba: part.start_lba,
             label,
             id: 0,
-            geometry: geometry(bytes, p.logical_sector_size, payload.len() as u64)?,
+            geometry,
             power_mask,
+            utility_clusters: utility_clusters as u32,
         })
     };
     Ok([make(&p.partitions[1])?, make(&p.partitions[2])?])
 }
 
-pub(crate) fn prepare(p: &Layout, payload: &[u8], power_mask: u8) -> Result<[Volume; 2], FatError> {
-    let mut volumes = planned_volumes(p, payload, power_mask)?;
+pub(crate) fn prepare(
+    p: &Layout,
+    payload: &[u8],
+    power_mask: u8,
+    utility: Option<&[u8]>,
+) -> Result<[Volume; 2], FatError> {
+    let mut volumes = planned_volumes(p, payload, power_mask, utility)?;
     let mut ids = [0; 8];
     getrandom::fill(&mut ids).map_err(|e| FatError::Entropy(e.to_string()))?;
     volumes[0].id = read32(&ids[..4]);
@@ -208,9 +297,10 @@ pub(crate) fn write_volumes<W: Write + Seek>(
     file: &mut W,
     volumes: &[Volume; 2],
     payload: &[u8],
+    utility: Option<&[u8]>,
 ) -> Result<(), FatError> {
     for volume in volumes {
-        visit_regions(volume, payload, |offset, bytes| {
+        visit_regions(volume, payload, utility, |offset, bytes| {
             file.seek(SeekFrom::Start(offset))?;
             file.write_all(bytes)?;
             Ok(())
@@ -223,9 +313,10 @@ pub(crate) fn verify_volumes<R: Read + Seek>(
     file: &mut R,
     volumes: &[Volume; 2],
     payload: &[u8],
+    utility: Option<&[u8]>,
 ) -> Result<(), FatError> {
     for volume in volumes {
-        visit_regions(volume, payload, |offset, bytes| {
+        visit_regions(volume, payload, utility, |offset, bytes| {
             let mut actual = vec![0; bytes.len()];
             file.seek(SeekFrom::Start(offset))?;
             file.read_exact(&mut actual)?;
@@ -245,8 +336,9 @@ pub(crate) fn verify_existing<R: Read + Seek>(
     file: &mut R,
     p: &Layout,
     payload: &[u8],
+    utility: Option<&[u8]>,
 ) -> Result<(), FatError> {
-    let mut volumes = planned_volumes(p, payload, DEFAULT_POWER_MASK)?;
+    let mut volumes = planned_volumes(p, payload, DEFAULT_POWER_MASK, utility)?;
     for volume in &mut volumes {
         let mut id = [0; 4];
         file.seek(SeekFrom::Start(volume.offset + 67))?;
@@ -265,12 +357,13 @@ pub(crate) fn verify_existing<R: Read + Seek>(
             "boot slots have different power preferences".into(),
         ));
     }
-    verify_volumes(file, &volumes, payload)
+    verify_volumes(file, &volumes, payload, utility)
 }
 
 fn visit_regions(
     v: &Volume,
     payload: &[u8],
+    utility: Option<&[u8]>,
     mut visit: impl FnMut(u64, &[u8]) -> Result<(), FatError>,
 ) -> Result<(), FatError> {
     let g = &v.geometry;
@@ -283,7 +376,7 @@ fn visit_regions(
         visit(v.offset + relative, bytes)
     };
     let boot = boot_sector(v);
-    let info = fsinfo(g);
+    let info = fsinfo(g, v.utility_clusters);
     let mut reserved = vec![0; RESERVED as usize * sector];
     for at in [0, 6] {
         reserved[at * sector..(at + 1) * sector].copy_from_slice(&boot);
@@ -298,17 +391,22 @@ fn visit_regions(
     for cluster in 2..PAYLOAD_CLUSTER {
         put32(&mut table, cluster as usize * 4, END_OF_CHAIN);
     }
-    for i in 0..g.file_clusters {
-        let cluster = PAYLOAD_CLUSTER + i;
-        put32(
-            &mut table,
-            cluster as usize * 4,
-            if i + 1 == g.file_clusters {
-                END_OF_CHAIN
-            } else {
-                cluster + 1
-            },
-        );
+    for (start, count) in [
+        (PAYLOAD_CLUSTER, g.file_clusters),
+        (PAYLOAD_CLUSTER + g.file_clusters, v.utility_clusters),
+    ] {
+        for i in 0..count {
+            let cluster = start + i;
+            put32(
+                &mut table,
+                cluster as usize * 4,
+                if i + 1 == count {
+                    END_OF_CHAIN
+                } else {
+                    cluster + 1
+                },
+            );
+        }
     }
     for i in 0..2 {
         checked(
@@ -320,6 +418,15 @@ fn visit_regions(
     directory_entry(&mut root[..32], &v.label, 0x08, 0, 0);
     directory_entry(&mut root[32..64], b"EFI        ", 0x10, 3, 0);
     directory_entry(&mut root[64..96], b"IHPOWER CFG", 0x20, POWER_CLUSTER, 8);
+    if let Some(utility) = utility {
+        directory_entry(
+            &mut root[96..128],
+            b"IHUTIL  EFI",
+            0x20,
+            PAYLOAD_CLUSTER + g.file_clusters,
+            utility.len() as u32,
+        );
+    }
     let mut efi = vec![0; sector];
     directory_entry(&mut efi[..32], b".          ", 0x10, 3, 0);
     directory_entry(&mut efi[32..64], b"..         ", 0x10, 0, 0);
@@ -348,6 +455,17 @@ fn visit_regions(
             data + (u64::from(PAYLOAD_CLUSTER - 2) + i as u64) * g.sector_size,
             &block,
         )?;
+    }
+    if let Some(utility) = utility {
+        for (i, chunk) in utility.chunks(sector).enumerate() {
+            block.fill(0);
+            block[..chunk.len()].copy_from_slice(chunk);
+            checked(
+                data + (u64::from(PAYLOAD_CLUSTER - 2 + g.file_clusters) + i as u64)
+                    * g.sector_size,
+                &block,
+            )?;
+        }
     }
     Ok(())
 }
@@ -382,11 +500,11 @@ fn boot_sector(v: &Volume) -> Vec<u8> {
     b
 }
 
-fn fsinfo(g: &Geometry) -> Vec<u8> {
+fn fsinfo(g: &Geometry, utility_clusters: u32) -> Vec<u8> {
     let mut b = vec![0; g.sector_size as usize];
     put32(&mut b, 0, 0x4161_5252);
     put32(&mut b, 484, 0x6141_7272);
-    let free = g.data_clusters - METADATA_CLUSTERS - g.file_clusters;
+    let free = g.data_clusters - METADATA_CLUSTERS - g.file_clusters - utility_clusters;
     put32(&mut b, 488, free);
     put32(
         &mut b,
@@ -394,7 +512,7 @@ fn fsinfo(g: &Geometry) -> Vec<u8> {
         if free == 0 {
             u32::MAX
         } else {
-            PAYLOAD_CLUSTER + g.file_clusters
+            PAYLOAD_CLUSTER + g.file_clusters + utility_clusters
         },
     );
     put32(&mut b, 508, 0xaa55_0000);
@@ -491,6 +609,7 @@ mod tests {
             id: part.number,
             geometry: geometry(64 << 20, 512, payload.len() as u64).unwrap(),
             power_mask: DEFAULT_POWER_MASK,
+            utility_clusters: 0,
         };
         let volumes = [volume(&p.partitions[1]), volume(&p.partitions[2])];
         for operation in ["seek", "write", "short", "read"] {
@@ -498,7 +617,7 @@ mod tests {
                 let mut file = tempfile::tempfile().unwrap();
                 file.set_len(p.size_bytes).unwrap();
                 if operation == "read" {
-                    write_volumes(&mut file, &volumes, &payload).unwrap();
+                    write_volumes(&mut file, &volumes, &payload, None).unwrap();
                 }
                 let mut faulty = FaultIo {
                     file,
@@ -507,9 +626,9 @@ mod tests {
                     calls: 0,
                 };
                 let result = if operation == "read" {
-                    verify_volumes(&mut faulty, &volumes, &payload)
+                    verify_volumes(&mut faulty, &volumes, &payload, None)
                 } else {
-                    write_volumes(&mut faulty, &volumes, &payload)
+                    write_volumes(&mut faulty, &volumes, &payload, None)
                 };
                 assert!(
                     matches!(result, Err(FatError::Io(_))),

@@ -25,6 +25,18 @@ fn efi() -> Vec<u8> {
     bytes[148..150].copy_from_slice(&240u16.to_le_bytes());
     bytes[152..154].copy_from_slice(&0x20bu16.to_le_bytes());
     bytes[220..222].copy_from_slice(&10u16.to_le_bytes());
+    bytes[150..152].copy_from_slice(&0x22u16.to_le_bytes());
+    bytes[168..172].copy_from_slice(&448u32.to_le_bytes());
+    bytes[184..188].copy_from_slice(&32u32.to_le_bytes());
+    bytes[188..192].copy_from_slice(&32u32.to_le_bytes());
+    bytes[208..212].copy_from_slice(&512u32.to_le_bytes());
+    bytes[212..216].copy_from_slice(&448u32.to_le_bytes());
+    bytes[260..264].copy_from_slice(&16u32.to_le_bytes());
+    bytes[400..404].copy_from_slice(&64u32.to_le_bytes());
+    bytes[404..408].copy_from_slice(&448u32.to_le_bytes());
+    bytes[408..412].copy_from_slice(&64u32.to_le_bytes());
+    bytes[412..416].copy_from_slice(&448u32.to_le_bytes());
+    bytes[428..432].copy_from_slice(&0x6000_0020u32.to_le_bytes());
     bytes
 }
 

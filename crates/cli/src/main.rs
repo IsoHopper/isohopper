@@ -103,6 +103,9 @@ enum ImageCommand {
         /// Put this x64 EFI application into FAT32 boot slots A and B (64 MiB input limit).
         #[arg(long)]
         efi: Option<PathBuf>,
+        /// Embed a user-supplied x64 EFI utility; firmware controls permission to execute it.
+        #[arg(long, requires = "efi")]
+        utility: Option<PathBuf>,
         /// Read firmware power preferences from YAML/TOML into both EFI test slots.
         #[arg(long, requires = "efi")]
         config: Option<PathBuf>,
@@ -112,6 +115,9 @@ enum ImageCommand {
         /// Also verify both FAT32 boot slots against this exact x64 EFI payload.
         #[arg(long)]
         efi: Option<PathBuf>,
+        /// Verify the exact embedded utility as well as the launcher.
+        #[arg(long, requires = "efi")]
+        utility: Option<PathBuf>,
     },
 }
 #[derive(Subcommand)]
@@ -367,6 +373,7 @@ fn create_image(
     legacy: bool,
     efi: Option<&Path>,
     config: Option<&Path>,
+    utility: Option<&Path>,
 ) -> Result<(), String> {
     let layout = plan(size_mib, sector_size, legacy)?;
     if let Some(efi) = efi {
@@ -383,10 +390,18 @@ fn create_image(
             | (u8::from(power.shutdown) << 1)
             | (u8::from(power.firmware_setup) << 2);
         let payload = read_binary(efi, 64 * 1024 * 1024)?;
-        virtualdisk::create_bootable_configured(path, &layout, &payload, power_mask)
+        if let Some(utility) = utility {
+            let utility = read_binary(utility, 64 * 1024 * 1024)?;
+            virtualdisk::create_bootable_with_utility(
+                path, &layout, &payload, power_mask, &utility,
+            )
             .map_err(|error| error.to_string())?;
+        } else {
+            virtualdisk::create_bootable_configured(path, &layout, &payload, power_mask)
+                .map_err(|error| error.to_string())?;
+        }
         print_json(
-            &serde_json::json!({"path":path, "efi":efi, "status":"firmware-test-only", "verification":"gpt-and-fat32-payload", "boot_slots":{"A":"fat32","B":"fat32"}, "data_partition":"unformatted", "firmware_boot_tested":false, "secure_boot_verified":false, "power_mask":power_mask, "power":power}),
+            &serde_json::json!({"path":path, "efi":efi, "utility": utility.map(utility_evidence), "status":"firmware-test-only", "verification":"gpt-and-fat32-payload", "boot_slots":{"A":"fat32","B":"fat32"}, "data_partition":"unformatted", "firmware_boot_tested":false, "secure_boot_verified":false, "power_mask":power_mask, "power":power}),
         )
     } else {
         virtualdisk::create(path, &layout).map_err(|error| error.to_string())?;
@@ -395,12 +410,22 @@ fn create_image(
         )
     }
 }
-fn verify_image(path: &Path, efi: Option<&Path>) -> Result<(), String> {
+fn utility_evidence(path: &Path) -> serde_json::Value {
+    serde_json::json!({"source":path,"boot_path":"\\IHUTIL.EFI","signature_verified":false,"execution_policy":"firmware-load-image"})
+}
+
+fn verify_image(path: &Path, efi: Option<&Path>, utility: Option<&Path>) -> Result<(), String> {
     if let Some(efi) = efi {
         let payload = read_binary(efi, 64 * 1024 * 1024)?;
-        virtualdisk::verify_bootable(path, &payload).map_err(|error| error.to_string())?;
+        if let Some(utility) = utility {
+            let utility = read_binary(utility, 64 * 1024 * 1024)?;
+            virtualdisk::verify_bootable_with_utility(path, &payload, &utility)
+                .map_err(|error| error.to_string())?;
+        } else {
+            virtualdisk::verify_bootable(path, &payload).map_err(|error| error.to_string())?;
+        }
         print_json(
-            &serde_json::json!({"path":path, "efi":efi, "status":"firmware-test-only", "verification":"gpt-and-fat32-payload", "boot_slots":{"A":"fat32","B":"fat32"}, "data_partition":"not-checked", "firmware_boot_tested":false, "secure_boot_verified":false}),
+            &serde_json::json!({"path":path, "efi":efi, "utility":utility.map(utility_evidence), "status":"firmware-test-only", "verification":"gpt-and-fat32-payload", "boot_slots":{"A":"fat32","B":"fat32"}, "data_partition":"not-checked", "firmware_boot_tested":false, "secure_boot_verified":false}),
         )
     } else {
         virtualdisk::verify(path).map_err(|error| error.to_string())?;
@@ -430,8 +455,8 @@ fn run(cli: Cli) -> Result<(), (u8, String)> {
         Command::Manifest { command } => match command { ManifestCommand::Verify { path, signature, public_key } => verify_manifest(&path, &signature, &public_key) },
         Command::Plan { size_mib, sector_size, legacy } => plan(size_mib, sector_size, legacy).and_then(|layout| print_json(&layout)),
         Command::Image { command } => match command {
-            ImageCommand::Create { path, size_mib, sector_size, legacy, efi, config } => create_image(&path, size_mib, sector_size, legacy, efi.as_deref(), config.as_deref()),
-            ImageCommand::Verify { path, efi } => verify_image(&path, efi.as_deref()),
+            ImageCommand::Create { path, size_mib, sector_size, legacy, efi, config, utility } => create_image(&path, size_mib, sector_size, legacy, efi.as_deref(), config.as_deref(), utility.as_deref()),
+            ImageCommand::Verify { path, efi, utility } => verify_image(&path, efi.as_deref(), utility.as_deref()),
         },
         Command::Verify { path, algorithm, expected } => isohopper_config::verify::file(&path, &algorithm, expected.as_deref()).map_err(|error| error.to_string()).and_then(|value| print_json(&value)),
         Command::Config { command } => match command {

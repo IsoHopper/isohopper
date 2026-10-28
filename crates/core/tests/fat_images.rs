@@ -18,6 +18,18 @@ fn payload(size: usize) -> Vec<u8> {
     b[148..150].copy_from_slice(&240_u16.to_le_bytes());
     b[152..154].copy_from_slice(&0x20b_u16.to_le_bytes());
     b[220..222].copy_from_slice(&10_u16.to_le_bytes());
+    b[150..152].copy_from_slice(&0x22_u16.to_le_bytes());
+    b[168..172].copy_from_slice(&448_u32.to_le_bytes());
+    b[184..188].copy_from_slice(&32_u32.to_le_bytes());
+    b[188..192].copy_from_slice(&32_u32.to_le_bytes());
+    b[208..212].copy_from_slice(&512_u32.to_le_bytes());
+    b[212..216].copy_from_slice(&448_u32.to_le_bytes());
+    b[260..264].copy_from_slice(&16_u32.to_le_bytes());
+    b[400..404].copy_from_slice(&64_u32.to_le_bytes());
+    b[404..408].copy_from_slice(&448_u32.to_le_bytes());
+    b[408..412].copy_from_slice(&64_u32.to_le_bytes());
+    b[412..416].copy_from_slice(&448_u32.to_le_bytes());
+    b[428..432].copy_from_slice(&0x6000_0020_u32.to_le_bytes());
     b
 }
 fn read(f: &mut File, offset: u64, size: usize) -> Vec<u8> {

@@ -12,6 +12,8 @@ use thiserror::Error;
 
 mod gpt;
 
+type BootImage<'a> = (&'a [crate::fat::Volume; 2], &'a [u8], Option<&'a [u8]>);
+
 #[derive(Debug, Error)]
 pub enum VirtualDiskError {
     #[error(transparent)]
@@ -45,20 +47,53 @@ pub fn create_bootable_configured(
     payload: &[u8],
     power_mask: u8,
 ) -> Result<(), VirtualDiskError> {
-    let volumes = crate::fat::prepare(p, payload, power_mask)?;
-    create_image(path.as_ref(), p, Some((&volumes, payload)))
+    let volumes = crate::fat::prepare(p, payload, power_mask, None)?;
+    create_image(path.as_ref(), p, Some((&volumes, payload, None)))
+}
+
+/// Also embed a caller-supplied EFI utility at IHUTIL.EFI in both boot slots.
+/// Structural validation is not publisher authentication; firmware controls
+/// whether the utility may execute under its Secure Boot policy.
+pub fn create_bootable_with_utility(
+    path: impl AsRef<Path>,
+    p: &Layout,
+    payload: &[u8],
+    power_mask: u8,
+    utility: &[u8],
+) -> Result<(), VirtualDiskError> {
+    let volumes = crate::fat::prepare(p, payload, power_mask, Some(utility))?;
+    create_image(path.as_ref(), p, Some((&volumes, payload, Some(utility))))
 }
 
 /// Verify GPT and every initialized FAT32 byte against the expected payload.
 pub fn verify_bootable(path: impl AsRef<Path>, payload: &[u8]) -> Result<(), VirtualDiskError> {
+    verify_bootable_inner(path.as_ref(), payload, None)
+}
+
+/// Verify both boot slots against the exact expected launcher and utility.
+pub fn verify_bootable_with_utility(
+    path: impl AsRef<Path>,
+    payload: &[u8],
+    utility: &[u8],
+) -> Result<(), VirtualDiskError> {
+    verify_bootable_inner(path.as_ref(), payload, Some(utility))
+}
+
+fn verify_bootable_inner(
+    path: &Path,
+    payload: &[u8],
+    utility: Option<&[u8]>,
+) -> Result<(), VirtualDiskError> {
     crate::fat::validate_efi_x64(payload)?;
-    let path = path.as_ref();
+    if let Some(utility) = utility {
+        crate::fat::validate_efi_x64(utility)?;
+    }
     let mut file = open_regular_read(path)?;
     let before = file.metadata()?;
     let identity = Handle::from_file(file.try_clone()?)?;
     check_identity(path, &identity, before.len())?;
     let p = gpt::inspect_reader(&mut file, before.len())?;
-    crate::fat::verify_existing(&mut file, &p, payload)?;
+    crate::fat::verify_existing(&mut file, &p, payload, utility)?;
     let after = file.metadata()?;
     if after.len() != before.len() || after.modified()? != before.modified()? {
         return Err(invalid("image changed during verification"));
@@ -75,7 +110,7 @@ pub fn create(path: impl AsRef<Path>, p: &Layout) -> Result<(), VirtualDiskError
 fn create_image(
     path: &Path,
     p: &Layout,
-    boot: Option<(&[crate::fat::Volume; 2], &[u8])>,
+    boot: Option<BootImage<'_>>,
 ) -> Result<(), VirtualDiskError> {
     layout::validate(p)?;
     let mut options = OpenOptions::new();
@@ -91,11 +126,11 @@ fn create_image(
     }
     let identity = Handle::from_file(file.try_clone()?)?;
     populate(&mut file, p)?;
-    if let Some((volumes, payload)) = boot {
-        crate::fat::write_volumes(&mut file, volumes, payload)?;
+    if let Some((volumes, payload, utility)) = boot {
+        crate::fat::write_volumes(&mut file, volumes, payload, utility)?;
         file.sync_all()?;
         gpt::verify_reader(&mut file, p.size_bytes)?;
-        crate::fat::verify_volumes(&mut file, volumes, payload)?;
+        crate::fat::verify_volumes(&mut file, volumes, payload, utility)?;
     }
     check_identity(path, &identity, p.size_bytes)
 }
