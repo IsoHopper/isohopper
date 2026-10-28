@@ -109,7 +109,66 @@ mod tests {
         );
         let installation = Arc::new(installation);
         observe_installed_backing(&installation);
+        installed_storage_excludes_its_actual_extents(&installation);
         installed_processes_keep_their_expected_roles(&installation);
+    }
+
+    fn installed_storage_excludes_its_actual_extents(installation: &Arc<MachineInstallation>) {
+        use isohopper_helper::{
+            windows_protected::{ImageRole, ProtectedError, bind_installed_file},
+            windows_sources::SourceError,
+            writer::{DeviceSnapshot, Geometry},
+        };
+        // Synthetic nonmatching selector, not a real target observation. This
+        // read-only test opens no target disk and cannot authorize preparation.
+        let candidate = DeviceSnapshot {
+            device_number: u32::MAX,
+            serial: "synthetic-installed-storage-test".into(),
+            device_id: None,
+            bus_type: 0,
+            geometry: Geometry {
+                size_bytes: 64 * 1024 * 1024,
+                logical_sector_size: 512,
+                physical_sector_size: 512,
+            },
+        };
+        for (installed_role, protected_role) in [
+            (InstalledRole::Studio, ImageRole::Caller),
+            (InstalledRole::Helper, ImageRole::Helper),
+        ] {
+            installation.require_inline_backing(installed_role).unwrap();
+            let before = retained_digest(installation.image(installed_role));
+            let binding =
+                bind_installed_file(Arc::clone(installation), installed_role, &candidate).unwrap();
+            assert_eq!(binding.role(), protected_role);
+            assert!(!binding.extents().is_empty());
+            assert_eq!(before, retained_digest(binding.source_file()));
+            binding.revalidate(&candidate).unwrap();
+            for extent in binding.extents() {
+                let overlapping = DeviceSnapshot {
+                    device_number: extent.disk_number,
+                    ..candidate.clone()
+                };
+                let refusal =
+                    bind_installed_file(Arc::clone(installation), installed_role, &overlapping);
+                assert!(matches!(
+                    refusal,
+                    Err(ProtectedError::Source(SourceError::OnTarget { ref extents }))
+                        if extents == binding.extents()
+                ));
+                assert!(matches!(
+                    binding.revalidate(&overlapping),
+                    Err(ProtectedError::Source(SourceError::Changed))
+                ));
+            }
+            binding.revalidate(&candidate).unwrap();
+            installation.revalidate().unwrap();
+            println!(
+                "INSTALLED_STORAGE_MAPPING role={protected_role:?}; extents={}; overlap_refusals={}",
+                binding.extents().len(),
+                binding.extents().len()
+            );
+        }
     }
 
     fn observe_installed_backing(installation: &MachineInstallation) {

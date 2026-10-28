@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::{state::*, *};
 use crate::{
+    windows_installation::{InstalledRole, MachineInstallation},
     windows_sources::{self, SourceBinding},
     writer::DeviceSnapshot,
 };
@@ -8,6 +9,7 @@ use std::{
     fs::{File, OpenOptions},
     io,
     os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+    sync::Arc,
 };
 use windows_sys::Win32::{
     Storage::FileSystem::{
@@ -61,6 +63,25 @@ pub unsafe fn bind_file(
     // SAFETY: the caller supplies the same live synchronous readable handle
     // invariant required by bind_source. The binding takes ownership of it.
     let source = unsafe { windows_sources::bind_source(file, target) }?;
+    Ok(ProtectedFileBinding { role, source })
+}
+
+/// Bind only a fixed file from a retained protected machine installation.
+/// WOF inline-backing evidence is checked against its guarded path and original
+/// handle; volume extents and virtual dependencies use the retained source.
+/// `target` must be fresh evidence from the caller's retained target handle.
+/// This correlates installed-file storage, not a running process, and grants no
+/// authority to write. Loaded modules and other protected storage are separate.
+pub fn bind_installed_file(
+    installation: Arc<MachineInstallation>,
+    role: InstalledRole,
+    target: &DeviceSnapshot,
+) -> Result<ProtectedFileBinding, ProtectedError> {
+    let source = windows_sources::bind_installed_source(installation, role, target)?;
+    let role = match role {
+        InstalledRole::Studio => ImageRole::Caller,
+        InstalledRole::Helper => ImageRole::Helper,
+    };
     Ok(ProtectedFileBinding { role, source })
 }
 

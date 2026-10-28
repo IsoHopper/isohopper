@@ -37,4 +37,7 @@ mod state;
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
-pub use native::{ProtectedFileBinding, SystemDirectoryBinding, bind_file, bind_system_directory};
+pub use native::{
+    ProtectedFileBinding, SystemDirectoryBinding, bind_file, bind_installed_file,
+    bind_system_directory,
+};

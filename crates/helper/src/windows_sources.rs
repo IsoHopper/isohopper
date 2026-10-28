@@ -33,6 +33,8 @@ pub enum SourceError {
     VirtualDependency,
     #[error("externally backed source files are unsupported")]
     ExternalBacking,
+    #[error("installed source backing evidence is unavailable: {0}")]
+    InstalledBacking(String),
     #[error("retained source, volume mapping, or target evidence changed")]
     Changed,
 }
@@ -40,7 +42,9 @@ pub enum SourceError {
 #[cfg(windows)]
 pub use native::{SourceBinding, bind_source};
 #[cfg(windows)]
-pub(crate) use native::{no_virtual_dependencies, source_guid, volume_extents};
+pub(crate) use native::{
+    bind_installed_source, no_virtual_dependencies, source_guid, volume_extents,
+};
 
 #[cfg(any(windows, test))]
 const MAX_PATH_UNITS: usize = 32_768;

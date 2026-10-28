@@ -31,7 +31,7 @@ use windows_sys::Win32::{
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE,
         FILE_STANDARD_INFO, FILE_TYPE_DISK, FileBasicInfo, FileIdInfo, FileStandardInfo,
         GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW,
-        GetVolumeInformationByHandleW, QueryDosDeviceW, VOLUME_NAME_NT,
+        GetVolumeInformationByHandleW, QueryDosDeviceW, VOLUME_NAME_NT, WofIsExternalFile,
     },
     System::{
         Com::CoTaskMemFree, SystemInformation::GetSystemWindowsDirectoryW,
@@ -387,6 +387,40 @@ impl MachineInstallation {
         }
         self.studio.revalidate()?;
         self.helper.revalidate()
+    }
+
+    /// Require explicit WOF evidence that one fixed installed image is stored
+    /// inline. This path-taking query is only valid within this retained,
+    /// protected fresh installation; it is not a fallback for arbitrary files.
+    /// Both successful and failed queries are bracketed by namespace, ACL,
+    /// original-handle metadata and final-name checks. Administrators remain
+    /// trusted, as for the installation owner; no process or disk is authorized.
+    pub fn require_inline_backing(&self, role: InstalledRole) -> Result<(), String> {
+        self.revalidate()?;
+        let image = self.retained(role);
+        let before = image_metadata(&image.file)?;
+        let name = final_name(&image.file)?;
+        let path = wide(image.path.as_os_str());
+        let mut external = i32::MIN;
+        // SAFETY: only the fixed path held by this protected installation is
+        // passed. Its ancestors and original file remain retained throughout.
+        // The terminated input and BOOL output live through the synchronous
+        // call; all optional provider/detail outputs are null.
+        // https://learn.microsoft.com/windows/win32/api/wofapi/nf-wofapi-wofisexternalfile
+        let hresult = unsafe {
+            WofIsExternalFile(
+                path.as_ptr(),
+                &mut external,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        self.revalidate()?;
+        if image_metadata(&image.file)? != before || final_name(&image.file)? != name {
+            return Err("Installed image changed during backing query".into());
+        }
+        super::backing::require_inline(hresult, external)
     }
 
     /// Validate an application resource directory without ever opening it.

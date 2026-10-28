@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
-use crate::writer::DeviceSnapshot;
+use crate::{
+    windows_installation::{InstalledRole, MachineInstallation},
+    writer::DeviceSnapshot,
+};
 use std::{
     fs::{File, OpenOptions},
     mem::{offset_of, size_of},
     os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
     ptr,
+    sync::Arc,
 };
 use windows_sys::Win32::{
     Foundation::ERROR_VIRTDISK_NOT_VIRTUAL_DISK,
@@ -34,6 +38,33 @@ fn io_error(stage: &'static str, source: io::Error) -> SourceError {
     SourceError::Io { stage, source }
 }
 
+// No caller-selectable bypass: only bind_installed_source can construct the
+// installed mode, and its source is a duplicate of that owner's fixed image.
+enum BackingCheck {
+    FileControl,
+    Installed {
+        installation: Arc<MachineInstallation>,
+        role: InstalledRole,
+    },
+}
+
+impl BackingCheck {
+    fn check(&self, source: &File) -> Result<(), SourceError> {
+        match self {
+            Self::FileControl => no_external_backing(source),
+            Self::Installed { installation, role } => {
+                installation
+                    .require_inline_backing(*role)
+                    .map_err(SourceError::InstalledBacking)?;
+                if file_identity(source)? != file_identity(installation.image(*role))? {
+                    return Err(SourceError::Changed);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Owns the exact source and volume handles used for this mapping.
 /// Records filesystem-reported extents after rejecting VHD/ISO and external
 /// file backing. Storage Spaces/RAID ancestry remains the caller's preflight
@@ -43,6 +74,7 @@ pub struct SourceBinding {
     volume: File,
     mapping: Mapping,
     target: DeviceSnapshot,
+    backing: BackingCheck,
 }
 
 impl SourceBinding {
@@ -68,7 +100,7 @@ impl SourceBinding {
         reject_target(&actual.extents, target.device_number)?;
         // SAFETY: bind_source owns this synchronously opened volume handle.
         unsafe { no_virtual_dependencies(&self.volume)? };
-        no_external_backing(&self.source)?;
+        self.backing.check(&self.source)?;
         unchanged(&actual, &mapping(&self.source, &self.volume)?)
     }
 }
@@ -85,6 +117,41 @@ impl SourceBinding {
 pub unsafe fn bind_source(
     source: File,
     target: &DeviceSnapshot,
+) -> Result<SourceBinding, SourceError> {
+    // SAFETY: unchanged synchronous source contract supplied by this caller.
+    unsafe { bind(source, target, BackingCheck::FileControl) }
+}
+
+/// The only installed-source constructor duplicates a fixed retained image;
+/// no caller handle, path, hash or alternate backing predicate is accepted.
+pub(crate) fn bind_installed_source(
+    installation: Arc<MachineInstallation>,
+    role: InstalledRole,
+    target: &DeviceSnapshot,
+) -> Result<SourceBinding, SourceError> {
+    installation
+        .revalidate()
+        .map_err(SourceError::InstalledBacking)?;
+    let source = installation
+        .image(role)
+        .try_clone()
+        .map_err(|e| io_error("retain installed source", e))?;
+    // SAFETY: MachineInstallation opens this image synchronously read-only.
+    // Duplicating that retained handle preserves its synchronous I/O mode.
+    unsafe {
+        bind(
+            source,
+            target,
+            BackingCheck::Installed { installation, role },
+        )
+    }
+}
+
+// Caller establishes the same synchronous source invariant as bind_source.
+unsafe fn bind(
+    source: File,
+    target: &DeviceSnapshot,
+    backing: BackingCheck,
 ) -> Result<SourceBinding, SourceError> {
     target
         .geometry
@@ -107,13 +174,14 @@ pub unsafe fn bind_source(
     reject_target(&observed.extents, target.device_number)?;
     // SAFETY: volume was opened synchronously above and remains live.
     unsafe { no_virtual_dependencies(&volume)? };
-    no_external_backing(&source)?;
+    backing.check(&source)?;
     unchanged(&observed, &mapping(&source, &volume)?)?;
     Ok(SourceBinding {
         source,
         volume,
         mapping: observed,
         target: target.clone(),
+        backing,
     })
 }
 

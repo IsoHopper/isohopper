@@ -23,6 +23,8 @@ impl InstalledRole {
     }
 }
 
+#[cfg(any(windows, test))]
+mod backing;
 #[cfg(windows)]
 mod native;
 #[cfg(any(windows, test))]
