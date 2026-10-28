@@ -3,6 +3,8 @@
 name: Experimental release
 
 on:
+  push:
+    tags: ['v*-experimental.*']
   workflow_dispatch:
     inputs:
       tag:
@@ -20,16 +22,17 @@ concurrency:
 
 jobs:
   validate:
-    if: github.repository == 'IsoHopper/isohopper' && github.ref == 'refs/heads/main'
+    if: github.repository == 'IsoHopper/isohopper' && (github.ref == 'refs/heads/main' || github.event_name == 'push')
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Validate tag and packaging tests
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY'
@@ -37,7 +40,8 @@ jobs:
           version = json.load(open('studio/src-tauri/tauri.conf.json'))['version']
           assert re.fullmatch(r'v' + re.escape(version) + r'-experimental\.[1-9][0-9]*', os.environ['RELEASE_TAG']), 'Tag must match app version and experimental.N'
           PY
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
             echo 'Refusing to overwrite an existing release tag.' >&2
             exit 1
           fi
@@ -47,7 +51,7 @@ jobs:
     needs: validate
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    timeout-minutes: ${{ matrix.platform == 'macos-x64' && 60 || 40 }}
     strategy:
       fail-fast: false
       matrix:
@@ -70,10 +74,10 @@ jobs:
     env:
       CI: true
       CARGO_TERM_COLOR: always
-      CARGO_BUILD_JOBS: 2
+      CARGO_BUILD_JOBS: ${{ matrix.platform == 'macos-x64' && 4 || 2 }}
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
-      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -86,6 +90,8 @@ jobs:
           sudo apt-get install --no-install-recommends -y libwebkit2gtk-4.1-dev \
             build-essential curl wget file libxdo-dev libssl-dev \
             libayatana-appindicator3-dev librsvg2-dev patchelf libfuse2
+      - name: Test packaging with mock files before compiling
+        run: python3 -m unittest discover -s scripts -p 'test*release*.py'
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '22.22.1'
@@ -143,7 +149,7 @@ jobs:
     permissions:
       contents: write
     env:
-      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -158,8 +164,11 @@ jobs:
         run: python3 scripts/verify-release.py --directory dist/release --tag "$RELEASE_TAG" --source-revision "$GITHUB_SHA"
       - name: Publish experimental release
         run: |
-          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
-            -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$GITHUB_SHA"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$GITHUB_SHA"
+          fi
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)" = "$GITHUB_SHA"
           gh release create "$RELEASE_TAG" dist/release/* \
             --verify-tag --draft --prerelease --latest=false \
             --title "IsoHopper $RELEASE_TAG" --notes-file dist/release-notes.md

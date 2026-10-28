@@ -42,7 +42,7 @@ Build a local macOS app bundle with the pinned Tauri CLI:
 (cd studio/src-tauri && npx --yes @tauri-apps/cli@2.12.4 build --bundles app)
 ```
 
-This builds locally. Published prereleases are built and checked by a manually dispatched workflow; installer use and physical hardware still need human testing.
+This builds locally. Published prereleases are built and checked by a workflow run manually or when an experimental tag is pushed; installer use and physical hardware still need human testing.
 
 For the browser preview, run `npm --prefix studio/frontend run dev` and open the local URL printed by Vite. This uses a labelled fixture adapter; native file selection and host inspection require Studio.
 
