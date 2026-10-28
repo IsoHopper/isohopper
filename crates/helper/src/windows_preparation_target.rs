@@ -68,11 +68,18 @@ pub fn require_standalone_pool<'a>(
     {
         return Err(refused("physical storage metadata does not match"));
     }
-    if record.is_partial != Some(false)
-        || record.primordial_pools.is_empty()
-        || !record.nonprimordial_pools.is_empty()
-    {
-        return Err(refused("storage pool membership is unsafe or unknown"));
+    match record.is_partial {
+        Some(false) => (),
+        Some(true) => return Err(refused("physical storage reports partial use")),
+        None => return Err(refused("physical storage partial-use status is unknown")),
+    }
+    if record.primordial_pools.is_empty() {
+        return Err(refused(
+            "physical storage has no primordial pool association",
+        ));
+    }
+    if !record.nonprimordial_pools.is_empty() {
+        return Err(refused("physical storage has concrete pool membership"));
     }
     Ok(record)
 }

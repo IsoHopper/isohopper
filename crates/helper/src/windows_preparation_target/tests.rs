@@ -132,6 +132,52 @@ fn missing_ambiguous_partial_or_concrete_pool_evidence_refuses() {
 }
 
 #[test]
+fn pool_membership_refusals_identify_the_failed_field_without_provider_values() {
+    let (_, disk, pools) = fixture();
+    for (partial, primordial, concrete, reason) in [
+        (
+            Some(true),
+            true,
+            false,
+            "physical storage reports partial use",
+        ),
+        (
+            None,
+            true,
+            false,
+            "physical storage partial-use status is unknown",
+        ),
+        (
+            Some(false),
+            false,
+            false,
+            "physical storage has no primordial pool association",
+        ),
+        (
+            Some(false),
+            true,
+            true,
+            "physical storage has concrete pool membership",
+        ),
+    ] {
+        let mut observed = pools.clone();
+        let record = &mut observed.physical_disks[0];
+        record.is_partial = partial;
+        if concrete {
+            record.nonprimordial_pools = record.primordial_pools.clone();
+        }
+        if !primordial {
+            record.primordial_pools.clear();
+        }
+        let error = require_standalone_pool(&disk, &observed).unwrap_err();
+        // Exact fixed output excludes every provider-controlled identity,
+        // serial, friendly name and path, including on the native error path.
+        assert_eq!(error.to_string(), format!("preparation refused: {reason}"));
+        assert!(matches!(error, PreparationError::Refused(value) if value == reason));
+    }
+}
+
+#[test]
 fn pool_size_bus_and_serial_must_agree_and_be_known() {
     let (_, disk, pools) = fixture();
     let mut variants = vec![];
