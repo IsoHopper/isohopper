@@ -16,6 +16,7 @@ fn allowed(program: &str, args: &[&str]) -> bool {
         || (program == linux::LSBLK && args == linux::ARGS)
         || (program == windows::POWERSHELL
             && (args == windows::ARGS
+                || args == crate::windows_encryption::ARGS
                 || args == crate::windows_pagefiles::ARGS))
 }
 
@@ -193,6 +194,7 @@ mod tests {
         use crate::windows;
         for args in [
             windows::ARGS,
+            crate::windows_encryption::ARGS,
             crate::windows_pagefiles::ARGS,
         ] {
             assert!(allowed(windows::POWERSHELL, args));
