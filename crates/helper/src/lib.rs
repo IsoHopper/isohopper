@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;
 
+pub mod job;
 pub mod windows_encryption_check;
 pub mod windows_identity;
 pub mod windows_lock;
