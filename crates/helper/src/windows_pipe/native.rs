@@ -112,50 +112,30 @@ fn check_security(handle: &OwnedHandle, expected: &ProcessPeer) -> Result<(), Pi
     {
         return Err(last("pipe security readback"));
     }
-    // SAFETY: initialized allocation contains at least capacity bytes.
-    let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), capacity as usize) };
     let token = &expected.evidence().token;
-    if needed > capacity || needed < 20 {
-        return Err(descriptor_size_error(
-            bytes,
-            needed,
-            &token.user,
-            &token.logon,
-        ));
-    }
-    security::validate(&bytes[..needed as usize], &token.user, &token.logon)
+    validate_security_readback(&words, capacity as usize, needed, &token.user, &token.logon)
 }
 
-fn descriptor_size_error(
-    bytes: &[u8],
+fn validate_security_readback(
+    words: &[u32],
+    capacity: usize,
     returned: u32,
     owner: &crate::windows_peer::Sid,
     logon: &crate::windows_peer::Sid,
-) -> PipeError {
-    let grants_valid = security::validate(bytes, owner, logon).is_ok();
-    let length = if grants_valid {
-        // SAFETY: this diagnostic is reached only after the bounded parser
-        // validated the self-relative header, every present component range,
-        // SID and ACL. The allocation is initialized, immutable and remains
-        // live throughout this synchronous query. No pointer-sized absolute
-        // descriptor or unchecked component offset can reach the SDK call.
-        unsafe { GetSecurityDescriptorLength(bytes.as_ptr().cast_mut().cast()) }
-    } else {
-        0
-    };
-    // Fixed keys and integers only: no descriptor bytes or user identifiers.
-    // This remains an error regardless of the diagnostic validation result.
-    error(
-        "pipe security readback length",
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "capacity={} returned={returned} expected_grants_valid={} descriptor_length={length}",
-                bytes.len(),
-                u8::from(grants_valid)
-            ),
-        ),
-    )
+) -> Result<(), PipeError> {
+    if capacity > std::mem::size_of_val(words) {
+        return Err(PipeError::Security("security readback capacity"));
+    }
+    // SAFETY: initialized DWORD-aligned allocation covers capacity bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), capacity) };
+    security::validate_readback(bytes, returned, owner, logon, |effective| {
+        // SAFETY: validate_readback first validates every component, range,
+        // SID and ACL of this self-relative descriptor. The effective prefix
+        // retains the DWORD alignment of words and is immutable and live for
+        // this synchronous query. Absolute/unchecked descriptors cannot reach
+        // the SDK. Its length is then checked against the bounded parser.
+        unsafe { GetSecurityDescriptorLength(effective.as_ptr().cast_mut().cast()) }
+    })
 }
 
 /// Owns one noninheritable, local-only pipe instance. Dropping closes it.
@@ -601,7 +581,12 @@ mod tests {
     use crate::windows_peer::Sid;
 
     fn descriptor_fixture() -> (Vec<u32>, usize, Sid, Sid) {
-        let owner = Sid::from_bytes(&[1, 1, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0]).unwrap();
+        // A 28-byte user SID gives the 84-byte descriptor size observed on
+        // Windows; these are fixed synthetic identifiers, not host values.
+        let owner = Sid::from_bytes(&[
+            1, 5, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 41, 0, 0, 0, 42, 0, 0, 0, 43, 0, 0, 0, 44, 0, 0, 0,
+        ])
+        .unwrap();
         let logon =
             Sid::from_bytes(&[1, 3, 0, 0, 0, 0, 0, 5, 5, 0, 0, 0, 42, 0, 0, 0, 43, 0, 0, 0])
                 .unwrap();
@@ -615,46 +600,34 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_size_diagnostic_keeps_valid_grants_as_an_error() {
+    fn zero_reported_size_uses_validated_sdk_descriptor_length() {
         let (words, length, owner, logon) = descriptor_fixture();
-        // SAFETY: fixture allocation contains length initialized bytes.
-        let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), length) };
-        for returned in [0, 19, u32::MAX] {
-            let result = descriptor_size_error(bytes, returned, &owner, &logon);
-            match result {
-                PipeError::Io { stage, source } => {
-                    assert_eq!(stage, "pipe security readback length");
-                    assert_eq!(source.kind(), io::ErrorKind::InvalidData);
-                    assert_eq!(
-                        source.to_string(),
-                        format!(
-                            "capacity={length} returned={returned} expected_grants_valid=1 descriptor_length={length}"
-                        )
-                    );
-                }
-                other => panic!("unexpected diagnostic error: {other:?}"),
-            }
+        assert_eq!(length, 84);
+        for returned in [0, length as u32] {
+            validate_security_readback(&words, length, returned, &owner, &logon).unwrap();
+        }
+        for returned in [1, 19, length as u32 - 1, length as u32 + 1, u32::MAX] {
+            assert!(validate_security_readback(&words, length, returned, &owner, &logon).is_err());
         }
     }
 
     #[test]
-    fn descriptor_size_diagnostic_never_follows_an_invalid_component_pointer() {
+    fn zero_reported_size_never_follows_an_invalid_component_pointer() {
         let (mut words, length, owner, logon) = descriptor_fixture();
         words[1] = u32::MAX; // invalid self-relative owner offset
-        // SAFETY: fixture allocation contains length initialized bytes.
-        let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), length) };
-        let result = descriptor_size_error(bytes, 0, &owner, &logon);
-        match result {
-            PipeError::Io { stage, source } => {
-                assert_eq!(stage, "pipe security readback length");
-                assert_eq!(
-                    source.to_string(),
-                    format!(
-                        "capacity={length} returned=0 expected_grants_valid=0 descriptor_length=0"
-                    )
-                );
-            }
-            other => panic!("unexpected diagnostic error: {other:?}"),
+        assert!(validate_security_readback(&words, length, 0, &owner, &logon).is_err());
+    }
+
+    #[test]
+    fn sdk_readback_rejects_truncation_and_trailing_mutation() {
+        let (mut words, length, owner, logon) = descriptor_fixture();
+        for capacity in 0..length {
+            assert!(validate_security_readback(&words, capacity, 0, &owner, &logon).is_err());
         }
+        assert!(validate_security_readback(&words, length + 1, 0, &owner, &logon).is_err());
+        words.push(0);
+        validate_security_readback(&words, length + 4, 0, &owner, &logon).unwrap();
+        *words.last_mut().unwrap() = 1;
+        assert!(validate_security_readback(&words, length + 4, 0, &owner, &logon).is_err());
     }
 }

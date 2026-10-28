@@ -61,10 +61,37 @@ fn sid_end(bytes: &[u8], start: usize) -> Result<usize, PipeError> {
     Ok(end)
 }
 
+pub(super) fn validate_readback(
+    bytes: &[u8],
+    returned: u32,
+    owner: &Sid,
+    logon: &Sid,
+    descriptor_length: impl FnOnce(&[u8]) -> u32,
+) -> Result<(), PipeError> {
+    let length = validated_length(bytes, owner, logon)?;
+    // Some successful Windows named-pipe queries report zero despite writing
+    // the complete descriptor. No other inconsistent reported size is allowed.
+    if returned != 0 && returned as usize != length {
+        return Err(bad("security readback length"));
+    }
+    let effective = &bytes[..length];
+    validate(effective, owner, logon)?;
+    // The SDK may inspect components only after all offsets, ranges, SIDs and
+    // ACLs have been validated. Its independent length must agree exactly.
+    if descriptor_length(effective) as usize != length {
+        return Err(bad("security descriptor measured length"));
+    }
+    Ok(())
+}
+
 /// Compare grants and principals, not component placement. Owner implicit
 /// WRITE_DAC rights are not removed by this DACL; this is not isolation from
 /// every other same-user process.
 pub(super) fn validate(bytes: &[u8], owner: &Sid, logon: &Sid) -> Result<(), PipeError> {
+    validated_length(bytes, owner, logon).map(|_| ())
+}
+
+fn validated_length(bytes: &[u8], owner: &Sid, logon: &Sid) -> Result<usize, PipeError> {
     if !(20..=MAX_DESCRIPTOR_BYTES).contains(&bytes.len()) || bytes[0] != 1 || bytes[1] != 0 {
         return Err(bad("descriptor header"));
     }
@@ -107,10 +134,20 @@ pub(super) fn validate(bytes: &[u8], owner: &Sid, logon: &Sid) -> Result<(), Pip
         ranges.push((start, sid_end(bytes, start)?));
     }
     ranges.sort_unstable();
-    if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
-        return Err(bad("overlapping components"));
+    let mut end = 20;
+    for (start, next_end) in ranges {
+        if end > start {
+            return Err(bad("overlapping components"));
+        }
+        if bytes[end..start].iter().any(|byte| *byte != 0) {
+            return Err(bad("unvalidated component gap"));
+        }
+        end = next_end;
     }
-    Ok(())
+    if bytes[end..].iter().any(|byte| *byte != 0) {
+        return Err(bad("unvalidated descriptor trailing data"));
+    }
+    Ok(end)
 }
 
 #[cfg(test)]
@@ -199,5 +236,99 @@ mod tests {
         }
         assert!(validate(&bytes, &logon, &logon).is_err());
         assert!(validate(&bytes, &owner, &owner).is_err());
+    }
+
+    #[test]
+    fn validates_successful_readback_with_zero_reported_size() {
+        let (bytes, owner, logon) = sample();
+        for returned in [0, 68] {
+            validate_readback(&bytes, returned, &owner, &logon, |effective| {
+                assert_eq!(effective, bytes);
+                68
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn passes_only_validated_effective_prefix_to_length_query() {
+        let (mut bytes, owner, logon) = sample();
+        bytes.extend([0; 16]);
+        validate_readback(&bytes, 0, &owner, &logon, |effective| {
+            assert_eq!(effective.len(), 68);
+            validate(effective, &owner, &logon).unwrap();
+            68
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_inconsistent_positive_readback_and_sdk_sizes() {
+        let (bytes, owner, logon) = sample();
+        for returned in [1, 19, 20, 67, 69, 84, u32::MAX] {
+            assert!(validate_readback(&bytes, returned, &owner, &logon, |_| 68).is_err());
+        }
+        for measured in [0, 19, 20, 67, 69, u32::MAX] {
+            assert!(validate_readback(&bytes, 68, &owner, &logon, |_| measured).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_trailing_mutation_before_length_query() {
+        let (mut bytes, owner, logon) = sample();
+        bytes.extend([0; 16]);
+        bytes[80] = 1;
+        for returned in [0, 68, 84] {
+            assert!(
+                validate_readback(&bytes, returned, &owner, &logon, |_| {
+                    panic!("unvalidated trailing data reached SDK length query")
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_components_and_grants_before_length_query() {
+        let (bytes, owner, logon) = sample();
+        let mut cases = (0..bytes.len())
+            .map(|end| bytes[..end].to_vec())
+            .collect::<Vec<_>>();
+        for (at, value) in [(4, u32::MAX), (16, 20), (12, 20), (44, CLIENT_RIGHTS | 4)] {
+            let mut changed = bytes.clone();
+            changed[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            cases.push(changed);
+        }
+        cases.push(vec![0; MAX_DESCRIPTOR_BYTES + 1]);
+        for changed in cases {
+            assert!(
+                validate_readback(&changed, 0, &owner, &logon, |_| {
+                    panic!("invalid descriptor reached SDK length query")
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn validates_reordered_components_and_rejects_nonzero_gap() {
+        let (bytes, owner, logon) = sample();
+        let mut reordered = bytes[..20].to_vec();
+        reordered[4..8].copy_from_slice(&56u32.to_le_bytes());
+        reordered[16..20].copy_from_slice(&20u32.to_le_bytes());
+        reordered.extend(&bytes[32..]);
+        reordered.extend(&bytes[20..32]);
+        validate_readback(&reordered, 0, &owner, &logon, |_| 68).unwrap();
+
+        let mut gap = bytes[..32].to_vec();
+        gap[16..20].copy_from_slice(&36u32.to_le_bytes());
+        gap.extend([0, 0, 1, 0]);
+        gap.extend(&bytes[32..]);
+        assert!(
+            validate_readback(&gap, 0, &owner, &logon, |_| {
+                panic!("unvalidated gap reached SDK length query")
+            })
+            .is_err()
+        );
     }
 }
