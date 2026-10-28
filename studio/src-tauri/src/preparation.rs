@@ -12,11 +12,21 @@ pub mod targets;
 #[path = "preparation/windows.rs"]
 mod windows;
 
+use crate::imports::source_catalog::{SourceBatch, SourceInfo};
 use serde::Serialize;
+use std::fs::File;
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
+
+/// Review metadata only. It cannot reopen or lease a catalogue source.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SourceManifestEntry {
+    pub relative_path: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
@@ -31,6 +41,7 @@ pub struct Snapshot {
     pub bytes_verified: u64,
     pub target_may_be_incomplete: bool,
     pub sources_released: bool,
+    pub source_manifest: Vec<SourceManifestEntry>,
     pub target: Option<serde_json::Value>,
     pub image_sha256: Option<String>,
     pub description_digest: Option<String>,
@@ -51,6 +62,26 @@ struct Job {
     abort: AtomicBool,
 }
 impl Job {
+    /// Publish metadata only after every transfer callback and the final source
+    /// stability checks succeed. Earlier callbacks may already have sent handles
+    /// on failure, but the UI never receives a partial or unverified manifest.
+    fn transfer_sources(
+        &self,
+        sources: &SourceBatch,
+        transfer: impl FnMut(&File, &SourceInfo) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let manifest = sources
+            .visit_verified(transfer)?
+            .into_iter()
+            .map(|source| SourceManifestEntry {
+                relative_path: source.relative_path,
+                bytes: source.bytes,
+                sha256: source.verification.digest,
+            })
+            .collect();
+        self.update(|snapshot| snapshot.source_manifest = manifest)
+    }
+
     fn note_reply(
         &self,
         body: &isohopper_helper::prepare_protocol::ClientMessage,
@@ -78,6 +109,7 @@ impl Job {
                     bytes_verified: 0,
                     target_may_be_incomplete: false,
                     sources_released: false,
+                    source_manifest: Vec::new(),
                     target: None,
                     image_sha256: None,
                     description_digest: None,
@@ -180,6 +212,126 @@ pub use windows::start;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::imports::source_catalog::{PreparedSource, SourceCatalog};
+    use std::fs::File;
+
+    #[test]
+    fn transferred_manifest_survives_catalogue_release_and_terminal_snapshots() {
+        let root = tempfile::tempdir().unwrap();
+        let mut catalogue = SourceCatalog::default();
+        let mut sources = Vec::new();
+        for (name, bytes) in [("Mac/boot.iso", b"abc"), ("Windows/boot.iso", b"xyz")] {
+            let path = root.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            sources.push(PreparedSource::new(File::open(path).unwrap(), name).unwrap());
+        }
+        let infos = catalogue.insert_batch(sources).unwrap();
+        let ids = [infos[1].source_id.clone(), infos[0].source_id.clone()];
+        let batch = catalogue.lease_batch(&ids).unwrap();
+        let job = Job::new("manifest-job".into());
+        let mut transferred = Vec::new();
+        job.transfer_sources(&batch, |file, info| {
+            assert_eq!(file.metadata().unwrap().len(), info.bytes);
+            transferred.push(info.relative_path.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(transferred, ["Windows/boot.iso", "Mac/boot.iso"]);
+        let manifest = job.snapshot().unwrap().source_manifest;
+        assert_eq!(manifest[0].relative_path, infos[1].relative_path);
+        assert_eq!(manifest[0].bytes, infos[1].bytes);
+        assert_eq!(manifest[0].sha256, infos[1].verification.digest);
+        assert_eq!(manifest[1].sha256, infos[0].verification.digest);
+        drop(batch);
+        catalogue.release_sources(&ids).unwrap();
+        assert!(catalogue.list_sources().is_empty());
+        job.update(|s| {
+            s.sources_released = true;
+            s.phase = "await_confirmation".into();
+        })
+        .unwrap();
+        assert_eq!(job.snapshot().unwrap().source_manifest, manifest);
+        job.update(|s| {
+            s.active = false;
+            s.phase = "succeeded".into();
+        })
+        .unwrap();
+        let receipt = serde_json::to_value(job.snapshot().unwrap()).unwrap();
+        assert_eq!(
+            receipt["source_manifest"][0]["relative_path"],
+            "Windows/boot.iso"
+        );
+        assert_eq!(job.snapshot().unwrap().source_manifest, manifest);
+        let serialized = receipt.to_string();
+        assert!(!serialized.contains("source_id"));
+        assert!(!serialized.contains(&root.path().display().to_string()));
+        assert!(catalogue.lease(&ids[0]).is_err());
+    }
+
+    #[test]
+    fn failed_transfer_does_not_publish_a_partial_source_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let mut catalogue = SourceCatalog::default();
+        let mut sources = Vec::new();
+        for name in ["first.iso", "last.iso"] {
+            let path = root.path().join(name);
+            std::fs::write(&path, name).unwrap();
+            sources.push(PreparedSource::new(File::open(path).unwrap(), name).unwrap());
+        }
+        let infos = catalogue.insert_batch(sources).unwrap();
+        let ids: Vec<_> = infos.iter().map(|info| info.source_id.clone()).collect();
+        let batch = catalogue.lease_batch(&ids).unwrap();
+        let job = Job::new("failed-job".into());
+        let mut count = 0;
+        let error = job
+            .transfer_sources(&batch, |_, _| {
+                count += 1;
+                if count == 2 {
+                    Err("receiver rejected final source".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(error, "receiver rejected final source");
+        assert_eq!(count, 2);
+        assert!(job.snapshot().unwrap().source_manifest.is_empty());
+        assert!(catalogue.release_sources(&ids).is_err());
+        drop(batch);
+        catalogue.release_sources(&ids).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_source_stability_failure_does_not_publish_a_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let mut catalogue = SourceCatalog::default();
+        let mut sources = Vec::new();
+        for name in ["first.iso", "last.iso"] {
+            let path = root.path().join(name);
+            std::fs::write(&path, name).unwrap();
+            sources.push(PreparedSource::new(File::open(path).unwrap(), name).unwrap());
+        }
+        let infos = catalogue.insert_batch(sources).unwrap();
+        let ids: Vec<_> = infos.iter().map(|info| info.source_id.clone()).collect();
+        let batch = catalogue.lease_batch(&ids).unwrap();
+        let job = Job::new("changed-job".into());
+        let mut count = 0;
+        let result = job.transfer_sources(&batch, |_, _| {
+            count += 1;
+            if count == 2 {
+                // First source already passed its callback and local post-check.
+                // The final all-source check must still catch this mutation.
+                std::fs::write(root.path().join("first.iso"), b"changed-length").unwrap();
+            }
+            Ok(())
+        });
+        assert_eq!(count, 2);
+        assert!(result.is_err());
+        assert!(job.snapshot().unwrap().source_manifest.is_empty());
+    }
+
     fn pending() -> Job {
         let job = Job::new("local-job".into());
         job.update(|s| {

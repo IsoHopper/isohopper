@@ -194,7 +194,7 @@ fn run(
     let result = (|| {
         let count = u16::try_from(inputs.source_ids.len()).map_err(|_| "Too many source files")?;
         let mut index = 0_u16;
-        inputs.sources.as_ref().ok_or("Missing source batch")?.visit_verified(|file, info| {
+        job.transfer_sources(inputs.sources.as_ref().ok_or("Missing source batch")?, |file, info| {
             if cancelled(job)? { return Err("Preparation cancelled before staging".into()); }
             if channel.is_none() {
                 job.update(|s| { s.phase = "requesting_elevation".into(); s.message = "Waiting for the Windows elevation dialog.".into(); })?;
