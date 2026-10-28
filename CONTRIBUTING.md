@@ -21,6 +21,15 @@ npm --prefix studio/frontend run build
 cargo test --manifest-path studio/src-tauri/Cargo.toml --locked
 ```
 
+On Windows, first build and stage the matching helper from the repository root:
+
+```sh
+cargo build --locked -p isohopper-helper
+python scripts/stage-windows-helper.py --source target/debug/isohopper-helper.exe
+```
+
+Stage the release helper instead when packaging a release build. Studio embeds its checksum. The experimental elevation check requires a fresh machine-wide NSIS installation in `Program Files\IsoHopper` on the Windows system drive; portable builds cannot run it. It performs a read-only connection test, never disk preparation. Interactive UAC remains unvalidated. Windows Studio CI tests installation and existing-install refusal only on a disposable runner.
+
 ## Firmware tests
 
 These optional commands create a new regular-file image and test firmware entry in QEMU. They require the pinned Rust UEFI target, QEMU, and matching x64 OVMF/EDK2 code and variable-template files. Replace the firmware paths below with your installed files; choose a new output-image path on each run.
