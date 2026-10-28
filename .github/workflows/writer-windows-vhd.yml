@@ -96,7 +96,7 @@ jobs:
       - name: Inspect protected storage and retained disk identity without writes
         shell: bash
         run: |
-          if cargo +1.98.0 test --locked -p isohopper-helper --lib --test windows_protected --test probe_command > helper-unit.log 2>&1 &&
+          if cargo +1.98.0 test --locked -p isohopper-helper --lib --test windows_protected --test windows_source_transfer --test probe_command > helper-unit.log 2>&1 &&
              cargo +1.98.0 test --locked -p isohopper-helper --lib windows_peer::native::tests::native_linked_token_relationship_is_observed_without_elevation -- --exact --ignored --nocapture >> helper-unit.log 2>&1; then
             cat helper-unit.log
           else
@@ -113,6 +113,7 @@ jobs:
           for probe in \
             windows_protected:windows_protected_system_and_executable_mappings_are_read_only \
             windows_peer:windows_peer_observes_current_process_and_owned_child \
+            windows_source_transfer:windows_source_transfer_retains_readonly_file_from_owned_child \
             windows_pipe:windows_pipe_checks_peers_deadlines_and_frames \
             windows_identity:windows_vhd_identity_queries_agree_or_report_unsupported \
             windows_target:windows_vhd_provider_path_binds_to_retained_target \

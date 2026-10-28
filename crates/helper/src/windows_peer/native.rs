@@ -17,6 +17,8 @@ use windows_sys::Win32::{
     },
     System::Threading::{GetProcessId, GetProcessTimes, OpenProcessToken, WaitForSingleObject},
 };
+#[path = "source.rs"]
+mod source;
 
 const _: () = {
     assert!(size_of::<TOKEN_ELEVATION>() == 4);
@@ -47,7 +49,8 @@ pub struct ProcessPeer {
 impl ProcessPeer {
     /// Observe a live process using a caller-owned handle with
     /// PROCESS_QUERY_LIMITED_INFORMATION and SYNCHRONIZE rights. Additional
-    /// rights, if present, are unused. All queries complete synchronously.
+    /// rights are unused by observations; `receive_source_file` additionally
+    /// requires PROCESS_DUP_HANDLE. All queries complete synchronously.
     ///
     /// Supplying a handle says nothing about how the caller obtained or
     /// authenticated it. In particular, this does not bind a named-pipe peer.
@@ -68,6 +71,25 @@ impl ProcessPeer {
     pub fn revalidate(&mut self) -> Result<&PeerEvidence, PeerError> {
         decode::unchanged(&self.evidence, &observe(&self.process)?)?;
         Ok(&self.evidence)
+    }
+
+    /// Receive a backend-owned source handle value from this retained process.
+    /// The process handle must already include PROCESS_DUP_HANDLE in addition
+    /// to query/synchronize rights; this never reopens a process by PID. Only
+    /// positive 32-bit handle values are supported. The caller must retain the
+    /// sender's source lease through transfer and authenticate that sender and
+    /// handle selection independently; this API adds no transport/role policy.
+    ///
+    /// Returns an independently positioned synchronous read-only regular File
+    /// with share-read only. Directory, reparse, delete-pending, changed or
+    /// unsupported sources fail closed. Metadata is a change sentinel, not
+    /// immutable-content proof: existing mapped writes and attribute-only
+    /// changes are not prevented by sharing modes. The coordinator must still
+    /// hash the exact source and perform source-volume/external-backing checks.
+    /// No path is opened or original remote handle exposed, and no write
+    /// authority is granted.
+    pub fn receive_source_file(&mut self, remote: u64) -> Result<std::fs::File, PeerError> {
+        source::receive(&self.process, &self.evidence, remote)
     }
 }
 
