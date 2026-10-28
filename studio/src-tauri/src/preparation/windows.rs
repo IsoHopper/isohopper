@@ -21,13 +21,13 @@ impl Drop for ActiveGuard {
 }
 
 pub fn start(
+    native: crate::NativeJob,
     owner: std::sync::mpsc::Receiver<Result<usize, String>>,
     directory: PathBuf,
     target_token: String,
     source_ids: Vec<String>,
     archive_token: String,
 ) -> Result<Snapshot, String> {
-    let native = crate::NativeJob::begin()?;
     let target = targets::resolve(&target_token)?;
     let inputs = Inputs::lease(source_ids, archive_token)?;
     let job = Arc::new(Job::new(targets::token()?));
@@ -183,38 +183,72 @@ fn run(
     let result = (|| {
         let count = u16::try_from(inputs.source_ids.len()).map_err(|_| "Too many source files")?;
         let mut index = 0_u16;
-        job.transfer_sources(inputs.sources.as_ref().ok_or("Missing source batch")?, |file, info| {
-            if cancelled(job)? { return Err("Preparation cancelled before staging".into()); }
-            if channel.is_none() {
-                // Hash the fixed archive before launch, outside the helper's
-                // response deadline. Keep its cursor/identity lease through
-                // launch and the archive acknowledgement; no path reopen.
-                job.with_verified_archive(inputs.archive.as_ref().ok_or("Missing engine archive")?, |archive, metadata| {
-                    if cancelled(job)? { return Err("Preparation cancelled before staging".into()); }
-                    job.update(|s| { s.phase = "requesting_elevation".into(); s.message = "Waiting for the Windows elevation dialog.".into(); })?;
-                    let launched = launch_preparation(owner, directory, env!("ISOHOPPER_HELPER_SHA256"))?
-                        .ok_or("Windows elevation was cancelled")?;
-                    channel = Some(Channel { launched, protocol: ClientSession::new(count), current: None, terminal_received: false });
-                    let connection = channel.as_mut().ok_or("Missing helper channel")?;
-                    connection.receive(job)?;
-                    expected(connection, job, |v| matches!(v, ServerMessage::Hello))?;
-                    connection.reply(job, ClientMessage::Begin { target_selector: target.into(), source_count: count })?;
-                    connection.receive(job)?;
-                    expected(connection, job, |v| matches!(v, ServerMessage::NeedArchive))?;
-                    connection.reply(job, ClientMessage::Archive { remote_handle: remote_handle(archive)?, bytes: metadata.bytes, sha256: metadata.verification.digest.clone() })?;
-                    connection.receive(job)
+        job.transfer_inputs(
+            inputs.sources.as_ref().ok_or("Missing source batch")?,
+            inputs.archive.as_ref().ok_or("Missing engine archive")?,
+            &mut channel,
+            |channel, archive, metadata| {
+                if cancelled(job)? {
+                    return Err("Preparation cancelled before staging".into());
+                }
+                job.update(|s| {
+                    s.phase = "requesting_elevation".into();
+                    s.message = "Waiting for the Windows elevation dialog.".into();
                 })?;
-            }
-            let connection = channel.as_mut().ok_or("Missing helper channel")?;
-            expected(connection, job, |v| matches!(v, ServerMessage::NeedSource { index: requested } if *requested == index))?;
-            connection.reply(job, ClientMessage::Source {
-                index, source_id: info.source_id.clone(), relative_path: info.relative_path.clone(),
-                bytes: info.bytes, sha256: info.verification.digest.clone(), remote_handle: remote_handle(file)?,
-            })?;
-            index += 1;
-            connection.receive(job)
-        })?;
-        let connection = channel.as_mut().ok_or("No source files were transferred")?;
+                let launched =
+                    launch_preparation(owner, directory, env!("ISOHOPPER_HELPER_SHA256"))?
+                        .ok_or("Windows elevation was cancelled")?;
+                *channel = Some(Channel {
+                    launched,
+                    protocol: ClientSession::new(count),
+                    current: None,
+                    terminal_received: false,
+                });
+                let connection = channel.as_mut().ok_or("Missing helper channel")?;
+                connection.receive(job)?;
+                expected(connection, job, |v| matches!(v, ServerMessage::Hello))?;
+                connection.reply(
+                    job,
+                    ClientMessage::Begin {
+                        target_selector: target.into(),
+                        source_count: count,
+                    },
+                )?;
+                connection.receive(job)?;
+                expected(connection, job, |v| matches!(v, ServerMessage::NeedArchive))?;
+                connection.reply(
+                    job,
+                    ClientMessage::Archive {
+                        remote_handle: remote_handle(archive)?,
+                        bytes: metadata.bytes,
+                        sha256: metadata.verification.digest.clone(),
+                    },
+                )?;
+                connection.receive(job)
+            },
+            |connection, file, info| {
+                if cancelled(job)? {
+                    return Err("Preparation cancelled before staging".into());
+                }
+                expected(connection, job, |v| {
+                    matches!(v, ServerMessage::NeedSource { index: requested } if *requested == index)
+                })?;
+                connection.reply(
+                    job,
+                    ClientMessage::Source {
+                        index,
+                        source_id: info.source_id.clone(),
+                        relative_path: info.relative_path.clone(),
+                        bytes: info.bytes,
+                        sha256: info.verification.digest.clone(),
+                        remote_handle: remote_handle(file)?,
+                    },
+                )?;
+                index += 1;
+                connection.receive(job)
+            },
+        )?;
+        let connection = channel.as_mut().ok_or("Missing helper channel")?;
         expected(connection, job, |v| matches!(v, ServerMessage::InputsReady))?;
         connection.reply(
             job,

@@ -118,6 +118,7 @@ impl ClientSession {
             ClientMessage::Begin { source_count, .. } if *source_count == self.count => {
                 Next::Archive
             }
+            ClientMessage::Archive { .. } if self.count == 0 => Next::Inputs,
             ClientMessage::Archive { .. } => Next::Source(0),
             ClientMessage::Source { index, .. } => {
                 if index + 1 == self.count {
@@ -166,6 +167,57 @@ mod tests {
             sequence,
             body,
         }
+    }
+
+    #[test]
+    fn empty_media_transfers_engine_then_requires_inputs_ready_without_source_requests() {
+        let mut session = ClientSession::new(0);
+        let hello = frame(0, ServerMessage::Hello);
+        session.accept(&hello).unwrap();
+        session
+            .reply(
+                &hello,
+                ClientMessage::Begin {
+                    target_selector: "target".into(),
+                    source_count: 0,
+                },
+            )
+            .unwrap();
+        let archive = frame(1, ServerMessage::NeedArchive);
+        session.accept(&archive).unwrap();
+        session
+            .reply(
+                &archive,
+                ClientMessage::Archive {
+                    remote_handle: 4,
+                    bytes: isohopper_core::engine::archive::ARCHIVE_BYTES as u64,
+                    sha256: isohopper_core::engine::archive::ARCHIVE_SHA256.into(),
+                },
+            )
+            .unwrap();
+        assert!(
+            session
+                .accept(&frame(2, ServerMessage::NeedSource { index: 0 }))
+                .is_err()
+        );
+        let ready = frame(2, ServerMessage::InputsReady);
+        session.accept(&ready).unwrap();
+        session
+            .reply(&ready, ClientMessage::SourcesComplete)
+            .unwrap();
+        let forged = frame(
+            3,
+            ServerMessage::Terminal {
+                outcome: Outcome::Succeeded,
+                phase: Phase::Complete,
+                message: "forged completion".into(),
+                bytes_written: 512,
+                bytes_verified: 512,
+                target_may_be_incomplete: false,
+                sha256: Some("a".repeat(64)),
+            },
+        );
+        assert!(session.accept(&forged).is_err());
     }
     #[test]
     fn full_transfer_requires_seal_release_and_exact_terminal_image() {

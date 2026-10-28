@@ -8,6 +8,8 @@ fn capabilities() -> serde_json::Value {
         "mode": "native",
         "platform": std::env::consts::OS,
         "file_import": true,
+        "engine_download": true,
+        "session_restore": true,
         "host_inventory": cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux")),
         "helper_probe": cfg!(windows),
         "preparation_available": cfg!(windows),
@@ -28,8 +30,46 @@ fn check_config(text: String, format: String) -> serde_json::Value {
 }
 #[cfg(any(windows, test))]
 mod elevation;
+mod engine_download;
 mod imports;
 mod preparation;
+mod session;
+#[tauri::command]
+async fn restore_session(window: tauri::WebviewWindow) -> Result<session::RestoreReport, String> {
+    use tauri::Manager;
+    if window.label() != "main" {
+        return Err("Session restore requires the main Studio window".into());
+    }
+    // A reloaded webview may inspect retained selections while an operation is
+    // running. Reopening saved files is only permitted while native work is idle.
+    if engine_download::active() || preparation::active() {
+        return Ok(session::RestoreReport {
+            images: imports::list_sources()?,
+            warnings: Vec::new(),
+        });
+    }
+    let guard = NativeJob::begin()?;
+    let paths = window.app_handle().path();
+    let directory = paths.app_local_data_dir().map_err(|e| e.to_string())?;
+    let cache = paths
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("engine");
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        let mut restored = session::initialize(directory)?;
+        if preparation::inputs::selected_archive()?.is_none()
+            && let Err(error) = engine_download::restore(cache)
+        {
+            restored
+                .warnings
+                .push(format!("Engine cache was not restored: {error}"));
+        }
+        Ok(restored)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 #[tauri::command]
 fn preparation_status() -> Result<Option<preparation::Snapshot>, String> {
     preparation::status()
@@ -37,6 +77,34 @@ fn preparation_status() -> Result<Option<preparation::Snapshot>, String> {
 #[tauri::command]
 fn selected_engine_archive() -> Result<Option<preparation::inputs::ArchiveSelection>, String> {
     preparation::inputs::selected_archive()
+}
+#[tauri::command]
+fn start_engine_download(
+    window: tauri::WebviewWindow,
+) -> Result<engine_download::Snapshot, String> {
+    use tauri::Manager;
+    if window.label() != "main" {
+        return Err("Engine download requires the main Studio window".into());
+    }
+    let guard = NativeJob::begin()?;
+    if preparation::active() {
+        return Err("Wait for preparation to finish before downloading the engine".into());
+    }
+    let cache_root = window
+        .app_handle()
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("engine");
+    engine_download::start(cache_root, guard)
+}
+#[tauri::command]
+fn engine_download_status() -> Result<Option<engine_download::Snapshot>, String> {
+    engine_download::status()
+}
+#[tauri::command]
+fn cancel_engine_download(job_id: String) -> Result<(), String> {
+    engine_download::cancel(&job_id)
 }
 #[tauri::command]
 async fn pick_engine_archive() -> Result<Option<preparation::inputs::ArchiveSelection>, String> {
@@ -78,6 +146,8 @@ fn start_preparation(
         if window.label() != "main" {
             return Err("Preparation requires the main Studio window".into());
         }
+        // Hold the shared gate until preparation has registered its persistent job.
+        let guard = NativeJob::begin()?;
         let directory = window
             .app_handle()
             .path()
@@ -95,7 +165,14 @@ fn start_preparation(
                 );
             })
             .map_err(|e| e.to_string())?;
-        preparation::start(receive, directory, target_token, source_ids, archive_token)
+        preparation::start(
+            guard,
+            receive,
+            directory,
+            target_token,
+            source_ids,
+            archive_token,
+        )
     }
     #[cfg(not(windows))]
     {
@@ -120,6 +197,7 @@ fn cancel_preparation(job_id: String) -> Result<(), String> {
 }
 #[tauri::command]
 fn release_sources(ids: Vec<String>) -> Result<(), String> {
+    let _guard = NativeJob::begin()?;
     imports::release_sources(&ids)
 }
 #[tauri::command]
@@ -262,10 +340,14 @@ fn main() {
             pick_directory,
             release_sources,
             list_sources,
+            restore_session,
             inspect_devices,
             probe_helper,
             pick_engine_archive,
             selected_engine_archive,
+            start_engine_download,
+            engine_download_status,
+            cancel_engine_download,
             list_preparation_targets,
             preparation_status,
             start_preparation,
@@ -273,7 +355,9 @@ fn main() {
             cancel_preparation
         ])
         .on_window_event(|_, event| {
-            if (HELPER_PROBE_ACTIVE.load(Ordering::Acquire) || preparation::active())
+            if (HELPER_PROBE_ACTIVE.load(Ordering::Acquire)
+                || preparation::active()
+                || engine_download::active())
                 && let tauri::WindowEvent::CloseRequested { api, .. } = event
             {
                 api.prevent_close();
@@ -282,7 +366,9 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("could not start IsoHopper Studio")
         .run(|_, event| {
-            if (HELPER_PROBE_ACTIVE.load(Ordering::Acquire) || preparation::active())
+            if (HELPER_PROBE_ACTIVE.load(Ordering::Acquire)
+                || preparation::active()
+                || engine_download::active())
                 && let tauri::RunEvent::ExitRequested { api, .. } = event
             {
                 api.prevent_exit();

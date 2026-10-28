@@ -214,8 +214,8 @@ impl SourceCatalog {
     /// or cursor locking. Drop the catalogue guard before `verify_all`.
     #[allow(dead_code)] // Consumed by the forthcoming native preparation job.
     pub fn lease_batch(&self, ids: &[String]) -> Result<SourceBatch, String> {
-        if ids.is_empty() || ids.len() > MAX_SOURCES {
-            return Err(format!("Select between 1 and {MAX_SOURCES} source IDs."));
+        if ids.len() > MAX_SOURCES {
+            return Err(format!("Select at most {MAX_SOURCES} source IDs."));
         }
         let mut seen = BTreeSet::new();
         let mut entries = Vec::with_capacity(ids.len());
@@ -556,7 +556,6 @@ mod tests {
         let first = infos[0].source_id.clone();
         let second = infos[1].source_id.clone();
         for ids in [
-            vec![],
             vec![first.clone(), second.clone(), "unknown-last".into()],
             vec![first.clone(), second.clone(), first.clone()],
             vec![first.clone(); MAX_SOURCES + 1],
@@ -567,6 +566,16 @@ mod tests {
             }
         }
         catalog.release_sources(&[first, second]).unwrap();
+        assert_eq!(catalog.remaining_capacity(), MAX_SOURCES);
+    }
+
+    #[test]
+    fn empty_media_batch_verifies_and_releases_without_source_handles() {
+        let mut catalog = SourceCatalog::default();
+        let batch = catalog.lease_batch(&[]).unwrap();
+        batch.verify_all().unwrap();
+        drop(batch);
+        catalog.release_sources(&[]).unwrap();
         assert_eq!(catalog.remaining_capacity(), MAX_SOURCES);
     }
 

@@ -22,10 +22,12 @@ pub fn source_catalog() -> &'static Mutex<SourceCatalog> {
 }
 
 pub fn release_sources(ids: &[String]) -> Result<(), String> {
-    source_catalog()
+    let mut catalogue = source_catalog()
         .lock()
-        .map_err(|_| "Source catalogue is unavailable.")?
-        .release_sources(ids)
+        .map_err(|_| "Source catalogue is unavailable.")?;
+    catalogue.check_release_sources(ids)?;
+    crate::session::forget_images(ids)?;
+    catalogue.release_sources(ids)
 }
 
 pub fn list_sources() -> Result<Vec<ImportedImage>, String> {
@@ -72,7 +74,51 @@ pub fn import_file(path: &Path) -> Result<ImportedImage, String> {
         .ok_or_else(|| "Imported source was not retained.".into())
 }
 pub fn import_files(paths: &[PathBuf]) -> Result<Vec<ImportedImage>, String> {
-    import_files_into(source_catalog(), paths)
+    let locations = paths
+        .iter()
+        .map(|path| {
+            Ok(crate::session::ImagePath {
+                root: path
+                    .parent()
+                    .ok_or("Image has no parent directory")?
+                    .to_path_buf(),
+                relative_path: path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or("Image filename is not valid UTF-8")?
+                    .into(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let images = import_files_into(source_catalog(), paths)?;
+    remember_imports(&locations, &images)?;
+    Ok(images)
+}
+fn remember_imports(
+    paths: &[crate::session::ImagePath],
+    images: &[ImportedImage],
+) -> Result<(), String> {
+    retain_saved_imports(
+        source_catalog(),
+        images,
+        crate::session::remember_images(paths, images),
+    )
+}
+
+fn retain_saved_imports(
+    catalogue: &Mutex<SourceCatalog>,
+    images: &[ImportedImage],
+    saved: Result<(), String>,
+) -> Result<(), String> {
+    if let Err(error) = saved {
+        let ids: Vec<_> = images.iter().map(|image| image.source_id.clone()).collect();
+        catalogue
+            .lock()
+            .map_err(|_| "Source catalogue is unavailable.")?
+            .release_sources(&ids)?;
+        return Err(error);
+    }
+    Ok(())
 }
 fn import_files_into(
     catalogue: &Mutex<SourceCatalog>,
@@ -89,14 +135,21 @@ pub fn import_directory(root: &Path) -> Result<ImportedDirectory, String> {
     let scan = isohopper_media::scan(root).map_err(|e| e.to_string())?;
     check_capacity(source_catalog(), scan.images.len())?;
     let mut prepared = Vec::with_capacity(scan.images.len());
+    let mut locations = Vec::with_capacity(scan.images.len());
     for image in scan.images {
         let file =
             isohopper_media::open_image(root, &image.relative_path).map_err(|e| e.to_string())?;
         prepared.push(PreparedSource::new(file, &image.relative_path)?);
+        locations.push(crate::session::ImagePath {
+            root: root.to_path_buf(),
+            relative_path: image.relative_path,
+        });
     }
     // No ID is published until the entire directory batch hashes successfully.
+    let images = register(source_catalog(), prepared)?;
+    remember_imports(&locations, &images)?;
     Ok(ImportedDirectory {
-        images: register(source_catalog(), prepared)?,
+        images,
         warnings: scan.warnings,
     })
 }
@@ -105,6 +158,21 @@ pub fn import_directory(root: &Path) -> Result<ImportedDirectory, String> {
 mod tests {
     use super::*;
     use std::fs::File;
+    #[test]
+    fn failed_persistence_rolls_back_new_imports_without_losing_existing_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("old.iso");
+        let new = root.path().join("new.iso");
+        std::fs::write(&old, b"abc").unwrap();
+        std::fs::write(&new, b"xyz").unwrap();
+        let catalogue = Mutex::new(SourceCatalog::default());
+        let existing = import_files_into(&catalogue, &[old]).unwrap();
+        let added = import_files_into(&catalogue, &[new]).unwrap();
+        assert!(retain_saved_imports(&catalogue, &added, Err("save failed".into())).is_err());
+        let remaining = catalogue.lock().unwrap().list_sources();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].source_id, existing[0].source_id);
+    }
     #[test]
     fn failed_multi_file_import_does_not_leak_unreturned_sources() {
         let root = tempfile::tempdir().unwrap();

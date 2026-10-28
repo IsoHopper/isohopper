@@ -46,6 +46,14 @@ pub fn selected_archive() -> Result<Option<ArchiveSelection>, String> {
 }
 
 pub fn select_archive(path: &Path) -> Result<ArchiveSelection, String> {
+    select_archive_inner(path, true)
+}
+
+pub(crate) fn restore_archive(path: &Path) -> Result<ArchiveSelection, String> {
+    select_archive_inner(path, false)
+}
+
+fn select_archive_inner(path: &Path, remember: bool) -> Result<ArchiveSelection, String> {
     let file = File::open(path).map_err(|e| format!("Open selected engine archive: {e}"))?;
     if file.metadata().map_err(|e| e.to_string())?.len() != ARCHIVE_BYTES as u64 {
         return Err("Choose the exact Ventoy 1.1.18 Linux archive (20,320,548 bytes).".into());
@@ -66,6 +74,10 @@ pub fn select_archive(path: &Path) -> Result<ArchiveSelection, String> {
         .into_iter()
         .map(|i| i.source_id)
         .collect();
+    current.check_release_sources(&ids)?;
+    if remember {
+        crate::session::remember_archive(path)?;
+    }
     current.release_sources(&ids)?;
     *current = candidate;
     Ok(selection(info))
@@ -109,6 +121,7 @@ impl Inputs {
         let archive_ids = std::slice::from_ref(&self.archive_id);
         sources.check_release_sources(&self.source_ids)?;
         archive.check_release_sources(archive_ids)?;
+        crate::session::release_handles(&self.source_ids)?;
         sources.release_sources(&self.source_ids)?;
         archive.release_sources(archive_ids)?;
         Ok(())

@@ -133,6 +133,35 @@ impl Job {
         self.update(|snapshot| snapshot.source_manifest = manifest)
     }
 
+    /// Verify the complete source batch before launching. The archive's cursor
+    /// and identity lease cover the connection callback through acknowledgement.
+    /// Keep any partial channel in the caller's slot so errors still clean it up.
+    fn transfer_inputs<C>(
+        &self,
+        sources: &SourceBatch,
+        archive: &SourceLease,
+        channel: &mut Option<C>,
+        mut connect: impl FnMut(&mut Option<C>, &mut File, &SourceInfo) -> Result<(), String>,
+        mut transfer: impl FnMut(&mut C, &File, &SourceInfo) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.transfer_sources(sources, |file, info| {
+            if channel.is_none() {
+                self.with_verified_archive(archive, |file, info| connect(channel, file, info))?;
+            }
+            transfer(
+                channel.as_mut().ok_or("Missing helper channel")?,
+                file,
+                info,
+            )
+        })?;
+        // An empty medium still needs its verified engine and helper session.
+        if channel.is_none() {
+            self.with_verified_archive(archive, |file, info| connect(channel, file, info))?;
+        }
+        channel.as_ref().ok_or("Missing helper channel")?;
+        Ok(())
+    }
+
     fn note_reply(
         &self,
         body: &isohopper_helper::prepare_protocol::ClientMessage,
@@ -265,6 +294,164 @@ mod tests {
     use super::*;
     use crate::imports::source_catalog::{PreparedSource, SourceCatalog};
     use std::fs::File;
+
+    fn input_fixture(
+        names: &[&str],
+    ) -> (tempfile::TempDir, SourceCatalog, SourceBatch, SourceLease) {
+        let root = tempfile::tempdir().unwrap();
+        let mut catalogue = SourceCatalog::default();
+        let mut prepared = Vec::new();
+        for name in std::iter::once(&"archive.tar.gz").chain(names.iter()) {
+            let path = root.path().join(name);
+            std::fs::write(&path, name.as_bytes()).unwrap();
+            prepared.push(PreparedSource::new(File::open(path).unwrap(), name).unwrap());
+        }
+        let infos = catalogue.insert_batch(prepared).unwrap();
+        let archive = catalogue.lease(&infos[0].source_id).unwrap();
+        let sources = catalogue
+            .lease_batch(
+                &infos[1..]
+                    .iter()
+                    .map(|i| i.source_id.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        (root, catalogue, sources, archive)
+    }
+
+    #[test]
+    fn empty_inputs_connect_with_verified_retained_archive() {
+        use std::io::Read;
+        let (_root, mut catalogue, sources, archive) = input_fixture(&[]);
+        let job = Job::new("empty-inputs".into());
+        let mut channel = None;
+        let mut connections = 0;
+        job.transfer_inputs(
+            &sources,
+            &archive,
+            &mut channel,
+            |slot, file, info| {
+                connections += 1;
+                let snapshot = job.snapshot().unwrap();
+                assert_eq!(snapshot.phase, "verifying_archive");
+                assert_eq!((snapshot.completed_bytes, snapshot.total_bytes), (14, 14));
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes, b"archive.tar.gz");
+                assert!(catalogue.release(&info.source_id).is_err());
+                *slot = Some("archive acknowledged");
+                Ok(())
+            },
+            |_, _, _| panic!("empty input must not transfer an ISO"),
+        )
+        .unwrap();
+        assert_eq!(connections, 1);
+        assert_eq!(channel, Some("archive acknowledged"));
+        assert!(job.snapshot().unwrap().source_manifest.is_empty());
+    }
+
+    #[test]
+    fn nonempty_inputs_connect_once_then_transfer_every_source() {
+        let (_root, _catalogue, sources, archive) = input_fixture(&["first.iso", "last.iso"]);
+        let job = Job::new("ordered-inputs".into());
+        let mut channel = None;
+        let mut connections = 0;
+        job.transfer_inputs(
+            &sources,
+            &archive,
+            &mut channel,
+            |slot, _, _| {
+                connections += 1;
+                *slot = Some(vec!["archive acknowledged".to_string()]);
+                Ok(())
+            },
+            |events, _, info| {
+                events.push(info.relative_path.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(connections, 1);
+        assert_eq!(
+            channel.unwrap(),
+            ["archive acknowledged", "first.iso", "last.iso"]
+        );
+        assert_eq!(job.snapshot().unwrap().source_manifest.len(), 2);
+    }
+
+    #[test]
+    fn cancelled_empty_inputs_never_connect() {
+        let (_root, _catalogue, sources, archive) = input_fixture(&[]);
+        let job = Job::new("cancelled-empty-inputs".into());
+        job.cancel().unwrap();
+        let mut channel: Option<()> = None;
+        let error = job
+            .transfer_inputs(
+                &sources,
+                &archive,
+                &mut channel,
+                |_, _, _| panic!("cancelled job must not launch"),
+                |_, _, _| panic!("cancelled job must not transfer"),
+            )
+            .unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+        assert!(channel.is_none());
+    }
+
+    #[test]
+    fn empty_inputs_retain_partial_channel_for_failure_cleanup() {
+        let (_root, _catalogue, sources, archive) = input_fixture(&[]);
+        let job = Job::new("failed-empty-inputs".into());
+        let mut channel = None;
+        let error = job
+            .transfer_inputs(
+                &sources,
+                &archive,
+                &mut channel,
+                |slot, _, _| {
+                    *slot = Some("launched helper requires cleanup");
+                    Err("archive acknowledgement failed".into())
+                },
+                |_, _, _| panic!("empty input must not transfer an ISO"),
+            )
+            .unwrap_err();
+        assert_eq!(error, "archive acknowledgement failed");
+        assert_eq!(channel, Some("launched helper requires cleanup"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_sources_and_archive_are_rehashed_before_connecting() {
+        use std::io::Write;
+        for (names, changed) in [
+            (&["first.iso", "last.iso"][..], "last.iso"),
+            (&[][..], "archive.tar.gz"),
+        ] {
+            let (root, _catalogue, sources, archive) = input_fixture(names);
+            let path = root.path().join(changed);
+            let before = std::fs::metadata(&path).unwrap();
+            let mut writer = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            writer
+                .write_all(&vec![b'!'; before.len() as usize])
+                .unwrap();
+            writer
+                .set_times(std::fs::FileTimes::new().set_modified(before.modified().unwrap()))
+                .unwrap();
+            let job = Job::new("changed-inputs".into());
+            let mut channel: Option<()> = None;
+            let error = job
+                .transfer_inputs(
+                    &sources,
+                    &archive,
+                    &mut channel,
+                    |_, _, _| panic!("changed input must not launch"),
+                    |_, _, _| panic!("changed input must not transfer"),
+                )
+                .unwrap_err();
+            assert!(error.contains("checksum mismatch"), "{error}");
+            assert!(channel.is_none());
+        }
+    }
 
     #[test]
     fn transferred_manifest_survives_catalogue_release_and_terminal_snapshots() {
