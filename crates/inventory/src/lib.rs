@@ -9,6 +9,7 @@ mod linux;
 mod macos;
 mod native;
 mod windows;
+pub mod windows_pagefiles;
 pub use native::NativeCommandRunner;
 
 const MAX_OUTPUT: usize = 2 * 1024 * 1024;

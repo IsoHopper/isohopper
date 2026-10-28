@@ -14,7 +14,9 @@ fn allowed(program: &str, args: &[&str]) -> bool {
             _ => false,
         })
         || (program == linux::LSBLK && args == linux::ARGS)
-        || (program == windows::POWERSHELL && args == windows::ARGS)
+        || (program == windows::POWERSHELL
+            && (args == windows::ARGS
+                || args == crate::windows_pagefiles::ARGS))
 }
 
 impl CommandRunner for NativeCommandRunner {
@@ -187,25 +189,30 @@ mod tests {
     }
 
     #[test]
-    fn windows_allows_only_the_fixed_read_only_script() {
+    fn windows_allows_only_the_fixed_read_only_scripts() {
         use crate::windows;
-        assert!(allowed(windows::POWERSHELL, windows::ARGS));
-        let mut changed = windows::ARGS.to_vec();
-        changed[4] = "Get-Disk | Clear-Disk";
-        assert!(!allowed(windows::POWERSHELL, &changed));
-        let mut extra = windows::ARGS.to_vec();
-        extra.push("untrusted-device");
-        assert!(!allowed(windows::POWERSHELL, &extra));
-        assert!(!allowed("pwsh", windows::ARGS));
-        assert!(!allowed(r"C:\untrusted\powershell.exe", windows::ARGS));
-        #[cfg(not(target_os = "windows"))]
-        assert_eq!(
-            NativeCommandRunner
-                .run(windows::POWERSHELL, windows::ARGS)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::Unsupported
-        );
+        for args in [
+            windows::ARGS,
+            crate::windows_pagefiles::ARGS,
+        ] {
+            assert!(allowed(windows::POWERSHELL, args));
+            let mut changed = args.to_vec();
+            changed[4] = "Get-Disk | Clear-Disk";
+            assert!(!allowed(windows::POWERSHELL, &changed));
+            let mut extra = args.to_vec();
+            extra.push("untrusted-device");
+            assert!(!allowed(windows::POWERSHELL, &extra));
+            assert!(!allowed("pwsh", args));
+            assert!(!allowed(r"C:\untrusted\powershell.exe", args));
+            #[cfg(not(target_os = "windows"))]
+            assert_eq!(
+                NativeCommandRunner
+                    .run(windows::POWERSHELL, args)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
     }
 
     #[cfg(target_os = "windows")]
