@@ -767,10 +767,12 @@ dependencies = [
 name = "isohopper-helper"
 version = "0.1.0"
 dependencies = [
+ "cap-std",
  "hex",
  "hmac",
  "isohopper-core",
  "isohopper-inventory",
+ "isohopper-media",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -231,6 +231,23 @@ jobs:
             exit 1
           fi
 
+      - name: Format and populate only a new disposable exFAT volume
+        shell: bash
+        run: |
+          if cargo +1.98.0 test --locked -p isohopper-helper --test windows_exfat_stage windows_exfat_staging_preserves_nested_files_after_reattachment -- --ignored --exact --nocapture --test-threads=1 > exfat-stage.log 2>&1; then
+            cat exfat-stage.log
+          else
+            python - <<'PY'
+          from pathlib import Path
+          text = Path('exfat-stage.log').read_text(errors='replace')[-12000:]
+          print(text)
+          text = text.encode('utf-8')[-3500:].decode('utf-8', errors='replace')
+          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=Windows exFAT staging failed::' + text)
+          PY
+            exit 1
+          fi
+
       - name: Record bounded read-only observations
         if: always()
         shell: python
@@ -251,6 +268,7 @@ jobs:
               'windows_protected.log': r'(?:Protected storage observations: successful_mappings=\d+, actual_volume_overlap_refusals=\d+, unsupported_executable_roles=\d+|UNSUPPORTED executable role=(?:Helper|Caller): external-backing query returned Win32 1; mapping remains blocked)',
               'volume-lock-test.log': r'(?:Owned formatted VHD provider binding agrees for 2 GPT partitions across a fresh collection; no physical device tested|VHD BitLocker observation: provider=(?:Reported\((?:Available|MissingNamespace|MissingClass)\)|QueryFailed\((?:UnsupportedPlatform|InvalidResponse|CommandFailed)\)), target_partitions=\d+, returned_volume_records=\d+)',
               'windows_pagefile_probe.log': r'(?:UNSUPPORTED: no active pagefiles observed; zero handle mappings verified|UNSUPPORTED: stage=open active pagefile, Win32=\d+, count=\d+|OBSERVED: \d+ active pagefile metadata handles, GUIDs and extents remained consistent; no production exclusion or backing-ancestry claim)',
+              'exfat-stage.log': r'Owned VHD exFAT staging: 3 nested files copied and SHA-256 verified after read-only reattachment; GPT and both FAT boot slots preserved; no physical disk or OS boot tested',
           }
           messages = []
           for filename, pattern in patterns.items():
@@ -288,4 +306,31 @@ jobs:
                   if component == 'filesystem' and item.get('name') in ('NTFS', 'ReFS', 'FAT', 'FAT32', 'exFAT', 'UDF', 'CDFS', 'CSVFS', 'other'):
                       result['name'] = item['name']
                   safe[component] = result
+              reopened = record.get('same_object_reopen')
+              if isinstance(reopened, dict):
+                  result = {}
+                  if reopened.get('status') in ('observed', 'changed', 'error', 'not_queried'):
+                      result['status'] = reopened['status']
+                  if reopened.get('stage') in ('initial_metadata', 'reopen', 'before_query', 'after_query'):
+                      result['stage'] = reopened['stage']
+                  for key in ('identity_matches', 'sentinels_match', 'mapping_remains_blocked'):
+                      if type(reopened.get(key)) is bool:
+                          result[key] = reopened[key]
+                  for key in ('win32_error',):
+                      value = reopened.get(key)
+                      if type(value) is int and 0 <= value <= 0xffffffff:
+                          result[key] = value
+                  for handle in ('original', 'reopened'):
+                      query = reopened.get(handle)
+                      if not isinstance(query, dict):
+                          continue
+                      observation = {}
+                      if query.get('status') in ('success', 'error', 'invalid'):
+                          observation['status'] = query['status']
+                      for key in ('win32_error', 'returned_bytes', 'version', 'provider'):
+                          value = query.get(key)
+                          if type(value) is int and 0 <= value <= 0xffffffff:
+                              observation[key] = value
+                      result[handle] = observation
+                  safe['same_object_reopen'] = result
               print('::notice title=Windows backing diagnostic::' + json.dumps(safe, separators=(',', ':')))

@@ -1,5 +1,33 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Independent read-only volume discovery for owned disposable VHD fixtures.
+pub fn has_exact_data_range(
+    plan: &isohopper_core::layout::Layout,
+    ranges: &[(u64, u64)],
+) -> std::io::Result<bool> {
+    use std::{collections::BTreeSet, io};
+    let invalid = || io::Error::other("unexpected or duplicate owned VHD volume extent");
+    isohopper_core::layout::validate(plan).map_err(|_| invalid())?;
+    let expected: BTreeSet<_> = plan
+        .partitions
+        .iter()
+        .map(|p| {
+            (
+                p.start_lba * plan.logical_sector_size,
+                (p.end_lba - p.start_lba + 1) * plan.logical_sector_size,
+            )
+        })
+        .collect();
+    let observed: BTreeSet<_> = ranges.iter().copied().collect();
+    if observed.len() != ranges.len() || !observed.is_subset(&expected) {
+        return Err(invalid());
+    }
+    let data = &plan.partitions[0];
+    Ok(observed.contains(&(
+        data.start_lba * plan.logical_sector_size,
+        (data.end_lba - data.start_lba + 1) * plan.logical_sector_size,
+    )))
+}
+
 pub fn volume_name(buffer: &[u16]) -> std::io::Result<String> {
     let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
     let end = buffer
@@ -242,24 +270,13 @@ mod native {
     }
 
     pub fn verify_filesystem(volume: &Volume) -> io::Result<()> {
+        verify_filesystem_kind(volume, "FAT32")
+    }
+
+    /// Also rejects drive letters and mounted folders on the owned fixture.
+    pub fn verify_filesystem_kind(volume: &Volume, expected: &str) -> io::Result<()> {
+        verify_no_mount_paths(volume)?;
         let name: Vec<_> = volume.name.encode_utf16().chain(Some(0)).collect();
-        let mut paths = [0u16; 1024];
-        let mut returned = 0;
-        // SAFETY: terminated GUID path and bounded output buffer remain live.
-        checked(
-            unsafe {
-                GetVolumePathNamesForVolumeNameW(
-                    name.as_ptr(),
-                    paths.as_mut_ptr(),
-                    paths.len() as u32,
-                    &mut returned,
-                )
-            },
-            "check owned VHD has no drive letters or mounted folders",
-        )?;
-        if returned == 0 || returned as usize > paths.len() || paths[0] != 0 {
-            return Err(invalid("owned VHD unexpectedly has a mount path"));
-        }
         let mut filesystem = [0u16; 32];
         // SAFETY: optional outputs are null; only this positively matched VHD
         // volume is probed for its filesystem. Buffer and path remain live.
@@ -282,8 +299,32 @@ mod native {
             .iter()
             .position(|c| *c == 0)
             .ok_or_else(|| invalid("unterminated filesystem name"))?;
-        if String::from_utf16_lossy(&filesystem[..end]) != "FAT32" {
-            return Err(invalid("owned VHD volume did not mount as FAT32"));
+        if String::from_utf16_lossy(&filesystem[..end]) != expected {
+            return Err(invalid(
+                "owned VHD volume mounted with an unexpected filesystem",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn verify_no_mount_paths(volume: &Volume) -> io::Result<()> {
+        let name: Vec<_> = volume.name.encode_utf16().chain(Some(0)).collect();
+        let mut paths = [0u16; 1024];
+        let mut returned = 0;
+        // SAFETY: terminated GUID path and bounded output buffer remain live.
+        checked(
+            unsafe {
+                GetVolumePathNamesForVolumeNameW(
+                    name.as_ptr(),
+                    paths.as_mut_ptr(),
+                    paths.len() as u32,
+                    &mut returned,
+                )
+            },
+            "check owned VHD has no drive letters or mounted folders",
+        )?;
+        if returned == 0 || returned as usize > paths.len() || paths[0] != 0 {
+            return Err(invalid("owned VHD unexpectedly has a mount path"));
         }
         Ok(())
     }
@@ -338,10 +379,34 @@ mod native {
             thread::sleep(Duration::from_millis(100));
         }
     }
+
+    /// Select only the canonical basic-data partition, allowing the two ESPs
+    /// to be enumerated or hidden. Every observed own-disk range must match the
+    /// validated plan; no approximate range, duplicate or foreign range passes.
+    pub fn wait_for_data_volume(disk_number: u32, plan: &Layout) -> io::Result<Volume> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let volumes = enumerate(disk_number)?;
+            let ranges: Vec<_> = volumes.iter().map(|v| (v.start, v.length)).collect();
+            if super::has_exact_data_range(plan, &ranges)? {
+                return Ok(volumes
+                    .into_iter()
+                    .find(|v| v.start == plan.partitions[0].start_lba * plan.logical_sector_size)
+                    .expect("validated exact data range"));
+            }
+            if Instant::now() >= deadline {
+                return Err(invalid(
+                    "owned VHD data volume did not enumerate within 10 seconds",
+                ));
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 #[cfg(windows)]
 #[allow(unused_imports)] // Individual integration binaries use different helpers.
 pub use native::{
-    open_payload, verify_filesystem, verify_payload, volume_extents, wait_for_volumes,
+    Volume, open_payload, verify_filesystem, verify_filesystem_kind, verify_no_mount_paths,
+    verify_payload, volume_extents, wait_for_data_volume, wait_for_volumes,
 };
