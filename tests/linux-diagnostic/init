@@ -1,0 +1,13 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -eu
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sysfs /sys
+/bin/busybox mount -t devtmpfs devtmpfs /dev
+[ "$$" -eq 1 ]
+/bin/busybox uname -a
+printf 'ISOHOPPER:LINUX:INIT_PID1\n'
+/bin/busybox sync
+/bin/busybox poweroff -f
+printf 'ISOHOPPER:LINUX:FAIL\n'
+exit 1

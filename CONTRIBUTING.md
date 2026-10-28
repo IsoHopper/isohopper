@@ -57,6 +57,26 @@ PATH="$PWD/.local/secure-boot-venv/bin:$PATH" python3 scripts/secure-boot-smoke.
 
 Choose a new evidence directory for each run. The script accepts only bounded regular-file inputs, uses no host firmware interface, and generates keys, signed copies, images, and variable stores in private temporary storage outside the evidence directory. It removes that storage on exit. Evidence contains logs, results, and public hashes only. Each guest has a 90-second default limit; the full run is bounded to nine minutes. Do not upload temporary storage or reuse these test keys for releases.
 
+For a Linux handoff test, `tests/linux-diagnostic` builds a small unified kernel image from pinned official Ubuntu packages: kernel `6.8.0-147-generic` (`6.8.0-147.147`), the systemd EFI stub, and static BusyBox. It uses a pinned Ubuntu base and package snapshot, normalizes the initramfs, and exports package provenance, hashes, and upstream license notices. Docker needs network access to Ubuntu while building; the build context contains only the fixture sources. After building the launcher above, run from the repository root:
+
+```sh
+mkdir -p .local
+diagnostic_output="$(mktemp -d "$PWD/.local/linux-diagnostic.XXXXXX")"
+docker build --platform linux/amd64 \
+  --output "type=local,dest=$diagnostic_output" tests/linux-diagnostic
+cargo run -p isohopper-cli --locked -- image create "$diagnostic_output/usb.img" \
+  --size-mib 256 --efi target/x86_64-unknown-uefi/release/isohopper-launcher.efi \
+  --utility "$diagnostic_output/diagnostic.efi"
+cargo run -p isohopper-cli --locked -- image verify "$diagnostic_output/usb.img" \
+  --efi target/x86_64-unknown-uefi/release/isohopper-launcher.efi \
+  --utility "$diagnostic_output/diagnostic.efi"
+python3 scripts/firmware-smoke.py --image "$diagnostic_output/usb.img" \
+  --code /path/to/OVMF_CODE.fd --vars /path/to/OVMF_VARS.fd \
+  --action linux-diagnostic --log "$diagnostic_output/serial.log"
+```
+
+Success requires the launcher entry, utility start, Linux version banner, diagnostic PID 1 marker, and clean guest power-off in order, followed by QEMU exit status zero. This tests only the custom diagnostic kernel/initramfs; it establishes no installer or general distribution compatibility. To run its four Secure Boot cases, use the `secure-boot-smoke.py` command above with `--utility "$diagnostic_output/diagnostic.efi"`, add `--utility-kind linux-diagnostic`, and choose a fresh evidence directory. The default EFI utility mode is unchanged. Keep generated binaries and logs local; the combined binary contains separately licensed upstream components, whose notices are exported with it.
+
 The manual Windows inventory workflow runs fixture tests and read-only discovery on `windows-2022`. Its live smoke test reports counts only. This validates the inventory provider; it does not establish broader Windows or Studio compatibility.
 
 ## Review expectations
