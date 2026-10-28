@@ -130,16 +130,23 @@ fn rename(file: &File, destination: &Path) -> Result<(), String> {
     if name.is_empty() || name.len() >= 32768 || name.contains(&0) {
         return Err("Invalid installation destination".into());
     }
-    let length = offset_of!(FILE_RENAME_INFO, FileName) + name.len() * 2;
+    // Win32 accepts a terminated path even though FileNameLength excludes
+    // its NUL. Include it in both storage and the API buffer size; alignment
+    // padding is not guaranteed to provide a terminator.
+    let length = (offset_of!(FILE_RENAME_INFO, FileName) + (name.len() + 1) * 2)
+        .max(size_of::<FILE_RENAME_INFO>());
     let mut storage = vec![0u64; length.div_ceil(8)];
     // SAFETY: aligned zeroed allocation covers the fixed header and UTF-16
-    // tail; the owned DELETE handle remains live. No overwrite is permitted.
+    // tail including its terminator; the owned DELETE handle remains live.
+    // No overwrite is permitted.
     unsafe {
         let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
         (*info).Anonymous.ReplaceIfExists = false;
         (*info).RootDirectory = ptr::null_mut();
         (*info).FileNameLength = (name.len() * 2) as u32;
-        ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+        let tail = ptr::addr_of_mut!((*info).FileName).cast::<u16>();
+        ptr::copy_nonoverlapping(name.as_ptr(), tail, name.len());
+        *tail.add(name.len()) = 0;
         if SetFileInformationByHandle(
             file.as_raw_handle(),
             FileRenameInfo,
@@ -649,6 +656,7 @@ mod tests {
                 .unwrap_or(0);
             let current = if parent_rename.is_ok() { &moved } else { &path };
             let child = OpenOptions::new()
+                .write(true)
                 .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
                 .share_mode(0)
                 .create_new(true)
@@ -661,6 +669,42 @@ mod tests {
             );
             drop(guard);
         }
+    }
+
+    fn rename_diagnostics(point: &str, file: &File, root: &Path, expected: &Path) {
+        let expected = expected
+            .to_string_lossy()
+            .chars()
+            .take(512)
+            .collect::<String>();
+        let retained = final_name(file).map(|name| {
+            String::from_utf16_lossy(&name)
+                .chars()
+                .take(512)
+                .collect::<String>()
+        });
+        let entries = std::fs::read_dir(root)
+            .map(|entries| {
+                entries
+                    .take(8)
+                    .map(|entry| {
+                        entry
+                            .map(|entry| {
+                                entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .chars()
+                                    .take(128)
+                                    .collect::<String>()
+                            })
+                            .map_err(|error| error.raw_os_error())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|error| error.raw_os_error());
+        eprintln!(
+            "INSTALLER_RENAME_DIAGNOSTIC point={point}; expected={expected:?}; retained={retained:?}; entries={entries:?}"
+        );
     }
 
     #[test]
@@ -709,18 +753,30 @@ mod tests {
             .unwrap_err();
         assert_eq!(busy_or_unsafe("Mapped executable", mapped).code(), 10);
         let source = root.join("source.exe");
-        let destination = root.join("destination.exe");
+        let mut destination = root.join("destination.exe");
         let mut file = fresh_file(&source, &sd);
         file.write_all(b"verified payload").unwrap();
         file.sync_all().unwrap();
         assert_eq!(require_regular(&file, true).unwrap(), 16);
         assert_eq!(File::open(&source).unwrap_err().raw_os_error(), Some(32));
+        rename_diagnostics("before", &file, &root, &source);
         rename(&file, &destination).unwrap();
+        rename_diagnostics("after", &file, &root, &destination);
         assert!(!source.exists());
         assert_eq!(
             File::open(&destination).unwrap_err().raw_os_error(),
             Some(32)
         );
+        // Exercise every UTF-16 tail alignment against the eight-byte
+        // allocation, including the case with no incidental spare padding.
+        for extra in 0..4 {
+            let next = root.join(format!("renamed{}.exe", "x".repeat(extra)));
+            rename(&file, &next).unwrap();
+            rename_diagnostics("alignment", &file, &root, &next);
+            assert!(!destination.exists());
+            assert_eq!(File::open(&next).unwrap_err().raw_os_error(), Some(32));
+            destination = next;
+        }
         let collision = root.join("existing.exe");
         std::fs::write(&collision, b"must not overwrite").unwrap();
         assert!(rename(&file, &collision).is_err());
