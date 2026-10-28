@@ -29,6 +29,8 @@ pub struct TargetObservation {
     pub handle: HandleObservation,
     pub coverage: TargetCoverage,
     pub disk: WindowsDiskRecord,
+    /// Exact CM-enumerated path actually opened, separate from provider spelling.
+    pub interface_path: String,
     pub partitions: Vec<WindowsPartitionRecord>,
 }
 
@@ -55,9 +57,10 @@ pub enum TargetError {
 }
 
 /// Pure comparison for provider/handle observations. It performs no I/O and
-/// does not establish their provenance. Exact present disk-interface membership
-/// is required; no disk-number path construction or identifier normalization is
-/// used. Unknown provider safety flags remain unknown in the returned record.
+/// does not establish their provenance. An unambiguous present interface is
+/// selected by full-path ASCII-case-insensitive comparison; native handle
+/// equality must still establish identity. No path is constructed or rewritten.
+/// Unknown provider safety flags remain unknown in the returned record.
 pub fn assess(
     target: &HandleObservation,
     coverage: &TargetCoverage,
@@ -87,20 +90,32 @@ pub fn assess(
         .path
         .as_deref()
         .ok_or(TargetError::Invalid("provider disk path"))?;
-    require_interface(path, present_disk_interfaces)?;
+    let interface_path = resolve_interface(path, present_disk_interfaces)?.to_owned();
     let geometry = &target.device.geometry;
-    if disk.size != Some(geometry.size_bytes)
-        || disk.logical_sector_size != Some(u64::from(geometry.logical_sector_size))
-        || disk.physical_sector_size != Some(u64::from(geometry.physical_sector_size))
-        || disk.bus_type.map(u32::from) != Some(target.device.bus_type)
-        || disk
-            .serial_number
-            .as_deref()
-            .is_some_and(|value| value != target.device.serial)
-    {
-        return Err(TargetError::Mismatch(
-            "provider geometry, bus type or reported serial",
-        ));
+    for (matches, reason) in [
+        (disk.size == Some(geometry.size_bytes), "provider disk size"),
+        (
+            disk.logical_sector_size == Some(u64::from(geometry.logical_sector_size)),
+            "provider logical sector size",
+        ),
+        (
+            disk.physical_sector_size == Some(u64::from(geometry.physical_sector_size)),
+            "provider physical sector size",
+        ),
+        (
+            disk.bus_type.map(u32::from) == Some(target.device.bus_type),
+            "provider bus type",
+        ),
+        (
+            disk.serial_number
+                .as_deref()
+                .is_none_or(|value| value == target.device.serial),
+            "provider reported serial",
+        ),
+    ] {
+        if !matches {
+            return Err(TargetError::Mismatch(reason));
+        }
     }
     let mut partitions: Vec<_> = evidence
         .partitions
@@ -173,6 +188,7 @@ pub fn assess(
         handle: target.clone(),
         coverage: coverage.clone(),
         disk: disk.clone(),
+        interface_path,
         partitions,
     })
 }
@@ -207,28 +223,32 @@ fn valid_interface_text(path: &str) -> bool {
         && !path.chars().any(char::is_control)
 }
 
-fn require_interface(path: &str, interfaces: &[String]) -> Result<(), TargetError> {
+// Case matching selects a candidate, never proves device identity. Always open
+// the exact CM-enumerated string, then compare retained native identities. No
+// trimming, slash/namespace rewriting, Unicode folding or VPD normalization.
+fn resolve_interface<'a>(path: &str, interfaces: &'a [String]) -> Result<&'a str, TargetError> {
     if !valid_interface_text(path) || interfaces.len() > MAX_INTERFACES {
         return Err(TargetError::Invalid("disk interface path or count"));
     }
     let mut distinct = BTreeSet::new();
+    let mut selected = None;
     for value in interfaces {
-        if !valid_interface_text(value) || !distinct.insert(value.as_str()) {
+        if !valid_interface_text(value) || !distinct.insert(value.to_ascii_lowercase()) {
             return Err(TargetError::Invalid(
-                "invalid or duplicate present disk interface",
+                "invalid or case-ambiguous present disk interface",
             ));
         }
+        if value.eq_ignore_ascii_case(path) {
+            selected = Some(value.as_str());
+        }
     }
-    if !distinct.contains(path) {
-        return Err(TargetError::Invalid(
-            "provider path is not an exact present disk interface",
-        ));
-    }
-    Ok(())
+    selected.ok_or(TargetError::Invalid(
+        "provider path has no matching present disk interface",
+    ))
 }
 
 // GPT GUID text has a documented structure. Device-interface paths and VPD
-// identifiers do not use this parser and are never normalized for a join.
+// identifiers do not use this parser.
 fn parse_guid(value: &str) -> Result<[u8; 16], TargetError> {
     let text = value
         .strip_prefix('{')

@@ -36,10 +36,11 @@ pub struct BoundTarget {
 
 impl BoundTarget {
     /// Correlate a fresh provider record with an already retained target.
-    /// The target path is never reconstructed from an OS disk number. Only an
-    /// exact path from a fresh present GUID_DEVINTERFACE_DISK list is opened.
-    /// Case/spelling differences between providers are unsupported rather than
-    /// repaired; UniqueId and UniqueIdFormat are retained as opaque metadata.
+    /// The target path is never reconstructed from an OS disk number. Full-path
+    /// ASCII case comparison selects one present GUID_DEVINTERFACE_DISK entry;
+    /// its exact enumerated spelling is opened and native identity is checked.
+    /// Other spelling differences are unsupported. UniqueId and UniqueIdFormat
+    /// are retained as opaque metadata.
     ///
     /// # Safety
     /// `target` must be a live whole-disk handle opened with read access only,
@@ -125,7 +126,7 @@ impl Backend for Native<'_> {
         present_interfaces()
     }
     fn open(&mut self, path: &str) -> Result<OwnedHandle, TargetError> {
-        // state::refresh verified exact membership in the immediately preceding
+        // state::refresh selected this exact entry from the immediately preceding
         // present disk-interface query. No string enters a shell or command.
         OpenOptions::new()
             .read(true)
@@ -158,8 +159,8 @@ unsafe fn observe_handle(handle: &OwnedHandle) -> Result<HandleObservation, Targ
 }
 
 // The class identifies disk interfaces, not arbitrary paths. Microsoft says
-// not to parse device-interface symbolic names; exact membership establishes
-// their origin before opening, then native handle identity establishes target.
+// not to parse device-interface symbolic names; only original CM entries are
+// opened, then native handle identity establishes the target.
 // https://learn.microsoft.com/en-us/windows-hardware/drivers/install/guid-devinterface-disk
 // https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdigetdeviceinterfacedetailw
 // Lengths are UTF-16 units. Hotplug can grow the list between the two calls;

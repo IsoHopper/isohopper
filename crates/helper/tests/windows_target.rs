@@ -223,7 +223,7 @@ fn provider_geometry_bus_and_partition_changes_refuse_binding() {
 }
 
 #[test]
-fn exact_present_interface_membership_required_before_path_can_be_used() {
+fn present_interface_membership_required_before_path_can_be_used() {
     let (handle, coverage, evidence, interfaces) = fixture();
     for path in [
         r"C:\example.iso",
@@ -247,17 +247,60 @@ fn exact_present_interface_membership_required_before_path_can_be_used() {
             &coverage,
             &handle,
             &evidence,
-            &[PATH.to_uppercase()]
+            &[PATH.into(), PATH.into()]
         )
         .is_err()
     );
+}
+
+#[test]
+fn ascii_case_selection_preserves_exact_os_path_and_native_identity_check() {
+    let (handle, coverage, evidence, _) = fixture();
+    let os_path = PATH.to_ascii_uppercase();
+    let result = assess(
+        &handle,
+        &coverage,
+        &handle,
+        &evidence,
+        std::slice::from_ref(&os_path),
+    )
+    .unwrap();
+    assert_eq!(result.interface_path, os_path);
+    assert_eq!(result.disk.path, evidence.disks[0].path);
+    let mut changed = handle.clone();
+    changed.device.serial.push('x');
+    assert!(assess(&handle, &coverage, &changed, &evidence, &[os_path]).is_err());
+}
+
+#[test]
+fn ambiguous_case_equivalents_and_other_path_rewrites_are_rejected() {
+    let (handle, coverage, evidence, _) = fixture();
     assert!(
         assess(
             &handle,
             &coverage,
             &handle,
             &evidence,
-            &[PATH.into(), PATH.into()]
+            &[PATH.into(), PATH.to_ascii_uppercase()]
+        )
+        .is_err()
+    );
+    for rewritten in [
+        format!("{PATH}\\"),
+        PATH.replacen("?", ".", 1),
+        format!(" {PATH}"),
+    ] {
+        assert!(assess(&handle, &coverage, &handle, &evidence, &[rewritten]).is_err());
+    }
+    let mut unicode = evidence;
+    unicode.disks[0].path = Some("interface-ä".into());
+    assert!(
+        assess(
+            &handle,
+            &coverage,
+            &handle,
+            &unicode,
+            &["INTERFACE-Ä".into()]
         )
         .is_err()
     );
@@ -341,7 +384,17 @@ fn windows_vhd_provider_path_binds_to_retained_target() -> Result<(), Box<dyn st
             assert_eq!(bound.observation().handle.identity, identity);
             assert_eq!(bound.observation().handle.device, expected);
             assert_eq!(bound.observation().disk.number, number);
-            assert!(bound.observation().disk.path.is_some());
+            let observation = bound.observation();
+            let provider_path = observation.disk.path.as_deref().expect("provider path");
+            assert!(provider_path.eq_ignore_ascii_case(&observation.interface_path));
+            println!(
+                "Owned VHD interface selection: match={}",
+                if provider_path == observation.interface_path {
+                    "exact"
+                } else {
+                    "ascii_case_only"
+                }
+            );
             assert!(bound.observation().partitions.is_empty());
             let first = bound.observation().clone();
             assert_eq!(bound.revalidate()?, &first);

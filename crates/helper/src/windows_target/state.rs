@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::{
-    HandleObservation, TargetError, TargetObservation, assess, candidate, require_interface,
+    HandleObservation, TargetError, TargetObservation, assess, candidate, resolve_interface,
 };
 use crate::windows_lock::TargetCoverage;
 use isohopper_inventory::windows::WindowsEvidence;
@@ -45,9 +45,9 @@ pub(super) fn refresh<B: Backend>(
             .path
             .as_deref()
             .ok_or(TargetError::Invalid("provider disk path"))?;
-        require_interface(path, &interfaces)?;
-        // Membership is established before this sole path-opening operation.
-        let handle = backend.open(path)?;
+        let interface = resolve_interface(path, &interfaces)?;
+        // Open the exact enumerated spelling, never a rewritten provider path.
+        let handle = backend.open(interface)?;
         let provider = backend.inspect(&handle)?;
         let result = assess(&before, &coverage, &provider, &evidence, &interfaces)?;
         Ok::<_, TargetError>((result, handle))
@@ -91,6 +91,8 @@ mod tests {
         events: Vec<&'static str>,
         collected: bool,
         bad_path: bool,
+        os_case_variant: bool,
+        ambiguous_interfaces: bool,
         collect_fails: bool,
         target_changes: bool,
         old_changes: bool,
@@ -146,6 +148,8 @@ mod tests {
             events: vec![],
             collected: false,
             bad_path: false,
+            os_case_variant: false,
+            ambiguous_interfaces: false,
             collect_fails: false,
             target_changes: false,
             old_changes: false,
@@ -186,11 +190,23 @@ mod tests {
         }
         fn interfaces(&mut self) -> Result<Vec<String>, TargetError> {
             self.events.push("interfaces");
-            Ok(vec![PATH.into()])
+            if self.ambiguous_interfaces {
+                return Ok(vec![PATH.into(), PATH.to_ascii_uppercase()]);
+            }
+            Ok(vec![if self.os_case_variant {
+                PATH.to_ascii_uppercase()
+            } else {
+                PATH.into()
+            }])
         }
         fn open(&mut self, path: &str) -> Result<u8, TargetError> {
             self.events.push("open");
-            assert_eq!(path, PATH);
+            let expected = if self.os_case_variant {
+                PATH.to_ascii_uppercase()
+            } else {
+                PATH.into()
+            };
+            assert_eq!(path, expected);
             Ok(2)
         }
         fn inspect(&mut self, handle: &u8) -> Result<HandleObservation, TargetError> {
@@ -234,7 +250,36 @@ mod tests {
     }
 
     #[test]
+    fn case_matching_opens_original_os_entry_and_keeps_provider_spelling() {
+        let mut backend = fixture();
+        backend.os_case_variant = true;
+        let expected = backend.observed.clone();
+        let (observed, _) = refresh(&mut backend, &expected, None).unwrap();
+        assert_eq!(observed.interface_path, PATH.to_ascii_uppercase());
+        assert_eq!(observed.disk.path.as_deref(), Some(PATH));
+        assert!(backend.events.contains(&"open"));
+        backend.collected = false;
+        assert_eq!(
+            refresh(&mut backend, &expected, Some((&1, &observed)))
+                .unwrap()
+                .0,
+            observed
+        );
+        backend.collected = false;
+        backend.os_case_variant = false;
+        assert!(matches!(
+            refresh(&mut backend, &expected, Some((&1, &observed))),
+            Err(TargetError::Mismatch("provider record changed"))
+        ));
+    }
+
+    #[test]
     fn unlisted_paths_never_reach_open_and_failed_collection_is_bracketed() {
+        let mut ambiguous = fixture();
+        ambiguous.ambiguous_interfaces = true;
+        let expected = ambiguous.observed.clone();
+        assert!(refresh(&mut ambiguous, &expected, None).is_err());
+        assert!(!ambiguous.events.contains(&"open"));
         let mut backend = fixture();
         let expected = backend.observed.clone();
         backend.bad_path = true;
