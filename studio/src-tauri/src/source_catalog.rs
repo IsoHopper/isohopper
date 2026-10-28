@@ -290,6 +290,45 @@ impl SourceBatch {
             .iter()
             .map(|lease| lease.with_verified_source(|_, info| Ok(info.clone())))
             .collect::<Result<Vec<_>, _>>()?;
+        self.check_all_unchanged()?;
+        Ok(infos)
+    }
+
+    /// Verify the complete batch once, then visit retained files in requested
+    /// order with immutable backend metadata. The borrowed file starts at zero;
+    /// its cursor is locked only for that callback. No catalogue lock is held.
+    /// Do not recursively acquire the same source from inside its callback.
+    ///
+    /// This is not a transaction: earlier callbacks may have transferred handles
+    /// before a later failure. The first callback error is propagated unchanged,
+    /// and no partial success report is returned. All leases stay owned by this
+    /// batch on success or failure; keep it alive through receiver acknowledgement.
+    /// The receiver must verify the bytes it consumes against these digests;
+    /// metadata checks cannot rule out transient external writes after hashing.
+    #[allow(dead_code)] // Native preparation only; never exposed to the renderer.
+    pub fn visit_verified(
+        &self,
+        mut visit: impl FnMut(&File, &SourceInfo) -> Result<(), String>,
+    ) -> Result<Vec<SourceInfo>, String> {
+        let infos = self.verify_all()?;
+        for (lease, info) in self.leases.iter().zip(&infos) {
+            let mut source = lease.0.lock().map_err(|_| "Source lock is unavailable.")?;
+            source.unchanged()?;
+            source
+                .handle
+                .as_file_mut()
+                .rewind()
+                .map_err(|e| e.to_string())?;
+            let result = visit(source.handle.as_file(), info);
+            let stability = source.unchanged();
+            result?;
+            stability?;
+        }
+        self.check_all_unchanged()?;
+        Ok(infos)
+    }
+
+    fn check_all_unchanged(&self) -> Result<(), String> {
         for lease in &self.leases {
             lease
                 .0
@@ -297,7 +336,7 @@ impl SourceBatch {
                 .map_err(|_| "Source lock is unavailable.")?
                 .unchanged()?;
         }
-        Ok(infos)
+        Ok(())
     }
 }
 
@@ -533,6 +572,208 @@ mod tests {
         drop(batch);
         shared.lock().unwrap().release_sources(&ids).unwrap();
         assert!(shared.lock().unwrap().list_sources().is_empty());
+    }
+
+    #[test]
+    fn batch_visitor_preserves_order_metadata_and_all_leases_during_callbacks() {
+        let root = tempfile::tempdir().unwrap();
+        let mut catalog = SourceCatalog::default();
+        let contents: [&[u8]; 3] = [b"mac", b"windows", b"linux"];
+        let infos = catalog
+            .insert_batch(vec![
+                prepared(root.path(), "Mac/boot.iso", contents[0]),
+                prepared(root.path(), "Windows/Install Media/boot.iso", contents[1]),
+                prepared(root.path(), "Linux/日本語.iso", contents[2]),
+            ])
+            .unwrap();
+        let order = [2, 0, 1];
+        let ids = order.map(|index| infos[index].source_id.clone());
+        let shared = Mutex::new(catalog);
+        let batch = shared.lock().unwrap().lease_batch(&ids).unwrap();
+        let mut visited = Vec::new();
+        let verified = batch
+            .visit_verified(|mut file, info| {
+                // The batch owns every lease throughout the call, while the
+                // catalogue stays available even during native transfer work.
+                let mut catalog = shared.try_lock().unwrap();
+                for id in &ids {
+                    assert!(catalog.release(id).is_err());
+                }
+                // Another lease may have moved a later source's cursor since
+                // preflight. Each visitor must still begin at offset zero.
+                let later = if visited.is_empty() {
+                    Some(catalog.lease(&ids[1]).unwrap())
+                } else {
+                    None
+                };
+                drop(catalog);
+                if let Some(later) = later {
+                    later
+                        .with_verified_source(|file, _| {
+                            file.read_exact(&mut [0_u8; 1]).unwrap();
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                let index = order[visited.len()];
+                assert_eq!(info.relative_path, infos[index].relative_path);
+                assert_eq!(info.verification, infos[index].verification);
+                let mut actual = Vec::new();
+                file.read_to_end(&mut actual).unwrap();
+                assert_eq!(actual, contents[index]);
+                visited.push(info.source_id.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(visited, ids);
+        assert_eq!(
+            verified
+                .iter()
+                .map(|info| &info.source_id)
+                .collect::<Vec<_>>(),
+            ids.iter().collect::<Vec<_>>()
+        );
+        assert!(shared.lock().unwrap().release_sources(&ids).is_err());
+        drop(batch);
+        shared.lock().unwrap().release_sources(&ids).unwrap();
+    }
+
+    #[test]
+    fn batch_visitor_error_stops_callbacks_but_keeps_every_lease_and_allows_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let mut catalog = SourceCatalog::default();
+        let infos = catalog
+            .insert_batch(vec![
+                prepared(root.path(), "first.iso", b"abc"),
+                prepared(root.path(), "second.iso", b"xyz"),
+            ])
+            .unwrap();
+        let ids = infos
+            .iter()
+            .map(|info| info.source_id.clone())
+            .collect::<Vec<_>>();
+        let batch = catalog.lease_batch(&ids).unwrap();
+        let mut calls = 0;
+        assert_eq!(
+            batch
+                .visit_verified(|_, _| {
+                    calls += 1;
+                    Err("native transfer refused the handle".into())
+                })
+                .unwrap_err(),
+            "native transfer refused the handle"
+        );
+        assert_eq!(calls, 1);
+        for id in &ids {
+            assert!(catalog.release(id).is_err());
+        }
+        let mut retried = 0;
+        batch
+            .visit_verified(|mut file, _| {
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes, if retried == 0 { b"abc" } else { b"xyz" });
+                retried += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(retried, 2);
+        drop(batch);
+        catalog.release_sources(&ids).unwrap();
+    }
+
+    #[test]
+    fn batch_visitor_retains_original_files_after_catalogue_drop_and_path_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let batch = {
+            let mut catalog = SourceCatalog::default();
+            let infos = catalog
+                .insert_batch(vec![prepared(root.path(), "boot.iso", b"original")])
+                .unwrap();
+            catalog.lease_batch(&[infos[0].source_id.clone()]).unwrap()
+        };
+        std::fs::rename(
+            root.path().join("boot.iso"),
+            root.path().join("retained.iso"),
+        )
+        .unwrap();
+        std::fs::write(root.path().join("boot.iso"), b"replacement").unwrap();
+        batch
+            .visit_verified(|mut file, info| {
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes, b"original");
+                assert_eq!(info.relative_path, "boot.iso");
+                assert_eq!(info.bytes, 8);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_visitor_verifies_late_sources_before_calling_any_visitor() {
+        let root = tempfile::tempdir().unwrap();
+        let mut catalog = SourceCatalog::default();
+        let infos = catalog
+            .insert_batch(vec![
+                prepared(root.path(), "first.iso", b"abc"),
+                prepared(root.path(), "last.iso", b"xyz"),
+            ])
+            .unwrap();
+        let ids = infos
+            .iter()
+            .map(|info| info.source_id.clone())
+            .collect::<Vec<_>>();
+        let batch = catalog.lease_batch(&ids).unwrap();
+        let path = root.path().join("last.iso");
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut writer = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        writer.write_all(b"bad").unwrap();
+        writer
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let mut calls = 0;
+        let error = batch
+            .visit_verified(|_, _| {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.contains("checksum mismatch"));
+        assert_eq!(calls, 0);
+        assert!(catalog.release_sources(&ids).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_visitor_detects_an_earlier_source_changed_by_a_later_callback() {
+        let root = tempfile::tempdir().unwrap();
+        let mut catalog = SourceCatalog::default();
+        let infos = catalog
+            .insert_batch(vec![
+                prepared(root.path(), "first.iso", b"abc"),
+                prepared(root.path(), "last.iso", b"xyz"),
+            ])
+            .unwrap();
+        let ids = infos
+            .iter()
+            .map(|info| info.source_id.clone())
+            .collect::<Vec<_>>();
+        let batch = catalog.lease_batch(&ids).unwrap();
+        let mut calls = 0;
+        let error = batch
+            .visit_verified(|_, _| {
+                calls += 1;
+                if calls == 2 {
+                    std::fs::write(root.path().join("first.iso"), b"changed length").unwrap();
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.contains("changed"));
+        assert_eq!(calls, 2);
+        assert!(catalog.release_sources(&ids).is_err());
     }
 
     #[test]
