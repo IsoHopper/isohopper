@@ -70,6 +70,48 @@ jobs:
           done
           exit "$failed"
 
+      - name: Check BitLocker PowerShell projection with controlled CIM responses
+        shell: bash
+        run: |
+          if cargo +1.98.0 test --locked -p isohopper-inventory --lib windows_encryption::tests::windows_projects_bitlocker_methods_without_inventing_success -- --exact --nocapture > encryption-projection.log 2>&1; then
+            cat encryption-projection.log
+          else
+            python - <<'PY'
+          from pathlib import Path
+          text = Path('encryption-projection.log').read_text(errors='replace')[-12000:]
+          print(text)
+          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=Windows encryption projection failed::' + text)
+          PY
+            exit 1
+          fi
+
+      - name: Inspect protected storage and retained disk identity without writes
+        shell: bash
+        run: |
+          failed=0
+          for probe in \
+            windows_protected:windows_protected_system_and_executable_mappings_are_read_only \
+            windows_identity:windows_vhd_identity_queries_agree_or_report_unsupported \
+            windows_pagefile_probe:windows_active_pagefile_zero_access_metadata_probe; do
+            target="${probe%%:*}"
+            test_name="${probe#*:}"
+            if cargo +1.98.0 test --locked -p isohopper-helper --test "$target" "$test_name" -- --ignored --exact --nocapture --test-threads=1 > "$target.log" 2>&1; then
+              cat "$target.log"
+            else
+              failed=1
+              python - "$target.log" <<'PY'
+          import sys
+          from pathlib import Path
+          text = Path(sys.argv[1]).read_text(errors='replace')[-12000:]
+          print(text)
+          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=Windows retained storage inspection failed::' + text)
+          PY
+            fi
+          done
+          exit "$failed"
+
       - name: Check actual filesystem copies and readback on Windows
         shell: bash
         run: |
@@ -165,3 +207,23 @@ jobs:
           PY
             exit 1
           fi
+
+      - name: Record bounded read-only observations
+        if: always()
+        shell: python
+        run: |
+          import re
+          from pathlib import Path
+          patterns = {
+              'windows_pagefiles.log': r'active_pagefiles=\d+',
+              'windows_encryption.log': r'BitLocker provider (?:observed \d+ volumes; no write authorization|unavailable: (?:MissingNamespace|MissingClass); encryption state unknown)',
+              'windows_pools.log': r'Observed \d+ physical disks; \d+ have concrete pool associations',
+              'windows_identity.log': r'Owned (?:read-only VHD identity agrees across retained handles; no physical device tested|VHD reports a random GUID \(flags \d+\); identity binding remains unsupported, not accepted|VHD has no device GUID; identity binding remains unsupported, not accepted|VHD driver does not implement the identity query \(Win32 Some\(\d+\)\); binding remains unsupported)',
+              'windows_protected.log': r'Observed one Windows directory and two executable roles; all three actual-volume overlaps refused',
+              'windows_pagefile_probe.log': r'(?:UNSUPPORTED: no active pagefiles observed; zero handle mappings verified|UNSUPPORTED: stage=open active pagefile, Win32=\d+, count=\d+|OBSERVED: \d+ active pagefile metadata handles, GUIDs and extents remained consistent; no production exclusion or backing-ancestry claim)',
+          }
+          for filename, pattern in patterns.items():
+              path = Path(filename)
+              if path.exists():
+                  for message in re.findall(pattern, path.read_text(errors='replace')):
+                      print('::notice title=Windows observation::' + message)

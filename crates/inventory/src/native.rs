@@ -158,7 +158,13 @@ fn execute(program: &Path, args: &[&str]) -> io::Result<CommandOutput> {
 pub(crate) fn test_powershell_script(script: &str) -> io::Result<CommandOutput> {
     execute(
         &powershell_path()?,
-        &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ],
     )
 }
 
