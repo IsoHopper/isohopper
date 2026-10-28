@@ -112,6 +112,18 @@ impl BoundTarget {
         &self.observation
     }
 
+    /// Check only the two retained disk handles. This does not refresh provider
+    /// records, paths or partition coverage; callers need `revalidate` for those.
+    pub(crate) fn revalidate_handles(&self) -> Result<(), TargetError> {
+        // SAFETY: both handles retain this owner's synchronous read-only contract.
+        let target = unsafe { observe_handle(&self.target)? };
+        let provider = unsafe { observe_handle(&self.provider)? };
+        if target != self.observation.handle || provider != self.observation.handle {
+            return Err(TargetError::Mismatch("retained disk handle changed"));
+        }
+        Ok(())
+    }
+
     /// Observe BitLocker for this owner's exact retained volume coverage.
     /// Recheck native identity, provider records and topology on both sides of
     /// collection, including when collection fails. The report preserves

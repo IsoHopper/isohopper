@@ -427,4 +427,4 @@ mod tests;
 mod build;
 #[path = "device.rs"]
 mod device;
-pub use build::{SealedStage, build};
+pub use build::{SealedStage, TargetBoundStage, build};

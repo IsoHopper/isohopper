@@ -27,6 +27,9 @@ use windows_sys::Win32::{
 
 const SEED: &str = "seed.img";
 const FINAL: &str = "final.img";
+#[path = "host.rs"]
+mod host;
+pub use host::TargetBoundStage;
 fn cancelled(cancel: &AtomicBool) -> Result<(), StageError> {
     if cancel.load(Ordering::Relaxed) {
         Err(StageError::Invalid("staging cancelled"))

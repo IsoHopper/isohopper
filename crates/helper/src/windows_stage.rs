@@ -39,10 +39,12 @@ mod native;
 #[cfg(any(windows, test))]
 mod policy;
 #[cfg(windows)]
-pub use native::{OwnedStageDisk, SealedStage, build};
+pub use native::{OwnedStageDisk, SealedStage, TargetBoundStage, build};
 
 #[cfg(any(windows, test))]
 mod build_policy;
+#[cfg(any(windows, test))]
+mod host_policy;
 
 /// One backend-owned source, including optional generated config.
 /// Construction does not authenticate its origin; the caller supplies that boundary.
