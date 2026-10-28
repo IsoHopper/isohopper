@@ -148,6 +148,49 @@ impl BoundTarget {
         self.observation = observed;
         Ok(&self.observation)
     }
+
+    /// Internal preparation handoff. Re-enumerate the exact interface and
+    /// independently compare the new writable handle before acquiring locks.
+    /// The preparation owner has already checked protected storage and status;
+    /// this method does not create a generic path-based writer capability.
+    pub(crate) fn lock_for_preparation(
+        mut self,
+    ) -> Result<crate::windows_lock::LockedWindowsDevice, crate::windows_lock::ObservedLockError>
+    {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH,
+        };
+        self.revalidate()?;
+        let interfaces = present_interfaces()?;
+        let selected = resolve_interface(&self.observation.interface_path, &interfaces)?;
+        let handle: OwnedHandle = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH)
+            .open(selected)
+            .map_err(|source| TargetError::Io {
+                stage: "opening observed preparation target",
+                source,
+            })?
+            .into();
+        // SAFETY: unique synchronous handle opened above without OVERLAPPED.
+        // Metadata comparison precedes any lock, dismount or write operation.
+        if unsafe { observe_handle(&handle)? } != self.observation.handle {
+            return Err(TargetError::Mismatch("writable target handoff").into());
+        }
+        // SAFETY: this exact owned handle was opened read/write, unbuffered and
+        // write-through, is not duplicated, and moves into its private owner.
+        let device = unsafe { crate::writer::windows::WindowsRawDevice::from_owned_handle(handle) }
+            .map_err(|source| TargetError::Io {
+                stage: "validating writable target",
+                source,
+            })?;
+        if device.initial_snapshot() != &self.observation.handle.device {
+            return Err(TargetError::Mismatch("writable device snapshot").into());
+        }
+        crate::windows_lock::lock_observed(device, self)
+    }
 }
 
 struct Native<'a> {
