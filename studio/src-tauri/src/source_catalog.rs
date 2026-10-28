@@ -205,6 +205,34 @@ impl SourceCatalog {
             .ok_or_else(|| "Unknown or released source ID; import it again.".into())
     }
 
+    /// Atomically retain an ordered selection while holding the catalogue lock.
+    /// This only validates IDs and clones references; it performs no source I/O
+    /// or cursor locking. Drop the catalogue guard before `verify_all`.
+    #[allow(dead_code)] // Consumed by the forthcoming native preparation job.
+    pub fn lease_batch(&self, ids: &[String]) -> Result<SourceBatch, String> {
+        if ids.is_empty() || ids.len() > MAX_SOURCES {
+            return Err(format!("Select between 1 and {MAX_SOURCES} source IDs."));
+        }
+        let mut seen = BTreeSet::new();
+        let mut entries = Vec::with_capacity(ids.len());
+        for id in ids {
+            if !seen.insert(id) {
+                return Err("Duplicate source ID in batch.".into());
+            }
+            entries.push(
+                self.sources
+                    .get(id)
+                    .ok_or("Unknown or released source ID; import it again.")?,
+            );
+        }
+        Ok(SourceBatch {
+            leases: entries
+                .into_iter()
+                .map(|entry| SourceLease(Arc::clone(&entry.source)))
+                .collect(),
+        })
+    }
+
     /// Explicit release only. A source used by any job cannot be evicted.
     #[allow(dead_code)] // Single-source convenience API; Studio releases batches.
     pub fn release(&mut self, source_id: &str) -> Result<(), String> {
@@ -238,6 +266,38 @@ impl SourceCatalog {
             self.sources.remove(id);
         }
         Ok(())
+    }
+}
+
+/// Ordered backend-owned sources. Every source remains leased until this batch
+/// is dropped, including after verification fails. No catalogue lock is held.
+pub struct SourceBatch {
+    leases: Vec<SourceLease>,
+}
+impl SourceBatch {
+    /// Rehash every retained handle against its import digest and return only a
+    /// complete report in requested order. Paths, sizes and digests come from
+    /// the backend; no pathname is reopened and no publisher trust is asserted.
+    ///
+    /// Verification is sequential, not an atomic filesystem snapshot. A final
+    /// identity/size/mtime pass detects ordinary changes during later hashes,
+    /// but external writes and transient mutations cannot be frozen by these
+    /// checks. The eventual copy must verify the bytes it consumes and readback.
+    #[allow(dead_code)] // Consumed by the forthcoming native preparation job.
+    pub fn verify_all(&self) -> Result<Vec<SourceInfo>, String> {
+        let infos = self
+            .leases
+            .iter()
+            .map(|lease| lease.with_verified_source(|_, info| Ok(info.clone())))
+            .collect::<Result<Vec<_>, _>>()?;
+        for lease in &self.leases {
+            lease
+                .0
+                .lock()
+                .map_err(|_| "Source lock is unavailable.")?
+                .unchanged()?;
+        }
+        Ok(infos)
     }
 }
 
@@ -381,6 +441,173 @@ mod tests {
             std::fs::read(root.path().join("Mac/boot.iso")).unwrap(),
             b"abc"
         );
+    }
+
+    #[test]
+    fn batch_lease_rejects_invalid_requests_without_partial_retention() {
+        let root = tempfile::tempdir().unwrap();
+        let mut catalog = SourceCatalog::default();
+        let infos = catalog
+            .insert_batch(vec![
+                prepared(root.path(), "first.iso", b"abc"),
+                prepared(root.path(), "second.iso", b"xyz"),
+            ])
+            .unwrap();
+        let first = infos[0].source_id.clone();
+        let second = infos[1].source_id.clone();
+        for ids in [
+            vec![],
+            vec![first.clone(), second.clone(), "unknown-last".into()],
+            vec![first.clone(), second.clone(), first.clone()],
+            vec![first.clone(); MAX_SOURCES + 1],
+        ] {
+            assert!(catalog.lease_batch(&ids).is_err());
+            for entry in catalog.sources.values() {
+                assert_eq!(Arc::strong_count(&entry.source), 1);
+            }
+        }
+        catalog.release_sources(&[first, second]).unwrap();
+        assert_eq!(catalog.remaining_capacity(), MAX_SOURCES);
+    }
+
+    #[test]
+    fn batch_verifies_backend_metadata_in_requested_nested_path_order() {
+        let root = tempfile::tempdir().unwrap();
+        let mut catalog = SourceCatalog::default();
+        let infos = catalog
+            .insert_batch(vec![
+                prepared(root.path(), "Mac/boot.iso", b"abc"),
+                prepared(root.path(), "Windows/Install Media/boot.iso", b"xyz"),
+                prepared(root.path(), "Linux/日本語.iso", b"linux"),
+            ])
+            .unwrap();
+        let order = [2, 0, 1];
+        let ids = order.map(|i| infos[i].source_id.clone());
+        let batch = catalog.lease_batch(&ids).unwrap();
+        let verified = batch.verify_all().unwrap();
+        assert_eq!(verified.len(), order.len());
+        for (source, index) in verified.iter().zip(order) {
+            assert_eq!(source.source_id, infos[index].source_id);
+            assert_eq!(source.relative_path, infos[index].relative_path);
+            assert_eq!(source.name, infos[index].name);
+            assert_eq!(source.bytes, infos[index].bytes);
+            assert_eq!(source.verification, infos[index].verification);
+            assert!(!source.verification.publisher_verified);
+        }
+        assert_eq!(
+            verified[1].verification.digest,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // Returned metadata is a copy; callers cannot change the next report.
+        let mut changed = verified;
+        changed[0].relative_path = "injected.iso".into();
+        changed[0].verification.digest = "0".repeat(64);
+        let repeated = batch.verify_all().unwrap();
+        assert_eq!(repeated[0].relative_path, "Linux/日本語.iso");
+        assert_eq!(repeated[0].verification, infos[2].verification);
+    }
+
+    #[test]
+    fn batch_holds_every_source_until_drop_without_holding_catalogue() {
+        let root = tempfile::tempdir().unwrap();
+        let mut catalog = SourceCatalog::default();
+        let infos = catalog
+            .insert_batch(vec![
+                prepared(root.path(), "first.iso", b"abc"),
+                prepared(root.path(), "second.iso", b"xyz"),
+                prepared(root.path(), "unrelated.iso", b"other"),
+            ])
+            .unwrap();
+        let ids = [infos[1].source_id.clone(), infos[0].source_id.clone()];
+        let shared = Mutex::new(catalog);
+        let batch = shared.lock().unwrap().lease_batch(&ids).unwrap();
+        {
+            let mut catalog = shared.try_lock().unwrap();
+            assert!(catalog.release_sources(&ids).is_err());
+            assert!(catalog.release(&ids[0]).is_err());
+            assert!(catalog.release(&ids[1]).is_err());
+            catalog.release(&infos[2].source_id).unwrap();
+            assert_eq!(catalog.list_sources().len(), 2);
+        }
+        assert_eq!(batch.verify_all().unwrap().len(), 2);
+        drop(batch);
+        shared.lock().unwrap().release_sources(&ids).unwrap();
+        assert!(shared.lock().unwrap().list_sources().is_empty());
+    }
+
+    #[test]
+    fn batch_acquisition_does_not_wait_for_a_source_cursor_or_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let mut catalog = SourceCatalog::default();
+        let info = catalog
+            .insert_batch(vec![prepared(root.path(), "boot.iso", b"abc")])
+            .unwrap()
+            .remove(0);
+        let source = catalog.lease(&info.source_id).unwrap();
+        let cursor = source.0.lock().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let shared = Mutex::new(catalog);
+            let batch = shared.lock().unwrap().lease_batch(&[info.source_id]);
+            sender.send(batch).unwrap();
+        });
+        // An accidental hash/cursor lock during acquisition cannot complete
+        // while the test owns the source mutex. Release it even on failure.
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(5));
+        drop(cursor);
+        worker.join().unwrap();
+        let batch = result
+            .expect("batch acquisition waited for source I/O")
+            .unwrap();
+        // The lease stays usable even after the worker drops the catalogue.
+        assert_eq!(batch.verify_all().unwrap()[0].bytes, 3);
+    }
+
+    #[test]
+    fn batch_verification_never_reopens_a_replaced_path() {
+        let root = tempfile::tempdir().unwrap();
+        let mut catalog = SourceCatalog::default();
+        let info = catalog
+            .insert_batch(vec![prepared(root.path(), "boot.iso", b"abc")])
+            .unwrap()
+            .remove(0);
+        let batch = catalog.lease_batch(&[info.source_id]).unwrap();
+        std::fs::rename(root.path().join("boot.iso"), root.path().join("old.iso")).unwrap();
+        std::fs::write(root.path().join("boot.iso"), b"replacement").unwrap();
+        let verified = batch.verify_all().unwrap();
+        assert_eq!(verified[0].relative_path, "boot.iso");
+        assert_eq!(verified[0].bytes, 3);
+        assert_eq!(verified[0].verification, info.verification);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_verification_aborts_on_a_late_source_checksum_change() {
+        let root = tempfile::tempdir().unwrap();
+        let mut catalog = SourceCatalog::default();
+        let infos = catalog
+            .insert_batch(vec![
+                prepared(root.path(), "first.iso", b"abc"),
+                prepared(root.path(), "last.iso", b"xyz"),
+            ])
+            .unwrap();
+        let ids = infos
+            .iter()
+            .map(|info| info.source_id.clone())
+            .collect::<Vec<_>>();
+        let batch = catalog.lease_batch(&ids).unwrap();
+        let path = root.path().join("last.iso");
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut writer = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        writer.write_all(b"bad").unwrap();
+        writer
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let error = batch.verify_all().unwrap_err();
+        assert!(error.contains("checksum mismatch"));
+        assert!(catalog.release_sources(&ids).is_err());
+        drop(batch);
+        catalog.release_sources(&ids).unwrap();
     }
 
     #[test]
