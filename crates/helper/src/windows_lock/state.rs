@@ -12,6 +12,16 @@ pub(super) const LDM_DATA: [u8; 16] = [
 pub(super) const LDM_METADATA: [u8; 16] = [
     0xaa, 0xc8, 0x08, 0x58, 0x8f, 0x7e, 0xe0, 0x42, 0x85, 0xd2, 0xe1, 0xe9, 0x04, 0x34, 0xcf, 0xb3,
 ];
+// Exact GPT types whose payload is not a filesystem: GRUB BIOS Boot
+// (21686148-6449-6e6f-744e-656564454649) and Microsoft Reserved
+// (e3c9e316-0b5c-4db8-817d-f92df00215ae). These need no volume GUID;
+// a matching volume, if Windows does expose one, must still be locked.
+const BIOS_BOOT: [u8; 16] = [
+    0x48, 0x61, 0x68, 0x21, 0x49, 0x64, 0x6f, 0x6e, 0x74, 0x4e, 0x65, 0x65, 0x64, 0x45, 0x46, 0x49,
+];
+const MICROSOFT_RESERVED: [u8; 16] = [
+    0x16, 0xe3, 0xc9, 0xe3, 0x5c, 0x0b, 0xb8, 0x4d, 0x81, 0x7d, 0xf9, 0x2d, 0xf0, 0x02, 0x15, 0xae,
+];
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct VolumeName(pub(super) String);
@@ -128,12 +138,16 @@ pub(super) fn parse_layout(bytes: &[u8], geometry: &Geometry) -> Result<DiskLayo
         if style == 0 {
             kind[0] = entry[32];
             partition_id.copy_from_slice(&entry[40..56]);
-            if [0x42, 0x86, 0x87].contains(&kind[0]) {
+            // Extended containers need independent validation of the complete
+            // logical-partition topology. Silently dropping them could turn
+            // incomplete discovery into an apparently empty, unlocked disk.
+            if [0x05, 0x0f, 0x42, 0x85, 0x86, 0x87].contains(&kind[0]) {
                 return Err(LockError::UnsupportedLayout);
             }
-            // Empty slots and extended containers are not independently
-            // lockable volumes; logical partitions still appear separately.
-            if [0, 5, 0x0f, 0x85].contains(&kind[0]) {
+            if kind[0] == 0 {
+                if u64_at(entry, 8) != 0 || u64_at(entry, 16) != 0 {
+                    return Err(LockError::UnsupportedLayout);
+                }
                 continue;
             }
         } else {
@@ -255,6 +269,18 @@ pub(super) fn acquire<B: Backend>(
             return Err(LockError::UnsupportedLayout);
         }
         names.push(name.clone());
+    }
+    // Discovery is complete only if every filesystem-bearing partition has
+    // one classified volume with the exact retained layout range. Hidden,
+    // unformatted and unknown types are not evidence of safe absence.
+    if layout.partitions.iter().any(|partition| {
+        let reserved =
+            layout.style == 1 && [BIOS_BOOT, MICROSOFT_RESERVED].contains(&partition.kind);
+        !reserved && !ranges.contains(&(partition.start, partition.length))
+    }) {
+        return Err(LockError::MissingEvidence(
+            "target partition has no classified volume",
+        ));
     }
     if backend.snapshot()? != *expected {
         return Err(LockError::DeviceChanged);

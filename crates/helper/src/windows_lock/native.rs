@@ -62,6 +62,9 @@ impl LockedWindowsDevice {
 /// a failed lock. Every volume path comes from bounded Windows enumeration.
 /// Unknown classifications and unsupported layouts fail closed. Synchronous
 /// driver calls have no user-space deadline; a stalled driver can block here.
+/// Every nonempty partition requires an exact classified volume except GPT
+/// BIOS Boot and Microsoft Reserved partitions. MBR extended and dynamic-disk
+/// layouts are unsupported; unenumerated hidden or unknown partitions fail.
 pub fn lock(
     mut device: WindowsRawDevice,
     expected: &DeviceSnapshot,

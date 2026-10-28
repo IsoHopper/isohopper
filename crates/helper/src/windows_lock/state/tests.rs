@@ -102,15 +102,18 @@ impl Drop for FakeVolume {
 }
 struct Fake {
     events: Rc<RefCell<Events>>,
+    layout: DiskLayout,
     volumes: BTreeMap<VolumeName, Option<Vec<Extent>>>,
     fault: &'static str,
     snapshots: usize,
     enumerations: usize,
+    writable_opens: usize,
 }
 impl Fake {
     fn new(fault: &'static str) -> Self {
         Self {
             events: Rc::default(),
+            layout: layout(),
             volumes: BTreeMap::from([
                 (name(1), Some(vec![extent(7, 1024 * 1024)])),
                 (name(2), Some(vec![extent(7, 2 * 1024 * 1024)])),
@@ -120,6 +123,7 @@ impl Fake {
             fault,
             snapshots: 0,
             enumerations: 0,
+            writable_opens: 0,
         }
     }
 }
@@ -134,7 +138,7 @@ impl Backend for Fake {
         Ok(value)
     }
     fn layout(&mut self) -> Result<DiskLayout, LockError> {
-        let mut result = layout();
+        let mut result = self.layout.clone();
         if self.fault == "layout_after" && self.enumerations > 1 {
             result.identity[0] ^= 1;
         }
@@ -158,6 +162,9 @@ impl Backend for Fake {
         Ok(result)
     }
     fn open(&mut self, name: &VolumeName, write: bool) -> Result<Self::Volume, LockError> {
+        if write {
+            self.writable_opens += 1;
+        }
         if self.fault == "unclassifiable" && name == &self::name(3) {
             return Err(LockError::MissingEvidence("unknown volume"));
         }
@@ -199,6 +206,139 @@ fn capability_retains_only_target_locks_and_unwinds_on_drop() {
     assert_eq!(backend.events.borrow().entries.len(), 4);
     drop(held);
     assert_eq!(backend.events.borrow().active, 0);
+}
+
+fn assert_unmapped_partition_refused(backend: &mut Fake) {
+    assert!(matches!(
+        acquire(backend, &target()),
+        Err(LockError::MissingEvidence(_))
+    ));
+    assert_eq!(backend.writable_opens, 0);
+    assert_eq!(backend.events.borrow().active, 0);
+    assert!(backend.events.borrow().entries.is_empty());
+}
+
+#[test]
+fn incomplete_partition_coverage_refuses_before_writable_opens_or_locks() {
+    for missing in 0..4 {
+        let mut backend = Fake::new("");
+        match missing {
+            0 => {
+                backend.volumes.remove(&name(2));
+            }
+            1 => backend.volumes.clear(),
+            2 => backend.volumes.retain(|name, _| name > &self::name(2)),
+            3 => {
+                backend.volumes.insert(name(2), None);
+            }
+            _ => unreachable!(),
+        }
+        assert_unmapped_partition_refused(&mut backend);
+    }
+}
+
+fn gpt_type(guid: &str) -> [u8; 16] {
+    let mut bytes: [u8; 16] = hex::decode(guid.replace('-', ""))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    // GUID wire representation uses little endian for the first three fields.
+    bytes[..4].reverse();
+    bytes[4..6].reverse();
+    bytes[6..8].reverse();
+    bytes
+}
+
+#[test]
+fn unknown_linux_efi_recovery_and_hidden_partitions_still_require_volumes() {
+    for guid in [
+        "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7", // basic data
+        "c12a7328-f81f-11d2-ba4b-00a0c93ec93b", // EFI filesystem
+        "de94bba4-06d1-4d40-a16a-bfd50179d6ac", // Windows recovery
+        "0fc63daf-8483-4772-8e79-3d69d8477de4", // Linux filesystem
+        "0657fd6d-a4ab-43c4-84e5-0933c84b4f4f", // Linux swap
+        "ffffffff-ffff-ffff-ffff-ffffffffffff", // unknown
+        "21686148-6449-6e6f-744e-656564454648", // not BIOS Boot
+        "e3c9e316-0b5c-4db8-817d-f92df00215af", // not MSR
+    ] {
+        for attributes in [0u64, 1 << 62, 1 << 63] {
+            let mut bytes = table(1, &gpt_type(guid));
+            bytes[112..120].copy_from_slice(&attributes.to_le_bytes());
+            let mut backend = Fake::new("");
+            backend.layout = parse_layout(&bytes, &target().geometry).unwrap();
+            backend.volumes.clear();
+            assert_unmapped_partition_refused(&mut backend);
+        }
+    }
+    for kind in [0x07, 0x17, 0x27, 0x82, 0x83, 0xef] {
+        let mut backend = Fake::new("");
+        backend.layout = parse_layout(&table(0, &[kind]), &target().geometry).unwrap();
+        backend.volumes.clear();
+        assert_unmapped_partition_refused(&mut backend);
+    }
+}
+
+#[test]
+fn exact_bios_boot_and_msr_types_need_no_volume_but_discovered_volumes_are_locked() {
+    for guid in [
+        "21686148-6449-6e6f-744e-656564454649",
+        "e3c9e316-0b5c-4db8-817d-f92df00215ae",
+    ] {
+        for discovered in [false, true] {
+            let mut backend = Fake::new("");
+            backend.layout = parse_layout(&table(1, &gpt_type(guid)), &target().geometry).unwrap();
+            backend
+                .volumes
+                .retain(|name, _| name > &self::name(2) || (discovered && name == &self::name(1)));
+            let held = acquire(&mut backend, &target()).unwrap();
+            let count = usize::from(discovered);
+            assert_eq!(held.len(), count);
+            assert_eq!(backend.writable_opens, count);
+            assert_eq!(backend.events.borrow().active, count);
+            assert_eq!(backend.events.borrow().entries.len(), 2 * count);
+            drop(held);
+            assert_eq!(backend.events.borrow().active, 0);
+        }
+
+        let mut backend = Fake::new("");
+        let mut reserved = parse_layout(&table(1, &gpt_type(guid)), &target().geometry)
+            .unwrap()
+            .partitions
+            .remove(0);
+        reserved.number = 3;
+        reserved.start = 3 * 1024 * 1024;
+        backend.layout.partitions.push(reserved);
+        let held = acquire(&mut backend, &target()).unwrap();
+        assert_eq!(held.len(), 2);
+        drop(held);
+
+        backend.events.borrow_mut().entries.clear();
+        backend.writable_opens = 0;
+        backend.volumes.remove(&name(2));
+        assert_unmapped_partition_refused(&mut backend);
+    }
+}
+
+#[test]
+fn raw_blank_disk_requires_no_volume_locks() {
+    let mut bytes = [0; 48];
+    bytes[..4].copy_from_slice(&2u32.to_le_bytes());
+    let mut backend = Fake::new("");
+    backend.layout = parse_layout(&bytes, &target().geometry).unwrap();
+    backend.volumes.retain(|name, _| name > &self::name(2));
+    assert!(acquire(&mut backend, &target()).unwrap().is_empty());
+    assert_eq!(backend.writable_opens, 0);
+    assert!(backend.events.borrow().entries.is_empty());
+
+    backend
+        .volumes
+        .insert(name(1), Some(vec![extent(7, 1024 * 1024)]));
+    assert!(matches!(
+        acquire(&mut backend, &target()),
+        Err(LockError::UnsupportedLayout)
+    ));
+    assert_eq!(backend.writable_opens, 0);
+    assert!(backend.events.borrow().entries.is_empty());
 }
 
 #[test]
@@ -361,4 +501,31 @@ fn layout_parser_rejects_dynamic_unknown_truncated_and_out_of_bounds_tables() {
     bad = good.clone();
     bad[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(parse_layout(&bad, &target().geometry).is_err());
+}
+
+#[test]
+fn mbr_extended_layouts_and_nonempty_unused_slots_are_unsupported() {
+    for kind in [0x05, 0x0f, 0x85] {
+        assert!(matches!(
+            parse_layout(&table(0, &[kind]), &target().geometry),
+            Err(LockError::UnsupportedLayout)
+        ));
+    }
+    let mut empty = table(0, &[0]);
+    empty[56..72].fill(0);
+    assert!(
+        parse_layout(&empty, &target().geometry)
+            .unwrap()
+            .partitions
+            .is_empty()
+    );
+    for (start, length) in [(512u64, 0u64), (0, 512), (512, 512)] {
+        let mut malformed = empty.clone();
+        malformed[56..64].copy_from_slice(&start.to_le_bytes());
+        malformed[64..72].copy_from_slice(&length.to_le_bytes());
+        assert!(matches!(
+            parse_layout(&malformed, &target().geometry),
+            Err(LockError::UnsupportedLayout)
+        ));
+    }
 }
