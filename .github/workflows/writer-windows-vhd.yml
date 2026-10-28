@@ -101,6 +101,7 @@ jobs:
           for probe in \
             windows_protected:windows_protected_system_and_executable_mappings_are_read_only \
             windows_peer:windows_peer_observes_current_process_and_owned_child \
+            windows_pipe:windows_pipe_checks_peers_deadlines_and_frames \
             windows_identity:windows_vhd_identity_queries_agree_or_report_unsupported \
             windows_target:windows_vhd_provider_path_binds_to_retained_target \
             windows_pagefile_probe:windows_active_pagefile_zero_access_metadata_probe; do
@@ -231,6 +232,7 @@ jobs:
               'windows_encryption.log': r'BitLocker provider (?:observed \d+ volumes; no write authorization|unavailable: (?:MissingNamespace|MissingClass); encryption state unknown)',
               'windows_pools.log': r'Observed \d+ physical disks; \d+ have concrete pool associations',
               'windows_peer.log': r'Windows peer observation passed: current=1 child=1 exited_child_rejected=1; no UAC or device access',
+              'windows_pipe.log': r'Windows pipe transport passed: roundtrip=1 immediate_io=1 clean_eof=1 first_instance=1 wrong_peer=1 connect_timeout=1 connect_cancel=1 read_timeout=1 read_cancel=1 write_timeout=1 partial_header_timeout=1; no UAC or device access',
               'windows_target.log': r'(?:Owned VHD interface selection: match=(?:exact|ascii_case_only)|Owned blank VHD provider path, retained native identity and empty partition topology agree across a fresh collection; no physical write or safety approval|UNSUPPORTED: owned VHD (?:identity is random \(flags \d+\)|has no native device GUID|driver lacks the device identity query); provider binding was refused, not passed)',
               'windows_identity.log': r'Owned (?:read-only VHD identity agrees across retained handles; no physical device tested|VHD reports a random GUID \(flags \d+\); identity binding remains unsupported, not accepted|VHD has no device GUID; identity binding remains unsupported, not accepted|VHD driver does not implement the identity query \(Win32 Some\(\d+\)\); binding remains unsupported)',
               'windows_protected.log': r'(?:Protected storage observations: successful_mappings=\d+, actual_volume_overlap_refusals=\d+, unsupported_executable_roles=\d+|UNSUPPORTED executable role=(?:Helper|Caller): external-backing query returned Win32 1; mapping remains blocked)',
