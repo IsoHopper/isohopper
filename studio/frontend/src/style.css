@@ -323,6 +323,10 @@ main { padding: 20px; }
   .log-row time { margin-left: 53px; }
 }
 .inspect-host { display: flex; margin: 9px 14px 0; width: calc(100% - 28px); justify-content: center; }
+.native-device-list { display: grid; gap: 10px; margin: 12px 14px; min-width: 0; }
+.native-device-list .host-device { padding: 10px; }
+.inventory-note p { margin: 6px 0; }
+.inventory-note code { overflow-wrap: anywhere; }
 .inventory-dialog { width: 920px; max-width: 100%; max-height: calc(100vh - 48px); overflow: auto; background: #1a2229; border: 1px solid #56717e; border-radius: 3px; }
 .inventory-status, .inventory-toolbar { padding: 12px 14px; }
 .inventory-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }

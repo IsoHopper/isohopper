@@ -44,7 +44,7 @@ Build a local macOS app bundle with the pinned Tauri CLI:
 
 This builds locally. The packaging workflow can build development artifacts manually or when an experimental tag is pushed; publication is disabled while the real USB workflow is incomplete.
 
-For the browser preview, run `npm --prefix studio/frontend run dev` and open the local URL printed by Vite. This uses a labelled fixture adapter; native file selection and host inspection require Studio.
+For the browser demo, run `npm --prefix studio/frontend run dev` and append `/?demo=1` to the local origin printed by Vite. Demo mode uses labelled fixtures. Native Studio uses real file selection and host inspection; it never falls back to fixtures.
 
 ## Checks
 

@@ -2,12 +2,15 @@
 // Copyright (C) 2026 S33G
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #[tauri::command]
-fn list_disks() -> Vec<isohopper_cli::DiskView> {
-    isohopper_cli::demo_disks()
-}
-#[tauri::command]
-fn plan_disk(id: String) -> Result<isohopper_core::layout::Layout, String> {
-    isohopper_cli::demo_plan(&id)
+fn capabilities() -> serde_json::Value {
+    serde_json::json!({
+        "mode": "native",
+        "platform": std::env::consts::OS,
+        "file_import": true,
+        "host_inventory": cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux")),
+        "physical_preparation": false,
+        "preparation_unavailable_reason": "Physical preparation is unavailable. The privileged helper is not connected."
+    })
 }
 #[tauri::command]
 fn check_config(text: String, format: String) -> serde_json::Value {
@@ -82,8 +85,7 @@ async fn inspect_devices() -> Result<isohopper_inventory::Inventory, String> {
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
-            list_disks,
-            plan_disk,
+            capabilities,
             check_config,
             pick_images,
             pick_directory,

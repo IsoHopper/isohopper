@@ -30,20 +30,23 @@ describe('native image intake', () => {
     expect(await bridge.PickImages!()).toEqual([]);
     expect(calls).toEqual(['pick_images']);
   });
-  it('keeps list, plan and config command arguments compatible with the native boundary', async () => {
+  it('keeps config command arguments compatible with the native boundary', async () => {
     const calls: { command: string; args: Record<string, unknown> | undefined }[] = [];
     const bridge = createNativeBridge(async <T>(command: string, args?: Record<string, unknown>) => {
       calls.push({ command, args });
-      return (command === 'list_disks' ? [{ disk: { id: 'fixture' } }] : command === 'check_config' ? { valid: true } : { partitions: [] }) as T;
+      return { valid: true } as T;
     });
-    expect((await bridge.ListDisks())[0].disk.id).toBe('fixture');
-    await bridge.PlanDisk('fixture');
     expect(await bridge.CheckConfig('boot: {}', 'yaml')).toEqual({ valid: true });
     expect(calls).toEqual([
-      { command: 'list_disks', args: undefined },
-      { command: 'plan_disk', args: { id: 'fixture' } },
       { command: 'check_config', args: { text: 'boot: {}', format: 'yaml' } }
     ]);
+  });
+  it('reads native capabilities and rejects an incomplete response', async () => {
+    const capabilities = { mode: 'native', platform: 'windows', file_import: true, host_inventory: true, physical_preparation: false, preparation_unavailable_reason: 'Helper unavailable.' };
+    const bridge = createNativeBridge(async <T>() => capabilities as T);
+    expect(await bridge.Capabilities()).toEqual(capabilities);
+    const incomplete = createNativeBridge(async <T>() => ({ mode: 'native' }) as T);
+    await expect(incomplete.Capabilities()).rejects.toThrow('capabilities');
   });
   it('preserves native failures instead of substituting browser fixtures', async () => {
     const bridge = createNativeBridge(async () => { throw new Error('native picker failed'); });

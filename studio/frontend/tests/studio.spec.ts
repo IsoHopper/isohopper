@@ -1,10 +1,102 @@
 // SPDX-FileCopyrightText: 2026 S33G
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 
-test('starts with an honest mock-device workspace and no horizontal overflow', async ({ page }) => {
+interface NativeScenario {
+  capabilityError?: string;
+  inventoryError?: string;
+  pickerOutcome?: 'image' | 'cancel' | 'error';
+}
+
+async function installNativeBridge(page: Page, scenario: NativeScenario = {}) {
+  await page.addInitScript(({ capabilityError, inventoryError, pickerOutcome }) => {
+    const host = window as unknown as { __TAURI__: unknown; nativeCommands: string[] };
+    host.nativeCommands = [];
+    host.__TAURI__ = { core: { invoke: async (command: string) => {
+      host.nativeCommands.push(command);
+      if (command === 'capabilities') {
+        if (capabilityError) throw new Error(capabilityError);
+        return { mode: 'native', platform: 'windows', file_import: true, host_inventory: true, physical_preparation: false, preparation_unavailable_reason: 'Privileged preparation helper is not available.' };
+      }
+      if (command === 'inspect_devices') {
+        if (inventoryError) throw new Error(inventoryError);
+        return { source: 'test-host-adapter', disks: [{ id: 'host-system-unique-id', serial: 'HOST-SERIAL-1234', model: 'Host system storage', bus: 'nvme', size_bytes: 512_000_000_000, logical_sector_size: 512, physical_sector_size: 4096, system_disk: true, external: false, safety_checks_complete: false }], warnings: [{ disk_id: 'host-system-unique-id', code: 'safety_unknown', message: 'Safety metadata is not complete.' }] };
+      }
+      if (command === 'pick_images') {
+        if (pickerOutcome === 'error') throw new Error('file read failed');
+        if (pickerOutcome === 'cancel') return [];
+        return [{ name: '/private/media/native-large.iso', bytes: 6_000_000_000, verification: { algorithm: 'sha256', digest: 'a'.repeat(64), bytes: 6_000_000_000, status: 'hash-only', publisher_verified: false } }];
+      }
+      if (command === 'pick_directory') {
+        const image = (relative_path: string) => ({ name: 'boot.iso', relative_path, bytes: 3, verification: { algorithm: 'sha256', digest: 'b'.repeat(64), bytes: 3, status: 'hash-only', publisher_verified: false } });
+        return { images: [image('Mac/boot.iso'), image('Windows/boot.iso'), image('MAC/BOOT.ISO')], warnings: ['Skipped symbolic link: external'] };
+      }
+      if (command === 'check_config') return { valid: true };
+      throw new Error(`Unexpected native operation: ${command}`);
+    } } };
+  }, scenario);
+}
+
+async function nativeCommands(page: Page) {
+  return page.evaluate(() => (window as unknown as { nativeCommands: string[] }).nativeCommands);
+}
+
+async function expectNoDemoContent(page: Page) {
+  await expect(page.getByText(/USB flash drive 64 GB|USB NVMe bridge 1 TB|SD card 32 GB/)).toHaveCount(0);
+  await expect(page.getByText(/linux-desktop-demo\.iso|recovery-toolkit-demo\.img/)).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Simulate preparation' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Load samples' })).toHaveCount(0);
+  await expect(page.getByText('Explicit browser demo · mock devices · no physical disk writes')).toHaveCount(0);
+}
+
+test('bare browser reports unavailable native runtime and requires an explicit demo choice', async ({ page }) => {
   await page.goto('/');
-  await expect(page.getByText('Experimental · mock devices · no physical disk writes')).toBeVisible();
+  await expect(page.getByText('Native desktop runtime unavailable.', { exact: true })).toBeVisible();
+  await expect(page.getByText('Experimental · physical preparation unavailable')).toBeVisible();
+  await expect(page.locator('.image-row')).toHaveCount(0);
+  await expectNoDemoContent(page);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.getByRole('link', { name: 'Open browser demo' }).click();
+  await expect(page).toHaveURL(/\?demo=1$/);
+  await expect(page.getByText('Explicit browser demo · mock devices · no physical disk writes')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Simulate preparation' })).toBeEnabled();
+});
+
+for (const url of ['/', '/?demo=1']) {
+  test(`native startup uses actual read-only inventory without fixtures at ${url}`, async ({ page }) => {
+    await installNativeBridge(page);
+    await page.goto(url);
+    await expect(page.getByText('Experimental · physical preparation unavailable')).toBeVisible();
+    await expect(page.locator('.target-panel')).toContainText('host-system-unique-id');
+    await expect(page.locator('.target-panel')).toContainText('Preparation unavailable');
+    await expect(page.locator('.target-panel')).toContainText('Privileged preparation helper is not available.');
+    await expect(page.locator('.image-row')).toHaveCount(0);
+    await expect(page.locator('#choose-drive')).toHaveCount(0);
+    await expectNoDemoContent(page);
+    expect(await nativeCommands(page)).toEqual(['capabilities', 'inspect_devices']);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await page.locator('nav').getByRole('button', { name: 'Image library' }).click();
+    await expect(page.locator('.image-row')).toHaveCount(0);
+    await expectNoDemoContent(page);
+  });
+}
+
+for (const stage of ['capabilities', 'inventory'] as const) {
+  test(`native ${stage} failure is visible and never falls back to browser fixtures`, async ({ page }) => {
+    const message = `${stage} service unavailable`;
+    await installNativeBridge(page, stage === 'capabilities' ? { capabilityError: message } : { inventoryError: message });
+    await page.goto('/?demo=1');
+    await expect(page.locator('.target-panel')).toContainText(message);
+    await expect(page.locator('.target-panel')).toContainText('Preparation unavailable');
+    await expect(page.locator('.image-row')).toHaveCount(0);
+    await expectNoDemoContent(page);
+    expect(await nativeCommands(page)).toEqual(stage === 'capabilities' ? ['capabilities'] : ['capabilities', 'inspect_devices']);
+  });
+}
+
+test('explicit browser demo shows mock devices and has no horizontal overflow', async ({ page }) => {
+  await page.goto('/?demo=1');
+  await expect(page.getByText('Explicit browser demo · mock devices · no physical disk writes')).toBeVisible();
   await expect(page.locator('header')).toHaveCount(0);
   await expect(page.locator('.experimental')).toContainText('Browser file I/O · demo hardware inventory');
   await expect(page.getByRole('button', { name: 'Simulate preparation' })).toBeEnabled();
@@ -13,7 +105,7 @@ test('starts with an honest mock-device workspace and no horizontal overflow', a
 });
 
 test('risk confirmation binds to the selected device and Enter does not start a run', async ({ page }) => {
-  await page.goto('/');
+  await page.goto('/?demo=1');
   await page.locator('#choose-drive').click();
   const picker = page.getByRole('dialog');
   await expect(picker.getByRole('button', { name: /Internal system disk/ })).toBeDisabled();
@@ -38,7 +130,7 @@ test('risk confirmation binds to the selected device and Enter does not start a 
 });
 
 test('paste into the risky confirmation field is rejected', async ({ page }) => {
-  await page.goto('/');
+  await page.goto('/?demo=1');
   await page.locator('#choose-drive').click();
   await page.getByRole('dialog').getByRole('button', { name: /USB NVMe bridge 1 TB/ }).click();
   const input = page.getByRole('textbox', { name: 'Disk confirmation phrase' });
@@ -48,7 +140,7 @@ test('paste into the risky confirmation field is rejected', async ({ page }) => 
 });
 
 test('hashes actual local data without treating it as publisher verification', async ({ page }) => {
-  await page.goto('/');
+  await page.goto('/?demo=1');
   await page.locator('#file-input').setInputFiles({ name: 'tiny.iso', mimeType: 'application/octet-stream', buffer: Buffer.from('abc') });
   const row = page.locator('.image-row').filter({ hasText: 'tiny.iso' });
   await expect(row.getByText('Hash only')).toBeVisible();
@@ -60,7 +152,7 @@ test('hashes actual local data without treating it as publisher verification', a
 });
 
 test('populated checksums and nested paths scroll inside the table without widening the page', async ({ page }) => {
-  await page.goto('/');
+  await page.goto('/?demo=1');
   await expect(page.getByRole('button', { name: 'Simulate preparation' })).toBeEnabled();
   await page.locator('#folder-input').evaluate(input => {
     const transfer = new DataTransfer();
@@ -91,7 +183,7 @@ test('populated checksums and nested paths scroll inside the table without widen
 });
 
 test('rejects unsupported intake and displays safe filenames', async ({ page }) => {
-  await page.goto('/');
+  await page.goto('/?demo=1');
   await page.locator('#file-input').setInputFiles({ name: 'program.exe', mimeType: 'application/octet-stream', buffer: Buffer.from('abc') });
   await expect(page.getByRole('status')).toContainText('Unsupported format');
   await expect(page.locator('.image-row').filter({ hasText: 'program.exe' })).toHaveCount(0);
@@ -101,7 +193,7 @@ test('rejects unsupported intake and displays safe filenames', async ({ page }) 
 });
 
 test('completes a simulation and records what did and did not happen', async ({ page }) => {
-  await page.goto('/');
+  await page.goto('/?demo=1');
   await page.getByRole('button', { name: 'Simulate preparation' }).click();
   await expect(page.getByRole('button', { name: 'Simulation in progress' })).toBeDisabled();
   await expect(page.getByText('No disk was opened or modified.')).toBeVisible();
@@ -111,7 +203,7 @@ test('completes a simulation and records what did and did not happen', async ({ 
 });
 
 test('settings change the launcher preview and config can be exported', async ({ page }) => {
-  await page.goto('/');
+  await page.goto('/?demo=1');
   await page.locator('nav').getByRole('button', { name: 'Configuration' }).click();
   await page.locator('[data-option="netboot"]').uncheck();
   await expect(page.getByRole('textbox', { name: 'Configuration source' })).toContainText('netboot_xyz: false');
@@ -128,17 +220,8 @@ test('settings change the launcher preview and config can be exported', async ({
   await expect(page.getByText(/Selected: recovery-toolkit-demo.img. This is a visual preview only./)).toBeVisible();
 });
 
-test('native bridge errors are visible and do not silently select browser fixtures', async ({ page }) => {
-  await page.addInitScript(() => {
-    (window as unknown as { __TAURI__: unknown }).__TAURI__ = { core: { invoke: async () => { throw new Error('fixture provider unavailable'); } } };
-  });
-  await page.goto('/');
-  await expect(page.getByText(/Device list unavailable: fixture provider unavailable/)).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Simulate preparation' })).toBeDisabled();
-});
-
 test('power settings control firmware preview actions and serialize in both formats', async ({ page }) => {
-  await page.goto('/');
+  await page.goto('/?demo=1');
   await page.locator('nav').getByRole('button', { name: 'Configuration' }).click();
   await expect(page.locator('[data-power-option="reboot"]')).toBeChecked();
   await expect(page.locator('[data-power-option="shutdown"]')).toBeChecked();
@@ -160,39 +243,22 @@ test('power settings control firmware preview actions and serialize in both form
 });
 
 test('power preview clicks remain inert even with the native bridge available', async ({ page }) => {
-  await page.addInitScript(() => {
-    const host = window as unknown as { __TAURI__: unknown; previewCommands: string[] };
-    host.previewCommands = [];
-    host.__TAURI__ = { core: { invoke: async (command: string) => {
-      host.previewCommands.push(command);
-      if (command === 'list_disks') return [];
-      throw new Error(`Unexpected native operation: ${command}`);
-    } } };
-  });
+  await installNativeBridge(page);
   await page.goto('/');
+  await expect(page.locator('.target-panel')).toContainText('host-system-unique-id');
   await page.locator('nav').getByRole('button', { name: 'Launcher preview' }).click();
   for (const name of ['Reboot', 'Shut down', 'Firmware setup']) {
     await page.getByRole('button', { name, exact: true }).click();
     await expect(page.locator('#toast')).toContainText(`${name}: preview only. No host action performed.`);
   }
-  expect(await page.evaluate(() => (window as unknown as { previewCommands: string[] }).previewCommands)).toEqual(['list_disks']);
+  expect(await nativeCommands(page)).toEqual(['capabilities', 'inspect_devices']);
 });
 
 for (const outcome of ['image', 'cancel', 'error'] as const) {
   test(`native picker handles ${outcome} without using browser file intake`, async ({ page }) => {
-    await page.addInitScript(({ outcome }) => {
-      (window as unknown as { __TAURI__: unknown }).__TAURI__ = { core: { invoke: async (command: string) => {
-        if (command === 'list_disks') return [{ disk: { id: 'usb-64gb', serial: 'USB64-ABCD', model: 'USB flash drive 64 GB', bus: 'usb', size_bytes: 64_000_000_000, logical_sector_size: 512 }, verdict: { state: 'ok', hard_blocks: [], risks: [] } }];
-        if (command === 'plan_disk') return { size_bytes: 64_000_000_000, logical_sector_size: 512, partitions: [{ name: 'ISOHOPPER', start_lba: 2048, end_lba: 124_737_855 }] };
-        if (command === 'pick_images') {
-          if (outcome === 'error') throw new Error('file read failed');
-          if (outcome === 'cancel') return [];
-          return [{ name: '/private/media/native-large.iso', bytes: 6_000_000_000, verification: { algorithm: 'sha256', digest: 'a'.repeat(64), bytes: 6_000_000_000, status: 'hash-only', publisher_verified: false } }];
-        }
-        return { valid: true };
-      } } };
-    }, { outcome });
+    await installNativeBridge(page, { pickerOutcome: outcome });
     await page.goto('/');
+    await expect(page.locator('.target-panel')).toContainText('host-system-unique-id');
     await expect(page.locator('.image-row')).toHaveCount(0);
     await page.getByRole('button', { name: 'Add images', exact: true }).click();
     if (outcome === 'image') {
@@ -205,19 +271,15 @@ for (const outcome of ['image', 'cancel', 'error'] as const) {
       if (outcome === 'error') await expect(page.getByRole('status')).toContainText('Native image selection failed');
     }
     await expect(page.getByRole('button', { name: 'Add images', exact: true })).toBeEnabled();
+    expect(await nativeCommands(page)).toEqual(['capabilities', 'inspect_devices', 'pick_images']);
+    await expect(page.getByRole('button', { name: 'Simulate preparation' })).toHaveCount(0);
   });
 }
 
 test('directory import preserves nested names and reports conflicting destinations and scan warnings', async ({ page }) => {
-  await page.addInitScript(() => {
-    const image = (relative_path: string) => ({ name: 'boot.iso', relative_path, bytes: 3, verification: { algorithm: 'sha256', digest: 'b'.repeat(64), bytes: 3, status: 'hash-only', publisher_verified: false } });
-    (window as unknown as { __TAURI__: unknown }).__TAURI__ = { core: { invoke: async (command: string) => {
-      if (command === 'list_disks') return [];
-      if (command === 'pick_directory') return { images: [image('Mac/boot.iso'), image('Windows/boot.iso'), image('MAC/BOOT.ISO')], warnings: ['Skipped symbolic link: external'] };
-      return [];
-    } } };
-  });
+  await installNativeBridge(page);
   await page.goto('/');
+  await expect(page.locator('.target-panel')).toContainText('host-system-unique-id');
   await page.getByRole('button', { name: 'Import folder', exact: true }).click();
   await expect(page.getByText('Mac/boot.iso', { exact: true })).toBeVisible();
   await expect(page.getByText('Windows/boot.iso', { exact: true })).toBeVisible();
@@ -226,17 +288,14 @@ test('directory import preserves nested names and reports conflicting destinatio
   await page.locator('nav').getByRole('button', { name: 'Activity' }).click();
   await expect(page.getByText('Directory import warning')).toBeVisible();
   await expect(page.getByText('Destination skipped')).toBeVisible();
+  expect(await nativeCommands(page)).toEqual(['capabilities', 'inspect_devices', 'pick_directory']);
 });
 
-test('host inventory is read only and stays separate from fixture preparation', async ({ page }) => {
-  await page.addInitScript(() => {
-    (window as unknown as { __TAURI__: unknown }).__TAURI__ = { core: { invoke: async (command: string) => {
-      if (command === 'list_disks') return [];
-      if (command === 'inspect_devices') return { source: 'test-host-adapter', disks: [{ id: 'host-system-unique-id', serial: 'HOST-SERIAL-1234', model: 'Host system storage', bus: 'nvme', size_bytes: 512_000_000_000, logical_sector_size: 512, physical_sector_size: 4096, safety_checks_complete: false }], warnings: [{ disk_id: 'host-system-unique-id', code: 'safety_unknown', message: 'Safety metadata is not complete.' }] };
-      return [];
-    } } };
-  });
+test('host inventory stays read only and can be inspected and exported', async ({ page }) => {
+  await installNativeBridge(page);
   await page.goto('/');
+  await expect(page.locator('.target-panel')).toContainText('host-system-unique-id');
+  await expect(page.locator('#choose-drive')).toHaveCount(0);
   await page.getByRole('button', { name: 'Inspect host devices (read only)' }).click();
   const dialog = page.getByRole('dialog');
   await expect(dialog.getByText('host-system-unique-id', { exact: true })).toBeVisible();
@@ -254,6 +313,8 @@ test('host inventory is read only and stays separate from fixture preparation', 
   await dialog.getByRole('button', { name: 'Export JSON' }).click();
   expect((await download).suggestedFilename()).toBe('isohopper-host-inventory.json');
   await dialog.getByRole('button', { name: 'Close host inventory' }).click();
-  await page.locator('#choose-drive').click();
-  await expect(page.getByRole('dialog')).not.toContainText('host-system-unique-id');
+  await expect(page.getByRole('button', { name: 'Inspect host devices (read only)' })).toBeFocused();
+  await expect(page.locator('.target-panel')).toContainText('Preparation unavailable');
+  await expect(page.locator('#choose-drive')).toHaveCount(0);
+  expect(await nativeCommands(page)).toEqual(['capabilities', 'inspect_devices', 'inspect_devices']);
 });
