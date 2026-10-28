@@ -16,6 +16,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  windows-packages:
+    name: Windows package mocks
+    runs-on: windows-2022
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Check release packaging with mock files
+        shell: bash
+        run: |
+          python3 --version
+          if python3 -m unittest discover -s scripts -p 'test*release*.py' > packaging-tests.log 2>&1; then
+            cat packaging-tests.log
+          else
+            cat packaging-tests.log
+            python - <<'PY'
+          from pathlib import Path
+          text = Path('packaging-tests.log').read_text(errors='replace')[-12000:]
+          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=Windows packaging tests::' + text)
+          PY
+            exit 1
+          fi
+
   check:
     name: Rust and Studio
     runs-on: ubuntu-24.04
