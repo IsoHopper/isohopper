@@ -2,7 +2,7 @@
 //! Storage binding for this module's own sealed file, never an arbitrary path.
 use super::*;
 use crate::{
-    windows_preparation_target::require_standalone_pool,
+    windows_preparation_target::require_stage_host_pool,
     windows_sources::{SourceExtent, no_virtual_dependencies, source_guid, volume_extents},
     windows_target::BoundTarget,
     writer::DeviceSnapshot,
@@ -134,7 +134,7 @@ impl SealedStage {
             target,
         )?;
         let pools = windows_pools::collect().map_err(|e| evidence("sealed host pools", e))?;
-        let pool = require_standalone_pool(
+        let pool = require_stage_host_pool(
             &host
                 .revalidate()
                 .map_err(|e| evidence("refresh sealed host", e))?
@@ -174,7 +174,7 @@ impl TargetBoundStage {
             .map_err(|e| evidence("refresh sealed host", e))?;
         let pools =
             windows_pools::collect().map_err(|e| evidence("refresh sealed host pools", e))?;
-        if require_standalone_pool(&self.host.observation().disk, &pools)
+        if require_stage_host_pool(&self.host.observation().disk, &pools)
             .map_err(|e| evidence("sealed host pool binding", e))?
             != &self.pool
         {

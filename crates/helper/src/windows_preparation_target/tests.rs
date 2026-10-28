@@ -178,6 +178,51 @@ fn pool_membership_refusals_identify_the_failed_field_without_provider_values() 
 }
 
 #[test]
+fn stage_host_allows_known_partial_use_without_relaxing_target_policy() {
+    let (_, disk, mut pools) = fixture();
+    for partial in [false, true] {
+        pools.physical_disks[0].is_partial = Some(partial);
+        let host = require_stage_host_pool(&disk, &pools).unwrap();
+        assert_eq!(host, &pools.physical_disks[0]);
+        assert_eq!(host.is_partial, Some(partial));
+        assert_eq!(require_standalone_pool(&disk, &pools).is_ok(), !partial);
+    }
+    pools.physical_disks[0].is_partial = None;
+    assert!(require_stage_host_pool(&disk, &pools).is_err());
+    assert!(require_standalone_pool(&disk, &pools).is_err());
+}
+
+#[test]
+fn stage_host_partial_use_does_not_bypass_identity_or_membership_checks() {
+    let (_, disk, mut pools) = fixture();
+    pools.physical_disks[0].is_partial = Some(true);
+    for change in 0..11 {
+        let mut observed = pools.clone();
+        let record = &mut observed.physical_disks[0];
+        match change {
+            0 => record.unique_id = "different opaque identity".into(),
+            1 => record.unique_id_format = None,
+            2 => record.unique_id_format = Some(0),
+            3 => record.serial_number = None,
+            4 => record.serial_number = Some("different serial".into()),
+            5 => record.size_bytes = None,
+            6 => record.size_bytes = Some(disk.size.unwrap() + 512),
+            7 => record.bus_type = Some(17),
+            8 => record.primordial_pools.clear(),
+            9 => record.nonprimordial_pools = record.primordial_pools.clone(),
+            10 => observed
+                .physical_disks
+                .push(observed.physical_disks[0].clone()),
+            _ => unreachable!(),
+        }
+        assert!(
+            require_stage_host_pool(&disk, &observed).is_err(),
+            "case {change}"
+        );
+    }
+}
+
+#[test]
 fn pool_size_bus_and_serial_must_agree_and_be_known() {
     let (_, disk, pools) = fixture();
     let mut variants = vec![];

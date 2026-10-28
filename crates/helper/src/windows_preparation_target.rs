@@ -31,6 +31,28 @@ pub fn require_standalone_pool<'a>(
     disk: &WindowsDiskRecord,
     pools: &'a PoolObservation,
 ) -> Result<&'a PhysicalDiskPools, PreparationError> {
+    let record = matched_physical_disk(disk, pools)?;
+    match record.is_partial {
+        Some(false) => (),
+        Some(true) => {
+            return Err(PreparationError::Refused(
+                "physical storage reports partial use",
+            ));
+        }
+        None => {
+            return Err(PreparationError::Refused(
+                "physical storage partial-use status is unknown",
+            ));
+        }
+    }
+    require_primordial_only(record)?;
+    Ok(record)
+}
+
+fn matched_physical_disk<'a>(
+    disk: &WindowsDiskRecord,
+    pools: &'a PoolObservation,
+) -> Result<&'a PhysicalDiskPools, PreparationError> {
     let refused = PreparationError::Refused;
     let id = disk
         .unique_id
@@ -68,11 +90,11 @@ pub fn require_standalone_pool<'a>(
     {
         return Err(refused("physical storage metadata does not match"));
     }
-    match record.is_partial {
-        Some(false) => (),
-        Some(true) => return Err(refused("physical storage reports partial use")),
-        None => return Err(refused("physical storage partial-use status is unknown")),
-    }
+    Ok(record)
+}
+
+fn require_primordial_only(record: &PhysicalDiskPools) -> Result<(), PreparationError> {
+    let refused = PreparationError::Refused;
     if record.primordial_pools.is_empty() {
         return Err(refused(
             "physical storage has no primordial pool association",
@@ -81,6 +103,26 @@ pub fn require_standalone_pool<'a>(
     if !record.nonprimordial_pools.is_empty() {
         return Err(refused("physical storage has concrete pool membership"));
     }
+    Ok(())
+}
+
+/// Bind read-only staging-host evidence without requiring exclusive disk use.
+/// IsPartial describes consumption outside normal pool operations; known use
+/// is permitted here, but never by the destructive-target policy above. The
+/// caller must still bind native geometry/extents, exclude the target and
+/// reject unsupported backing. This grants no permission to write a device.
+#[cfg(any(windows, test))]
+pub(crate) fn require_stage_host_pool<'a>(
+    disk: &WindowsDiskRecord,
+    pools: &'a PoolObservation,
+) -> Result<&'a PhysicalDiskPools, PreparationError> {
+    let record = matched_physical_disk(disk, pools)?;
+    if record.is_partial.is_none() {
+        return Err(PreparationError::Refused(
+            "physical storage partial-use status is unknown",
+        ));
+    }
+    require_primordial_only(record)?;
     Ok(record)
 }
 
