@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::{
-    LockError, TargetCoverage,
+    LockError, ObservedLockError, TargetCoverage,
     state::{self, Backend, DiskLayout, Extent, Held, Volume, VolumeName},
 };
 use crate::writer::{
@@ -105,13 +105,30 @@ impl TargetVolumeProbe {
 /// the approved device, source and operation. No handle extraction or explicit
 /// unlock operation is exposed; dropping this owner closes the raw device first.
 pub struct LockedWindowsDevice {
+    // Field order is deliberate: close the raw device before releasing locks.
     device: WindowsRawDevice,
     volumes: Vec<Held<NativeVolume>>,
+    observed: Option<state::WriteGate>,
 }
 
 impl LockedWindowsDevice {
     pub fn locked_volume_count(&self) -> usize {
         self.volumes.len()
+    }
+
+    fn check_observed(&mut self, before_write: bool) -> io::Result<()> {
+        if let Some(observed) = &mut self.observed {
+            let mut backend = Native {
+                device: &mut self.device,
+            };
+            if before_write {
+                observed.before_write(&mut backend, &mut self.volumes)
+            } else {
+                observed.revalidate(&mut backend, &mut self.volumes)
+            }
+            .map_err(io::Error::other)?;
+        }
+        Ok(())
     }
 }
 
@@ -124,6 +141,9 @@ impl LockedWindowsDevice {
 /// Every nonempty partition requires an exact classified volume except GPT
 /// BIOS Boot and Microsoft Reserved partitions. MBR extended and dynamic-disk
 /// layouts are unsupported; unenumerated hidden or unknown partitions fail.
+/// This low-level entry point checks the layout discovered by this call; it
+/// does not bind an earlier provider/coverage observation. Preparation callers
+/// should use `lock_observed` after their independent authorization checks.
 pub fn lock(
     mut device: WindowsRawDevice,
     expected: &DeviceSnapshot,
@@ -134,20 +154,64 @@ pub fn lock(
         },
         expected,
     )?;
-    Ok(LockedWindowsDevice { device, volumes })
+    Ok(LockedWindowsDevice {
+        device,
+        volumes,
+        observed: None,
+    })
+}
+
+/// Consume a retained target observation and acquire locks for that exact
+/// native identity and complete partition/volume topology. The read-only
+/// target/provider/volume handles are closed before writable volume opens.
+///
+/// This opens no physical-device path, authenticates no peer, and grants no
+/// independent permission to write. The caller must already own an authorized
+/// raw-device handle and complete source, encryption and other safety checks.
+/// The expected coverage stays private and is rechecked before the first
+/// write attempt. After that, the old layout may intentionally have changed;
+/// native identity and the full device snapshot remain checked on subsequent
+/// snapshots, reads, writes and flushes.
+pub fn lock_observed(
+    mut device: WindowsRawDevice,
+    mut target: crate::windows_target::BoundTarget,
+) -> Result<LockedWindowsDevice, ObservedLockError> {
+    let observation = target.revalidate()?;
+    let expected = state::LockObservation {
+        identity: observation.handle.identity.clone(),
+        coverage: observation.coverage.clone(),
+    };
+    // The raw handle is independently revalidated against expected below.
+    // Keeping read-only volume probes here could interfere with locking.
+    drop(target);
+    let volumes = state::acquire_observed(
+        &mut Native {
+            device: &mut device,
+        },
+        &expected,
+    )?;
+    Ok(LockedWindowsDevice {
+        device,
+        volumes,
+        observed: Some(state::WriteGate::new(expected)),
+    })
 }
 
 impl RetainedDevice for LockedWindowsDevice {
     fn snapshot(&mut self) -> io::Result<DeviceSnapshot> {
+        self.check_observed(false)?;
         self.device.snapshot()
     }
     fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+        self.check_observed(false)?;
         self.device.read_at(offset, buffer)
     }
     fn write_at(&mut self, offset: u64, buffer: &[u8]) -> io::Result<usize> {
+        self.check_observed(true)?;
         self.device.write_at(offset, buffer)
     }
     fn flush(&mut self) -> io::Result<()> {
+        self.check_observed(false)?;
         self.device.flush()
     }
 }
@@ -223,6 +287,12 @@ impl Backend for ReadOnlyNative<'_> {
 
 impl Backend for Native<'_> {
     type Volume = NativeVolume;
+    fn identity(&mut self) -> Result<crate::windows_identity::DiskIdentity, LockError> {
+        // SAFETY: WindowsRawDevice owns a synchronous whole-device handle;
+        // querying metadata does not change its shared file position.
+        unsafe { crate::windows_identity::query_identity(self.device.retained_handle()) }
+            .map_err(Into::into)
+    }
     fn snapshot(&mut self) -> Result<DeviceSnapshot, LockError> {
         self.device
             .snapshot()

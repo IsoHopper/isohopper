@@ -131,17 +131,39 @@ impl Fake {
 }
 impl Backend for Fake {
     type Volume = FakeVolume;
+    fn identity(&mut self) -> Result<crate::windows_identity::DiskIdentity, LockError> {
+        if self.fault == "native_error" {
+            return Err(LockError::MissingEvidence(
+                "injected native identity failure",
+            ));
+        }
+        let changed = self.fault == "native_identity"
+            || (self.fault == "native_before_locks" && self.writable_opens > 0)
+            || (self.fault == "native_after_locks" && self.events.borrow().active > 0);
+        Ok(native_identity(if changed { 9 } else { 1 }))
+    }
     fn snapshot(&mut self) -> Result<DeviceSnapshot, LockError> {
         self.snapshots += 1;
         let mut value = target();
-        if self.fault == "identity" || (self.fault == "identity_after" && self.snapshots > 2) {
+        if self.fault == "identity"
+            || (self.fault == "identity_after" && self.snapshots > 2)
+            || (self.fault == "snapshot_before_locks" && self.writable_opens > 0)
+        {
             value.serial.push('x');
+        }
+        if self.fault == "geometry" {
+            value.geometry.physical_sector_size *= 2;
+        }
+        if self.fault == "device_id" {
+            value.device_id = Some(crate::writer::StableDeviceId::from_naa128([0x60; 16]).unwrap());
         }
         Ok(value)
     }
     fn layout(&mut self) -> Result<DiskLayout, LockError> {
         let mut result = self.layout.clone();
-        if self.fault == "layout_after" && self.enumerations > 1 {
+        if (self.fault == "layout_after" && self.enumerations > 1)
+            || (self.fault == "layout_before_locks" && self.writable_opens > 0)
+        {
             result.identity[0] ^= 1;
         }
         Ok(result)
@@ -202,6 +224,214 @@ impl Backend for Fake {
             fail,
             locked: false,
         })
+    }
+}
+
+fn native_identity(guid_byte: u8) -> crate::windows_identity::DiskIdentity {
+    let mut bytes = [0u8; 40];
+    bytes[0..4].copy_from_slice(&40u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&40u32.to_le_bytes());
+    bytes[12..16].copy_from_slice(&7u32.to_le_bytes());
+    bytes[16..20].copy_from_slice(&7u32.to_le_bytes());
+    bytes[20..36].fill(guid_byte);
+    crate::windows_identity::parse_identity(&bytes).unwrap()
+}
+
+fn observed() -> LockObservation {
+    LockObservation {
+        identity: native_identity(1),
+        coverage: super::super::TargetCoverage {
+            device: target(),
+            partition_style: 1,
+            layout_identity: [1; 16],
+            partitions: vec![
+                super::super::PartitionCoverage {
+                    partition_number: 1,
+                    start_offset: 1024 * 1024,
+                    length_bytes: 1024 * 1024,
+                    partition_type: [1; 16],
+                    partition_identity: [2; 16],
+                    volume_guid: Some(name(1).0),
+                    volume_required: true,
+                },
+                super::super::PartitionCoverage {
+                    partition_number: 2,
+                    start_offset: 2 * 1024 * 1024,
+                    length_bytes: 1024 * 1024,
+                    partition_type: [1; 16],
+                    partition_identity: [3; 16],
+                    volume_guid: Some(name(2).0),
+                    volume_required: true,
+                },
+            ],
+        },
+    }
+}
+
+#[test]
+fn checked_lock_rejects_changed_observation_before_writable_opens() {
+    for change in 0..9 {
+        let mut backend = Fake::new("");
+        match change {
+            0 => backend.layout.identity[0] ^= 1,
+            1 => backend.layout.partitions[0].identity[0] ^= 1,
+            2 => backend.layout.partitions[0].kind[0] ^= 1,
+            3 => backend.layout.partitions[0].number = 3,
+            4 => {
+                backend.layout.partitions[1].start += 1024 * 1024;
+                backend
+                    .volumes
+                    .insert(name(2), Some(vec![extent(7, 3 * 1024 * 1024)]));
+            }
+            5 => {
+                backend.layout.partitions[1].length *= 2;
+                backend.volumes.get_mut(&name(2)).unwrap().as_mut().unwrap()[0].length *= 2;
+            }
+            6 => {
+                let value = backend.volumes.remove(&name(2)).unwrap();
+                backend.volumes.insert(name(6), value);
+            }
+            7 => backend.fault = "native_identity",
+            8 => backend.fault = "native_error",
+            _ => unreachable!(),
+        }
+        assert!(
+            acquire_observed(&mut backend, &observed()).is_err(),
+            "change {change}"
+        );
+        assert_eq!(backend.writable_opens, 0, "change {change}");
+        assert!(
+            backend.events.borrow().entries.is_empty(),
+            "change {change}"
+        );
+        assert_eq!(backend.events.borrow().active, 0);
+    }
+}
+
+#[test]
+fn checked_lock_rechecks_native_identity_before_dismount_and_releases_locks() {
+    let mut backend = Fake::new("native_after_locks");
+    assert!(acquire_observed(&mut backend, &observed()).is_err());
+    let events = backend.events.borrow();
+    assert!(
+        events
+            .entries
+            .iter()
+            .any(|event| event.starts_with("lock:"))
+    );
+    assert!(
+        !events
+            .entries
+            .iter()
+            .any(|event| event.starts_with("dismount:"))
+    );
+    assert_eq!(events.active, 0);
+}
+
+#[test]
+fn checked_lock_rechecks_target_after_opening_volumes_before_any_lock() {
+    for fault in [
+        "layout_before_locks",
+        "snapshot_before_locks",
+        "native_before_locks",
+    ] {
+        let mut backend = Fake::new(fault);
+        assert!(
+            acquire_observed(&mut backend, &observed()).is_err(),
+            "{fault}"
+        );
+        assert_eq!(backend.writable_opens, 2);
+        assert!(backend.events.borrow().entries.is_empty(), "{fault}");
+        assert_eq!(backend.events.borrow().active, 0);
+    }
+}
+
+#[test]
+fn checked_partial_lock_failure_releases_locks_without_dismount() {
+    let mut backend = Fake::new("lock");
+    assert!(acquire_observed(&mut backend, &observed()).is_err());
+    let events = backend.events.borrow();
+    assert_eq!(events.entries.len(), 2);
+    assert!(
+        events
+            .entries
+            .iter()
+            .all(|entry| entry.starts_with("lock:"))
+    );
+    assert_eq!(events.active, 0);
+}
+
+#[test]
+fn checked_first_write_failure_does_not_consume_topology_validation() {
+    let mut backend = Fake::new("");
+    let mut held = acquire_observed(&mut backend, &observed()).unwrap();
+    let mut gate = WriteGate::new(observed());
+    let events = backend.events.borrow().entries.clone();
+    backend.layout.identity[0] ^= 1;
+    assert!(gate.before_write(&mut backend, &mut held).is_err());
+    assert!(!gate.write_attempted);
+    assert!(gate.before_write(&mut backend, &mut held).is_err());
+    assert_eq!(backend.events.borrow().entries, events);
+    backend.layout.identity[0] ^= 1;
+    gate.before_write(&mut backend, &mut held).unwrap();
+    assert!(gate.write_attempted);
+}
+
+#[test]
+fn checked_gate_preserves_native_identity_after_a_write_attempt_changes_layout() {
+    let mut backend = Fake::new("");
+    let mut held = acquire_observed(&mut backend, &observed()).unwrap();
+    let mut gate = WriteGate::new(observed());
+    gate.revalidate(&mut backend, &mut held).unwrap();
+    gate.before_write(&mut backend, &mut held).unwrap();
+    // Called before the actual write: even a failed WriteFile may have changed
+    // GPT bytes, so the old layout must not be treated as immutable afterwards.
+    backend.layout.identity[0] ^= 1;
+    gate.revalidate(&mut backend, &mut held).unwrap();
+    backend.fault = "native_identity";
+    assert!(gate.before_write(&mut backend, &mut held).is_err());
+}
+
+#[test]
+fn checked_gate_preserves_full_snapshot_after_a_write_attempt() {
+    for fault in ["identity", "geometry", "device_id"] {
+        let mut backend = Fake::new("");
+        let mut held = acquire_observed(&mut backend, &observed()).unwrap();
+        let mut gate = WriteGate::new(observed());
+        gate.before_write(&mut backend, &mut held).unwrap();
+        backend.fault = fault; // Native GUID remains unchanged.
+        assert!(gate.revalidate(&mut backend, &mut held).is_err(), "{fault}");
+        assert!(
+            gate.before_write(&mut backend, &mut held).is_err(),
+            "{fault}"
+        );
+    }
+}
+
+#[test]
+fn checked_first_write_rejects_changed_or_missing_retained_volume_coverage() {
+    for change in 0..3 {
+        let mut backend = Fake::new("");
+        let mut held = acquire_observed(&mut backend, &observed()).unwrap();
+        let mut gate = WriteGate::new(observed());
+        let events = backend.events.borrow().entries.clone();
+        match change {
+            0 => held[0].volume.extents.as_mut().unwrap()[0].length *= 2,
+            1 => {
+                backend.volumes.remove(&name(1));
+            }
+            2 => {
+                let value = backend.volumes.remove(&name(1)).unwrap();
+                backend.volumes.insert(name(6), value);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            gate.before_write(&mut backend, &mut held).is_err(),
+            "change {change}"
+        );
+        assert!(!gate.write_attempted);
+        assert_eq!(backend.events.borrow().entries, events);
     }
 }
 

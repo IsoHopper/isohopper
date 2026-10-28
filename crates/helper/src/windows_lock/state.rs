@@ -205,10 +205,76 @@ pub(super) trait Volume {
 }
 pub(super) trait Backend {
     type Volume: Volume;
+    fn identity(&mut self) -> Result<crate::windows_identity::DiskIdentity, LockError> {
+        Err(LockError::MissingEvidence(
+            "native disk identity unavailable",
+        ))
+    }
     fn snapshot(&mut self) -> Result<DeviceSnapshot, LockError>;
     fn layout(&mut self) -> Result<DiskLayout, LockError>;
     fn enumerate(&mut self) -> Result<Vec<VolumeName>, LockError>;
     fn open(&mut self, name: &VolumeName, write: bool) -> Result<Self::Volume, LockError>;
+}
+
+pub(super) struct LockObservation {
+    pub(super) identity: crate::windows_identity::DiskIdentity,
+    pub(super) coverage: super::TargetCoverage,
+}
+
+pub(super) fn acquire_observed<B: Backend>(
+    backend: &mut B,
+    observed: &LockObservation,
+) -> Result<Vec<Held<B::Volume>>, LockError> {
+    acquire_inner(backend, &observed.coverage.device, Some(observed))
+}
+
+pub(super) struct WriteGate {
+    observed: LockObservation,
+    write_attempted: bool,
+}
+
+impl WriteGate {
+    pub(super) fn new(observed: LockObservation) -> Self {
+        Self {
+            observed,
+            write_attempted: false,
+        }
+    }
+
+    pub(super) fn revalidate<B: Backend>(
+        &self,
+        backend: &mut B,
+        held: &mut [Held<B::Volume>],
+    ) -> Result<(), LockError> {
+        check_identity(backend, Some(&self.observed))?;
+        if backend.snapshot()? != self.observed.coverage.device {
+            return Err(LockError::DeviceChanged);
+        }
+        if !self.write_attempted {
+            // Retained lock handles supply the target extents. Reopening a
+            // locked target volume here could fail or create self-interference.
+            let discovery = discover_with_held(backend, &self.observed.coverage.device, held)?;
+            if discovery.coverage(&self.observed.coverage.device) != self.observed.coverage
+                || backend.layout()? != discovery.layout
+            {
+                return Err(LockError::VolumeChanged);
+            }
+            check_identity(backend, Some(&self.observed))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn before_write<B: Backend>(
+        &mut self,
+        backend: &mut B,
+        held: &mut [Held<B::Volume>],
+    ) -> Result<(), LockError> {
+        self.revalidate(backend, held)?;
+        // A failing raw write may have changed GPT bytes. Mark the attempt
+        // before calling the writer, never after a reported successful write.
+        self.write_attempted = true;
+        Ok(())
+    }
 }
 
 pub(super) struct Held<V: Volume> {
@@ -240,29 +306,7 @@ pub(super) fn probe<B: Backend>(
             volume,
         });
     }
-    let coverage = super::TargetCoverage {
-        device: expected.clone(),
-        partition_style: discovery.layout.style,
-        layout_identity: discovery.layout.identity,
-        partitions: discovery
-            .layout
-            .partitions
-            .iter()
-            .map(|partition| super::PartitionCoverage {
-                partition_number: partition.number,
-                start_offset: partition.start,
-                length_bytes: partition.length,
-                partition_type: partition.kind,
-                partition_identity: partition.identity,
-                volume_required: requires_volume(discovery.layout.style, partition),
-                volume_guid: discovery.names.iter().find_map(|name| {
-                    let extent = discovery.before[name].as_ref()?.first()?;
-                    (extent.start == partition.start && extent.length == partition.length)
-                        .then(|| name.0.clone())
-                }),
-            })
-            .collect(),
-    };
+    let coverage = discovery.coverage(expected);
     let mut result = ProbeState {
         held,
         coverage,
@@ -330,6 +374,34 @@ struct Discovery {
     names: Vec<VolumeName>,
 }
 
+impl Discovery {
+    fn coverage(&self, expected: &DeviceSnapshot) -> super::TargetCoverage {
+        super::TargetCoverage {
+            device: expected.clone(),
+            partition_style: self.layout.style,
+            layout_identity: self.layout.identity,
+            partitions: self
+                .layout
+                .partitions
+                .iter()
+                .map(|partition| super::PartitionCoverage {
+                    partition_number: partition.number,
+                    start_offset: partition.start,
+                    length_bytes: partition.length,
+                    partition_type: partition.kind,
+                    partition_identity: partition.identity,
+                    volume_required: requires_volume(self.layout.style, partition),
+                    volume_guid: self.names.iter().find_map(|name| {
+                        let extent = self.before[name].as_ref()?.first()?;
+                        (extent.start == partition.start && extent.length == partition.length)
+                            .then(|| name.0.clone())
+                    }),
+                })
+                .collect(),
+        }
+    }
+}
+
 fn requires_volume(style: u32, partition: &Partition) -> bool {
     !(style == 1 && [BIOS_BOOT, MICROSOFT_RESERVED].contains(&partition.kind))
 }
@@ -338,11 +410,19 @@ fn discover<B: Backend>(
     backend: &mut B,
     expected: &DeviceSnapshot,
 ) -> Result<Discovery, LockError> {
+    discover_with_held(backend, expected, &mut [])
+}
+
+fn discover_with_held<B: Backend>(
+    backend: &mut B,
+    expected: &DeviceSnapshot,
+    held: &mut [Held<B::Volume>],
+) -> Result<Discovery, LockError> {
     if backend.snapshot()? != *expected {
         return Err(LockError::DeviceChanged);
     }
     let layout = backend.layout()?;
-    let before = survey(backend, &mut [])?;
+    let before = survey(backend, held)?;
     let mut names = Vec::new();
     let mut ranges = BTreeSet::new();
     for (name, extents) in &before {
@@ -394,11 +474,39 @@ pub(super) fn acquire<B: Backend>(
     backend: &mut B,
     expected: &DeviceSnapshot,
 ) -> Result<Vec<Held<B::Volume>>, LockError> {
+    acquire_inner(backend, expected, None)
+}
+
+fn check_identity<B: Backend>(
+    backend: &mut B,
+    observed: Option<&LockObservation>,
+) -> Result<(), LockError> {
+    if let Some(observed) = observed
+        && (observed.identity.device_number() != observed.coverage.device.device_number
+            || backend.identity()? != observed.identity)
+    {
+        return Err(LockError::DeviceChanged);
+    }
+    Ok(())
+}
+
+fn acquire_inner<B: Backend>(
+    backend: &mut B,
+    expected: &DeviceSnapshot,
+    observed: Option<&LockObservation>,
+) -> Result<Vec<Held<B::Volume>>, LockError> {
+    check_identity(backend, observed)?;
+    let discovery = discover(backend, expected)?;
+    if let Some(observed) = observed
+        && discovery.coverage(expected) != observed.coverage
+    {
+        return Err(LockError::VolumeChanged);
+    }
     let Discovery {
         layout,
         before,
         names,
-    } = discover(backend, expected)?;
+    } = discovery;
     let mut held = Vec::new();
     // Open and validate every target before taking any lock or dismounting.
     // Each Volume owns its lock and releases it when dropped, including all
@@ -410,6 +518,15 @@ pub(super) fn acquire<B: Backend>(
         }
         held.push(Held { name, volume });
     }
+    if observed.is_some() {
+        if backend.snapshot()? != *expected {
+            return Err(LockError::DeviceChanged);
+        }
+        if backend.layout()? != layout {
+            return Err(LockError::VolumeChanged);
+        }
+    }
+    check_identity(backend, observed)?;
     for item in &mut held {
         item.volume.lock()?;
     }
@@ -424,6 +541,7 @@ pub(super) fn acquire<B: Backend>(
             return Err(LockError::VolumeChanged);
         }
     }
+    check_identity(backend, observed)?;
     // No explicit dismount occurs until every lock and revalidation succeeds.
     for item in &mut held {
         item.volume.dismount()?;
@@ -434,6 +552,7 @@ pub(super) fn acquire<B: Backend>(
     if backend.snapshot()? != *expected {
         return Err(LockError::DeviceChanged);
     }
+    check_identity(backend, observed)?;
     Ok(held)
 }
 

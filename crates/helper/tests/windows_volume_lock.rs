@@ -89,7 +89,7 @@ mod native {
     use super::{lock_image, vhd_support};
     use isohopper_helper::{
         windows_encryption_check,
-        windows_lock::{self, LockError, TargetVolumeProbe},
+        windows_lock::{self, LockError, ObservedLockError, TargetVolumeProbe},
         windows_target::BoundTarget,
         writer::{RetainedDevice, write_image},
     };
@@ -197,13 +197,12 @@ mod native {
         // opens while the probe lives independently show no volume lock/dismount.
         verify_payload(&mut held_file)?;
         verify_payload(&mut open_payload(&volumes[0])?)?;
-        drop(binding);
         drop(probe);
-        match windows_lock::lock(device, &expected) {
-            Err(LockError::Io {
+        match windows_lock::lock_observed(device, binding) {
+            Err(ObservedLockError::Lock(LockError::Io {
                 stage: "lock target volume",
                 ..
-            }) => {}
+            })) => {}
             Err(error) => {
                 return Err(format!("expected open-file lock refusal, got {error}").into());
             }
@@ -215,7 +214,16 @@ mod native {
 
         let device = vhd.open_raw_device()?;
         assert_eq!(device.initial_snapshot(), &expected);
-        let mut locked = windows_lock::lock(device, &expected)?;
+        let (device_path, number) = vhd.physical_path()?;
+        let read_only = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(device_path)?;
+        vhd_support::assert_readback_binding(&read_only, number)?;
+        // SAFETY: same owned VHD, synchronous read-only handle. The bridge
+        // consumes all of its probe handles before trying volume locks.
+        let binding = unsafe { BoundTarget::from_owned_handle(read_only.into(), &expected)? };
+        let mut locked = windows_lock::lock_observed(device, binding)?;
         assert_eq!(locked.locked_volume_count(), 2);
         assert_eq!(locked.snapshot()?, expected);
         for volume in &volumes {
@@ -236,7 +244,7 @@ mod native {
         }
         vhd.detach()?;
         println!(
-            "VHD lock integration passed: read-only retained probe matches two independently discovered FAT32 extents without blocking payload access; open-file lock refusal followed by readable payloads and successful retry; retained locks deny file opens; drop restores both payloads; no USB hardware exercised"
+            "VHD lock integration passed: read-only retained probe matches two independently discovered FAT32 extents without blocking payload access; checked target-to-lock handoff refuses open files, then succeeds after retry; retained locks deny file opens; drop restores both payloads; no USB hardware exercised"
         );
         Ok(())
     }

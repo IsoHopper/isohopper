@@ -5,7 +5,11 @@
 #[path = "support/windows_vhd.rs"]
 mod support;
 use isohopper_core::{layout, virtualdisk};
-use isohopper_helper::writer::{CHUNK_BYTES, Phase, write_image};
+use isohopper_helper::{
+    windows_lock,
+    windows_target::BoundTarget,
+    writer::{CHUNK_BYTES, Phase, write_image},
+};
 use std::{
     fs::OpenOptions,
     io::{self, Read, Seek, SeekFrom, Write},
@@ -59,7 +63,7 @@ fn windows_vhd_writer_persists_verified_gpt() -> Result<(), Box<dyn std::error::
     drop(first);
     vhd.detach()?;
     vhd.attach(false)?;
-    let mut device = vhd.open_raw_device()?;
+    let device = vhd.open_raw_device()?;
     let expected = device.initial_snapshot().clone();
     assert_eq!(expected.geometry.size_bytes, CAPACITY);
     assert_eq!(expected.geometry.logical_sector_size, 512);
@@ -68,6 +72,21 @@ fn windows_vhd_writer_persists_verified_gpt() -> Result<(), Box<dyn std::error::
     // enumeration number. No serial is fabricated for a serial-less VHD.
     assert!(expected.serial.is_empty());
     assert_eq!(expected.device_id, Some(first_id));
+    let (physical_path, number) = vhd.physical_path()?;
+    let read_only = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(physical_path)?;
+    assert_readback_binding(&read_only, number)?;
+    // SAFETY: this is a synchronous read-only whole-device handle obtained
+    // only from the retained, newly created VHD fixture. No host disk selected.
+    let binding = unsafe { BoundTarget::from_owned_handle(read_only.into(), &expected)? };
+    assert!(binding.observation().coverage.partitions.is_empty());
+    let mut device = windows_lock::lock_observed(device, binding)?;
+    assert_eq!(device.locked_volume_count(), 0);
+    // The first write must revalidate the blank topology. Subsequent writes,
+    // flushing and readback must remain bound to the same native device while
+    // allowing the intended newly written GPT to replace that initial layout.
     let mut phases = Vec::new();
     let report = write_image(
         &mut device,
@@ -128,7 +147,7 @@ fn windows_vhd_writer_persists_verified_gpt() -> Result<(), Box<dyn std::error::
     vhd.detach()?;
     virtualdisk::verify(&persisted_path)?;
     println!(
-        "VHD integration passed: {CAPACITY} bytes written and read back; read-only reattachment digest and primary/backup GPT verified; no USB hardware exercised"
+        "VHD integration passed: checked target-to-lock handoff and first-write gate; {CAPACITY} bytes written and read back after intended GPT change; read-only reattachment digest and primary/backup GPT verified; no USB hardware exercised"
     );
     Ok(())
 }

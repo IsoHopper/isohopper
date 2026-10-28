@@ -44,12 +44,23 @@ pub enum LockError {
     VolumeChanged,
     #[error("dynamic, shared, overlapping or unsupported disk layout")]
     UnsupportedLayout,
+    #[error(transparent)]
+    Identity(#[from] crate::windows_identity::IdentityError),
+}
+
+/// A failed observation-to-lock handoff grants no device capability.
+#[derive(Debug, thiserror::Error)]
+pub enum ObservedLockError {
+    #[error(transparent)]
+    Target(#[from] crate::windows_target::TargetError),
+    #[error(transparent)]
+    Lock(#[from] LockError),
 }
 
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
-pub use native::{LockedWindowsDevice, TargetVolumeProbe, lock};
+pub use native::{LockedWindowsDevice, TargetVolumeProbe, lock, lock_observed};
 
 #[cfg(any(windows, test))]
 mod state;
