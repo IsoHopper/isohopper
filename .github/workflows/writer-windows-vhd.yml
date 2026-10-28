@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: 2026 S33G
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: Windows VHD writer integration
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/writer-windows-vhd.yml
+      - crates/helper/tests/windows_vhd.rs
+      - crates/helper/src/writer.rs
+      - crates/helper/src/writer/**
+      - crates/helper/Cargo.toml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-vhd-writer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vhd-writer:
+    name: Retained-device writer on a temporary VHDX
+    runs-on: windows-2022
+    timeout-minutes: 10
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: 2
+      CI: true
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+
+      - name: Write and verify only a newly created temporary VHDX
+        shell: bash
+        run: |
+          if cargo +1.98.0 test --locked -p isohopper-helper --test windows_vhd windows_vhd_writer_persists_verified_gpt -- --ignored --exact --nocapture > vhd-test.log 2>&1; then
+            cat vhd-test.log
+          else
+            python - <<'PY'
+          from pathlib import Path
+          text = Path('vhd-test.log').read_text(errors='replace')[-12000:]
+          print(text)
+          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=Windows VHD writer integration failed::' + text)
+          PY
+            exit 1
+          fi
