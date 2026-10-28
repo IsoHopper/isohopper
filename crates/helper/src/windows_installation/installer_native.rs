@@ -173,27 +173,46 @@ fn remove(file: &File) -> Result<(), String> {
 
 fn root_handle(path: &Path) -> Result<File, io::Error> {
     OpenOptions::new()
-        .access_mode(0x0002_0080 | DELETE)
-        .share_mode(0)
+        // Metadata only: the rename API opens its destination parent with
+        // FILE_WRITE_DATA | SYNCHRONIZE. A DELETE/share0 directory handle
+        // conflicts with that internal open. Denying delete sharing still
+        // prevents this retained directory from being renamed or replaced.
+        .access_mode(0x0002_0080)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
+}
+
+fn require_ordinary_directory(file: &File) -> Result<(), Error> {
+    let metadata = file.metadata().map_err(|e| Error::Unsafe(e.to_string()))?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(Error::Unsafe(
+            "Installation root is not an ordinary directory".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn prepare_root(path: &Path, sd: &Descriptor) -> Result<File, Error> {
     match root_handle(path) {
         Ok(file) => {
-            let metadata = file.metadata().map_err(|e| Error::Unsafe(e.to_string()))?;
-            if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            {
-                return Err(Error::Unsafe(
-                    "Installation root is not an ordinary directory".into(),
-                ));
-            }
+            require_ordinary_directory(&file)?;
             if check_object(&file, ObjectKind::Directory).is_ok() {
                 return Ok(file);
             }
             // Never harden/adopt a previously writable directory. Delete the
             // exact retained object only if empty, then create a fresh object.
+            // The metadata guard denies delete sharing, so release it before
+            // obtaining a separate exclusive deletion handle. Recheck its type
+            // after reopening; never follow a replacement reparse point.
+            drop(file);
+            let file = OpenOptions::new()
+                .access_mode(0x0002_0080 | DELETE)
+                .share_mode(0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)
+                .map_err(|e| busy_or_unsafe("Open empty installation root for replacement", e))?;
+            require_ordinary_directory(&file)?;
             // Any concurrent insertion makes disposition fail; a name race
             // after close makes CREATE_DIRECTORY fail rather than adopting it.
             remove(&file).map_err(|e| {
@@ -500,8 +519,13 @@ mod tests {
         );
         let _allocation = Descriptor(value.cast());
         assert!((1..8192).contains(&length));
-        String::from_utf16(unsafe { std::slice::from_raw_parts(value, length as usize - 1) })
-            .unwrap()
+        // The reported allocation can exceed the terminated text. Stop at
+        // its first NUL instead of treating trailing capacity as string data.
+        let end = (0..length as usize)
+            .find(|index| unsafe { *value.add(*index) } == 0)
+            .expect("terminated SDDL");
+        assert!(end > 0);
+        String::from_utf16(unsafe { std::slice::from_raw_parts(value, end) }).unwrap()
     }
 
     fn assert_created_descriptor(file: &File, sd: &Descriptor) {
@@ -585,6 +609,23 @@ mod tests {
         let root = fixture.path().join("protected");
         let root_guard = prepare_root(&root, &sd).unwrap();
         assert_created_descriptor(&root_guard, &sd);
+        let delete_attempt = OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(
+                FILE_SHARE_READ
+                    | FILE_SHARE_WRITE
+                    | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE,
+            )
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&root)
+            .unwrap_err();
+        assert_eq!(delete_attempt.raw_os_error(), Some(32));
+        assert_eq!(
+            std::fs::rename(&root, fixture.path().join("replaced"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(32)
+        );
         // The running test executable supplies a real mapped image section,
         // separately from the explicit read handles used by the install test.
         let mapped = OpenOptions::new()

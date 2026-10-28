@@ -70,6 +70,18 @@ jobs:
           $tokens = $null
           $null = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $env:GITHUB_WORKSPACE 'scripts/test-windows-installer.ps1'), [ref]$tokens, [ref]$parseErrors)
           if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
+      - name: Test native installer handles using owned temporary files
+        run: |
+          if cargo test --locked -p isohopper-helper --lib native_installer_retained_file_operations_and_empty_root_recovery -- --ignored --nocapture > installer-native.log 2>&1; then
+            cat installer-native.log
+          else
+            python - <<'PYERR'
+          from pathlib import Path
+          detail = Path('installer-native.log').read_text(errors='replace')[-3000:]
+          print('::error title=Native installer handles failed::' + detail.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A'))
+          PYERR
+            exit 1
+          fi
       - name: Stage the real helper and build frontend
         run: |
           cargo build --locked -p isohopper-helper
@@ -100,18 +112,6 @@ jobs:
           text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
           print('::error title=Windows Studio checks failed::' + text)
           PY
-            exit 1
-          fi
-      - name: Test native installer handles using owned temporary files
-        run: |
-          if cargo test --locked -p isohopper-helper --lib native_installer_retained_file_operations_and_empty_root_recovery -- --ignored --nocapture > installer-native.log 2>&1; then
-            cat installer-native.log
-          else
-            python - <<'PYERR'
-          from pathlib import Path
-          detail = Path('installer-native.log').read_text(errors='replace')[-3000:]
-          print('::error title=Native installer handles failed::' + detail.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A'))
-          PYERR
             exit 1
           fi
       - name: Build a diagnostic NSIS installer without WebView installation
