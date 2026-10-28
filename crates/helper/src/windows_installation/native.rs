@@ -28,10 +28,11 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FILE_STANDARD_INFO, FILE_TYPE_DISK, FileBasicInfo, FileIdInfo, FileStandardInfo,
-        GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW,
-        GetVolumeInformationByHandleW, QueryDosDeviceW, VOLUME_NAME_NT, WofIsExternalFile,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TRAVERSE, FILE_TYPE_DISK, FileBasicInfo,
+        FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx, GetFileType,
+        GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, QueryDosDeviceW, READ_CONTROL,
+        VOLUME_NAME_NT, WofIsExternalFile,
     },
     System::{
         Com::CoTaskMemFree, SystemInformation::GetSystemWindowsDirectoryW,
@@ -261,6 +262,20 @@ fn check_mapping(drive: &str, expected: Option<&str>) -> Result<String, String> 
     Ok(current)
 }
 
+/// Retain a directory without allowing its deletion or replacement. Callers
+/// separately validate the object's type and security before trusting it.
+pub(crate) fn open_directory_guard(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        // FILE_TRAVERSE aliases FILE_EXECUTE and participates in sharing.
+        // Metadata rights alone do not enforce denied delete sharing. Allow
+        // read/write sharing so rename can open its destination parent with
+        // FILE_WRITE_DATA | SYNCHRONIZE, while still excluding DELETE opens.
+        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
 fn retain_ancestors(directory: &str) -> Result<Vec<(File, ObjectKind)>, String> {
     let drive = &directory[..2];
     let mut ancestors = Vec::new();
@@ -275,13 +290,7 @@ fn retain_ancestors(directory: &str) -> Result<Vec<(File, ObjectKind)>, String> 
         } else {
             ObjectKind::Ancestor
         };
-        // READ_CONTROL + FILE_READ_ATTRIBUTES, rather than directory data
-        // access: existing harmless sibling creators must not block us.
-        let file = OpenOptions::new()
-            .access_mode(0x00020080)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&component)
+        let file = open_directory_guard(&component)
             .map_err(|e| format!("Open protected installation ancestor: {e}"))?;
         check_object(&file, kind)?;
         if index == 0 {

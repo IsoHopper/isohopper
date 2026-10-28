@@ -172,15 +172,7 @@ fn remove(file: &File) -> Result<(), String> {
 }
 
 fn root_handle(path: &Path) -> Result<File, io::Error> {
-    OpenOptions::new()
-        // Metadata only: the rename API opens its destination parent with
-        // FILE_WRITE_DATA | SYNCHRONIZE. A DELETE/share0 directory handle
-        // conflicts with that internal open. Denying delete sharing still
-        // prevents this retained directory from being renamed or replaced.
-        .access_mode(0x0002_0080)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
+    open_directory_guard(path)
 }
 
 fn require_ordinary_directory(file: &File) -> Result<(), Error> {
@@ -202,7 +194,7 @@ fn prepare_root(path: &Path, sd: &Descriptor) -> Result<File, Error> {
             }
             // Never harden/adopt a previously writable directory. Delete the
             // exact retained object only if empty, then create a fresh object.
-            // The metadata guard denies delete sharing, so release it before
+            // The directory guard denies delete sharing, so release it before
             // obtaining a separate exclusive deletion handle. Recheck its type
             // after reopening; never follow a replacement reparse point.
             drop(file);
@@ -601,12 +593,93 @@ mod tests {
         unsafe { File::from_raw_handle(handle) }
     }
 
+    fn directory_share_diagnostics(fixture: &Path, sd: &Descriptor) {
+        use windows_sys::Win32::Storage::FileSystem::{FILE_LIST_DIRECTORY, FILE_SHARE_DELETE};
+        // Test-only matrix reports every candidate before the production
+        // assertions. It is evidence, never a runtime fallback or policy probe.
+        for (label, access) in [
+            ("metadata", READ_CONTROL | FILE_READ_ATTRIBUTES),
+            (
+                "traverse",
+                READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+            ),
+            (
+                "list",
+                READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+            ),
+        ] {
+            let path = fixture.join(label);
+            let name = wide(path.as_os_str());
+            assert_ne!(
+                unsafe { CreateDirectoryW(name.as_ptr(), &attributes(sd)) },
+                0
+            );
+            let guard = OpenOptions::new()
+                .access_mode(access)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&path);
+            let guard = match guard {
+                Ok(guard) => guard,
+                Err(error) => {
+                    eprintln!(
+                        "DIRECTORY_SHARE_DIAGNOSTIC access={label}; open={:?}",
+                        error.raw_os_error()
+                    );
+                    continue;
+                }
+            };
+            let delete = OpenOptions::new()
+                .access_mode(DELETE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&path);
+            let delete_code = delete
+                .as_ref()
+                .err()
+                .and_then(io::Error::raw_os_error)
+                .unwrap_or(0);
+            drop(delete);
+            let moved = fixture.join(format!("{label}-moved"));
+            let parent_rename = std::fs::rename(&path, &moved);
+            let parent_code = parent_rename
+                .as_ref()
+                .err()
+                .and_then(io::Error::raw_os_error)
+                .unwrap_or(0);
+            let current = if parent_rename.is_ok() { &moved } else { &path };
+            let child = OpenOptions::new()
+                .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+                .share_mode(0)
+                .create_new(true)
+                .open(current.join("source"));
+            let child_result = child
+                .map_err(|error| error.to_string())
+                .and_then(|file| rename(&file, &current.join("renamed")));
+            eprintln!(
+                "DIRECTORY_SHARE_DIAGNOSTIC access={label}; delete={delete_code}; parent_rename={parent_code}; child_rename={child_result:?}"
+            );
+            drop(guard);
+        }
+    }
+
     #[test]
     #[ignore = "requires administrator token to create BA-owned fixture objects; no install or device access"]
     fn native_installer_retained_file_operations_and_empty_root_recovery() {
         let fixture = tempfile::tempdir().unwrap();
         let sd = descriptor().unwrap();
-        let root = fixture.path().join("protected");
+        directory_share_diagnostics(fixture.path(), &sd);
+        let ancestor = fixture.path().join("ancestor");
+        let ancestor_guard = prepare_root(&ancestor, &sd).unwrap();
+        // Test the ancestor guard before opening children, so a child handle
+        // cannot accidentally supply the protection this assertion expects.
+        assert_eq!(
+            std::fs::rename(&ancestor, fixture.path().join("ancestor-replaced"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(32)
+        );
+        let root = ancestor.join("protected");
         let root_guard = prepare_root(&root, &sd).unwrap();
         assert_created_descriptor(&root_guard, &sd);
         let delete_attempt = OpenOptions::new()
@@ -666,6 +739,7 @@ mod tests {
         std::fs::hard_link(&linked_path, root.join("alias.exe")).unwrap();
         assert!(require_regular(&File::open(&linked_path).unwrap(), true).is_err());
         drop(root_guard);
+        drop(ancestor_guard);
 
         let unsafe_sd = descriptor_from("O:BAG:BAD:P(A;OICI;FA;;;WD)").unwrap();
         for empty in [true, false] {

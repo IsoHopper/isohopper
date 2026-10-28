@@ -98,8 +98,9 @@ Function IsoHopperCreatePayload
   System::Store "s"
   StrCpy $IsoHopperFailureCode 12
   StrCpy $IsoHopperFailureText "Could not create a protected setup directory. Close other setup windows and run this installer again."
-  ; Hold the fixed parent without delete sharing before creating the child.
-  System::Call 'kernel32::CreateFileW(w "$PROGRAMFILES64", i 0x20080, i 3, p 0, i 3, i 0x02200000, p 0) p.r0'
+  ; Include FILE_TRAVERSE so the guard participates in sharing checks. Metadata
+  ; access alone does not enforce no-delete sharing. Permit child-name writes.
+  System::Call 'kernel32::CreateFileW(w "$PROGRAMFILES64", i 0x200a0, i 3, p 0, i 3, i 0x02200000, p 0) p.r0'
   ${If} $0 == -1
   ${OrIf} $0 == 0
     Call IsoHopperInstallFailed
@@ -147,7 +148,7 @@ Function IsoHopperCreatePayload
     ; The path was not created by us. Do not open or clean it up.
     Call IsoHopperInstallFailed
   ${EndIf}
-  System::Call 'kernel32::CreateFileW(w r8, i 0x20080, i 3, p 0, i 3, i 0x02200000, p 0) p.r0'
+  System::Call 'kernel32::CreateFileW(w r8, i 0x200a0, i 3, p 0, i 3, i 0x02200000, p 0) p.r0'
   ${If} $0 == -1
   ${OrIf} $0 == 0
     Call IsoHopperInstallFailed

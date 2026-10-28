@@ -13,6 +13,7 @@ use crate::{
     writer,
 };
 use std::sync::mpsc::SyncSender;
+use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
 /// Production staging lives under the machine installation, not the runner's
 /// environment-selected scratch disk. Keep this fixture on the Windows volume

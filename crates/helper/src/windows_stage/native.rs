@@ -4,7 +4,7 @@ use super::{
     policy::{privilege_enabled, validate_geometry},
 };
 use crate::{
-    windows_installation::{MachineInstallation, check_stage_object},
+    windows_installation::{MachineInstallation, check_stage_object, open_directory_guard},
     writer::Geometry,
 };
 use std::{
@@ -31,8 +31,7 @@ use windows_sys::Win32::{
     Storage::{
         FileSystem::{
             CreateDirectoryW, FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_ENCRYPTED,
-            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-            FILE_SHARE_WRITE,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
         },
         Vhd::*,
     },
@@ -194,11 +193,7 @@ fn create_private_directory(path: &Path, descriptor: &Descriptor) -> Result<File
     if unsafe { CreateDirectoryW(name.as_ptr(), &attributes) } == 0 {
         return Err(error("create job directory", io::Error::last_os_error()));
     }
-    let result = OpenOptions::new()
-        .access_mode(0x0002_0080)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
+    let result = open_directory_guard(path)
         .map_err(|e| error("retain job directory", e))
         .and_then(|file| {
             check_stage_object(&file, true).map_err(StageError::Installation)?;

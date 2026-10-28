@@ -34,7 +34,7 @@ mod policy;
 #[cfg(windows)]
 pub use native::MachineInstallation;
 #[cfg(windows)]
-pub(crate) use native::check_stage_object;
+pub(crate) use native::{check_stage_object, open_directory_guard};
 #[cfg(windows)]
 mod state;
 #[cfg(windows)]
