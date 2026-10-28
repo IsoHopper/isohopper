@@ -1,0 +1,164 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: Windows Studio integration
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/studio-windows.yml
+      - studio/src-tauri/**
+      - crates/helper/src/broker_probe.rs
+      - crates/helper/src/windows_probe.rs
+      - crates/helper/src/main.rs
+      - crates/helper/build.rs
+      - scripts/stage-windows-helper.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-studio-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    env:
+      CI: true
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22.22.1'
+          cache: npm
+          cache-dependency-path: studio/frontend/package-lock.json
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.0 --profile minimal --component clippy --component rustfmt
+      - name: Cache native compilation
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            studio/src-tauri/target
+          key: native-windows-nodebug-${{ hashFiles('Cargo.lock', 'studio/src-tauri/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            native-windows-nodebug-
+      - name: Stage the real helper and build frontend
+        run: |
+          cargo build --locked -p isohopper-helper
+          ./target/debug/isohopper-helper.exe --version
+          python3 scripts/stage-windows-helper.py --source target/debug/isohopper-helper.exe
+          npm --prefix studio/frontend ci --no-audit --no-fund
+          npm --prefix studio/frontend run build
+      - name: Check native backend without requesting UAC
+        run: |
+          if {
+            cargo fmt --manifest-path studio/src-tauri/Cargo.toml -- --check &&
+            cargo clippy --manifest-path studio/src-tauri/Cargo.toml --all-targets --locked -- -D warnings &&
+            cargo test --manifest-path studio/src-tauri/Cargo.toml --all-targets --locked
+          } > native-checks.log 2>&1; then
+            cat native-checks.log
+            python - <<'PY'
+          import re
+          from pathlib import Path
+          results = re.findall(r'test result: ok\. \d+ passed; \d+ failed; \d+ ignored', Path('native-checks.log').read_text(errors='replace'))
+          print('::notice title=Windows Studio checks::No UAC or physical-device operation; ' + '; '.join(results))
+          PY
+          else
+            python - <<'PY'
+          from pathlib import Path
+          text = Path('native-checks.log').read_text(errors='replace')[-12000:]
+          print(text)
+          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=Windows Studio checks failed::' + text)
+          PY
+            exit 1
+          fi
+      - name: Build a diagnostic NSIS installer without WebView installation
+        working-directory: studio/src-tauri
+        run: |
+          if npx --yes @tauri-apps/cli@2.12.4 build --debug --bundles nsis --config '{"bundle":{"windows":{"webviewInstallMode":{"type":"skip"}}}}' -- --locked > installer-build.log 2>&1; then
+            cat installer-build.log
+          else
+            python - <<'PY'
+          from pathlib import Path
+          text = Path('installer-build.log').read_text(errors='replace')[-12000:]
+          print(text)
+          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=Windows installer build failed::' + text)
+          PY
+            exit 1
+          fi
+      - name: Install only on this disposable runner and verify the real protection
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installation = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'IsoHopper'
+          if (Test-Path -LiteralPath $installation) { throw 'Refusing an existing installation directory' }
+          $installers = @(Get-ChildItem -LiteralPath 'studio/src-tauri/target/debug/bundle/nsis' -Filter '*.exe' -File)
+          if ($installers.Count -ne 1) { throw 'Expected exactly one diagnostic installer' }
+          $skipCleanup = $false
+          try {
+            $process = Start-Process -FilePath $installers[0].FullName -ArgumentList '/S' -PassThru -Wait
+            if ($process.ExitCode -ne 0) { throw "Fresh installation failed: $($process.ExitCode)" }
+            & (Join-Path $installation 'isohopper-helper.exe') --version
+            if ($LASTEXITCODE -ne 0) { throw 'Installed helper cannot execute normally' }
+            & cargo test --manifest-path studio/src-tauri/Cargo.toml --locked native_installed_helper_is_protected_and_matches_build -- --ignored --nocapture *> installed-check.log
+            $testExit = $LASTEXITCODE
+            Get-Content installed-check.log
+            if ($testExit -ne 0) {
+              $detail = (Get-Content installed-check.log -Raw)
+              if ($detail.Length -gt 12000) { $detail = $detail.Substring($detail.Length - 12000) }
+              $detail = $detail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+              Write-Output "::error title=Installed helper protection failed::$detail"
+              throw 'Installed helper protection or checksum failed'
+            }
+            $installedFiles = @(Get-ChildItem -LiteralPath $installation -Filter '*.exe' -File)
+            if ($installedFiles.Count -ne 3) { throw 'Expected application, helper and uninstaller' }
+            $original = @{}
+            foreach ($file in $installedFiles) {
+              $original[$file.FullName] = @{
+                Hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+                Sddl = (Get-Acl -LiteralPath $file.FullName).Sddl
+              }
+            }
+            foreach ($mode in @('/S', '/P')) {
+              $retry = Start-Process -FilePath $installers[0].FullName -ArgumentList $mode -PassThru
+              if (-not $retry.WaitForExit(60000)) {
+                # Kill is asynchronous. Runner disposal avoids overlapping cleanup.
+                $skipCleanup = $true
+                $retry.Kill($true)
+                throw "Existing-install refusal timed out: $mode"
+              }
+              if ($retry.ExitCode -ne 3) { throw "Expected refusal 3 for $mode, got $($retry.ExitCode)" }
+              foreach ($file in $installedFiles) {
+                $before = $original[$file.FullName]
+                if ((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash -ne $before.Hash) {
+                  throw "Existing executable changed during refusal: $mode"
+                }
+                if ((Get-Acl -LiteralPath $file.FullName).Sddl -ne $before.Sddl) {
+                  throw "Existing executable protection changed during refusal: $mode"
+                }
+              }
+            }
+            Write-Output '::notice title=Windows installer check::Fresh NSIS installation, protected helper and matching checksum, repeated silent/passive refusal with unchanged executables and ACLs passed; no UAC interaction or device operation tested'
+          } finally {
+            $uninstaller = Join-Path $installation 'uninstall.exe'
+            if (-not $skipCleanup -and (Test-Path -LiteralPath $uninstaller)) {
+              $cleanup = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
+              if ($cleanup.ExitCode -ne 0) { Write-Warning "Disposable runner uninstall returned $($cleanup.ExitCode)" }
+            }
+          }
