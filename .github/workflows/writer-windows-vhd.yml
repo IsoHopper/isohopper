@@ -224,6 +224,17 @@ jobs:
         run: |
           if cargo +1.98.0 test --locked -p isohopper-helper --lib windows_stage::native::build::tests::native_stage_builds_persists_and_seals_pinned_engine -- --ignored --exact --nocapture --test-threads=1 > sealed-stage-test.log 2>&1; then
             cat sealed-stage-test.log
+            python - <<'PY'
+          from pathlib import Path
+          text = Path('sealed-stage-test.log').read_text(errors='replace')
+          evidence = [
+              'OWNED_COORDINATOR_OK stage_host_bound=true confirmation=true cm_write_handoff=true persisted_raw_sha256=true nested_files=true physical_target=false',
+              'OWNED_STAGE_SEALED_OK nested_files=4 persisted=true raw_sha256=true engine_regions=true physical_write=false',
+          ]
+          if not all(line in text for line in evidence):
+              raise SystemExit('Expected production staging evidence is missing')
+          print('::notice title=Windows production staging evidence::' + '%0A'.join(evidence))
+          PY
           else
             python - <<'PY'
           from pathlib import Path
