@@ -432,10 +432,12 @@ impl MachineInstallation {
             .directory
             .to_str()
             .ok_or("Installation path is not Unicode")?;
-        if directory.eq_ignore_ascii_case(expected) {
+        if super::policy::resource_directory_matches(directory, expected) {
             Ok(())
         } else {
-            Err("Resource directory is not the protected machine installation".into())
+            Err(format!(
+                "Resource directory is not the protected machine installation (reported: {directory}; required: {expected})"
+            ))
         }
     }
 

@@ -96,6 +96,16 @@ pub(super) fn installation_path(
     Ok(expected)
 }
 
+pub(super) fn resource_directory_matches(directory: &str, expected: &str) -> bool {
+    // Tauri canonicalizes its executable path. On Windows that produces the
+    // extended drive spelling. Accept only that prefix, never UNC/device
+    // namespaces, traversal, trailing-dot aliases or other path normalization.
+    let directory = directory.strip_prefix(r"\\?\").unwrap_or(directory);
+    plain_drive_path(directory)
+        && plain_drive_path(expected)
+        && directory.eq_ignore_ascii_case(expected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,6 +116,36 @@ mod tests {
             flags: 0,
             mask,
             sid: sid.into(),
+        }
+    }
+
+    #[test]
+    fn resource_directory_accepts_the_canonical_windows_drive_prefix_only() {
+        let expected = r"C:\Program Files\IsoHopper";
+        for reported in [
+            expected,
+            r"\\?\C:\Program Files\IsoHopper",
+            r"\\?\c:\program files\isohopper",
+        ] {
+            assert!(resource_directory_matches(reported, expected), "{reported}");
+        }
+        for reported in [
+            r"C:\Users\me\IsoHopper",
+            r"C:\Program Files\IsoHopper2",
+            r"\\?\C:\Program Files\x\..\IsoHopper",
+            r"\\?\C:\Program Files\IsoHopper.",
+            r"\\?\C:\Program Files\IsoHopper ",
+            r"\\?\C:\Program Files\IsoHopper\",
+            r"\\?\UNC\server\Program Files\IsoHopper",
+            r"\\.\C:\Program Files\IsoHopper",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\Program Files\IsoHopper",
+            r"\\?\C:/Program Files/IsoHopper",
+            r"\\?\C:\Program Files\\IsoHopper",
+        ] {
+            assert!(
+                !resource_directory_matches(reported, expected),
+                "{reported}"
+            );
         }
     }
 

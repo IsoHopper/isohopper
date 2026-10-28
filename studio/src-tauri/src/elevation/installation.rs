@@ -102,6 +102,10 @@ mod tests {
                 .require_directory(installation.directory())
                 .is_ok()
         );
+        // Tauri's resource_dir uses its canonicalized executable directory,
+        // which includes the extended drive prefix on Windows.
+        let canonical = std::fs::canonicalize(installation.directory()).unwrap();
+        installation.require_directory(&canonical).unwrap();
         assert!(
             installation
                 .require_directory(Path::new(r"C:\Users\portable\IsoHopper"))
