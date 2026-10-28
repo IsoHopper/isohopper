@@ -154,7 +154,7 @@ Function IsoHopperCreatePayload
   System::Call 'kernel32::GetFileAttributesW(w "$PROGRAMFILES64") i.r0'
   IntOp $1 $0 & 0x410 ; DIRECTORY | REPARSE_POINT
   ${If} $0 == -1
-  ${OrIf} $1 != 0x10
+  ${OrIf} $1 <> 16
     Call IsoHopperInstallFailed
   ${EndIf}
 
@@ -229,7 +229,7 @@ Function IsoHopperCheckRetainedPayload
   ${EndIf}
   System::Call '*$4(i .r5, i .r6)'
   IntOp $5 $5 & 0x410 ; DIRECTORY | REPARSE_POINT
-  ${If} $5 != 0x10
+  ${If} $5 <> 16
     Goto isohopper_stage_check_done
   ${EndIf}
 
