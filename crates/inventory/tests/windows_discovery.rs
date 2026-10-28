@@ -300,3 +300,62 @@ fn command_errors_are_redacted_and_empty_inventory_is_explicit() {
     let r = report(input(vec![], vec![]));
     assert!(warned(&r, None, "no_disks"));
 }
+
+#[test]
+fn schema_errors_identify_known_paths_and_types_without_exposing_values() {
+    for (field, value, expected) in [
+        (
+            "BusType",
+            json!("private-bus-value"),
+            "unsigned 16-bit integer",
+        ),
+        (
+            "Size",
+            json!({"private-key": "private-size"}),
+            "unsigned 64-bit integer",
+        ),
+        ("IsBoot", json!("private-flag"), "boolean"),
+        ("SerialNumber", json!(["private-serial"]), "string"),
+    ] {
+        let mut value_to_parse = input(vec![disk(1)], vec![partition(1)]);
+        value_to_parse["disks"][0][field] = value;
+        let error = discover_for(Platform::Windows, &MockRunner::json(value_to_parse))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&format!("disks[].{field}")), "{error}");
+        assert!(error.contains(expected), "{error}");
+        assert!(!error.contains("private"), "{error}");
+    }
+    let mut value = input(vec![disk(1)], vec![partition(1)]);
+    value["partitions"][0]["MbrType"] = json!("private-mbr");
+    let error = discover_for(Platform::Windows, &MockRunner::json(value))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("partitions[].MbrType"), "{error}");
+    assert!(error.contains("received string"), "{error}");
+    assert!(!error.contains("private"), "{error}");
+}
+
+#[test]
+fn malformed_missing_and_unknown_fields_keep_diagnostics_redacted() {
+    for bytes in [
+        b"private-invalid-json".to_vec(),
+        b"{\"private-key\":\"private-value\"}".to_vec(),
+        b"{\"disks\":[],\"partitions\":[],\"partitions_complete\":true,\"private-key\":0}".to_vec(),
+        b"{\"disks\":[],\"disks\":[],\"partitions\":[],\"partitions_complete\":true}".to_vec(),
+    ] {
+        let error = discover_for(Platform::Windows, &MockRunner::bytes(bytes))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("line "), "{error}");
+        assert!(error.contains("column "), "{error}");
+        assert!(!error.contains("private"), "{error}");
+    }
+    let mut value = input(vec![disk(1)], vec![partition(1)]);
+    value["disks"][0].as_object_mut().unwrap().remove("Number");
+    let error = discover_for(Platform::Windows, &MockRunner::json(value))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("disks[].Number"), "{error}");
+    assert!(error.contains("received missing field"), "{error}");
+}

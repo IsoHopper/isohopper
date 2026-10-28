@@ -73,6 +73,142 @@ struct Partition {
     mbr_type: Option<u16>,
 }
 
+#[derive(Clone, Copy)]
+enum JsonKind {
+    String,
+    Boolean,
+    Unsigned(u8),
+    Array,
+}
+
+impl JsonKind {
+    fn accepts(self, value: &serde_json::Value) -> bool {
+        match self {
+            Self::String => value.is_string(),
+            Self::Boolean => value.is_boolean(),
+            Self::Unsigned(bits) => value.as_u64().is_some_and(|n| n <= u64::MAX >> (64 - bits)),
+            Self::Array => value.is_array(),
+        }
+    }
+
+    fn name(self) -> String {
+        match self {
+            Self::String => "string".into(),
+            Self::Boolean => "boolean".into(),
+            Self::Unsigned(bits) => format!("unsigned {bits}-bit integer"),
+            Self::Array => "array".into(),
+        }
+    }
+}
+
+type JsonField = (&'static str, JsonKind, bool);
+
+fn received_kind(value: Option<&serde_json::Value>) -> &'static str {
+    use serde_json::Value;
+    match value {
+        None => "missing field",
+        Some(Value::Null) => "null",
+        Some(Value::Bool(_)) => "boolean",
+        Some(Value::Number(_)) => "number",
+        Some(Value::String(_)) => "string",
+        Some(Value::Array(_)) => "array",
+        Some(Value::Object(_)) => "object",
+    }
+}
+
+fn check_json_fields(
+    value: &serde_json::Value,
+    path: &str,
+    fields: &[JsonField],
+) -> Option<String> {
+    let Some(object) = value.as_object() else {
+        return Some(format!(
+            "{path} expected object, received {}",
+            received_kind(Some(value))
+        ));
+    };
+    for &(name, kind, nullable) in fields {
+        let value = object.get(name);
+        if nullable && value.is_none_or(serde_json::Value::is_null) {
+            continue;
+        }
+        if !value.is_some_and(|v| kind.accepts(v)) {
+            return Some(format!(
+                "{path}.{name} expected {}, received {}",
+                kind.name(),
+                received_kind(value)
+            ));
+        }
+    }
+    object
+        .keys()
+        .any(|key| !fields.iter().any(|(name, _, _)| key == name))
+        .then(|| format!("{path} contains an unexpected field (name redacted)"))
+}
+
+// Used only after strict deserialization fails. Never print a serde error:
+// its message may contain device identifiers or attacker-controlled values.
+// This diagnostic pass does not decide whether a snapshot is accepted.
+fn json_error(bytes: &[u8], error: &serde_json::Error) -> InventoryError {
+    use JsonKind::{Array, Boolean, String as Text, Unsigned as Uint};
+    const ROOT: &[JsonField] = &[
+        ("disks", Array, false),
+        ("partitions", Array, false),
+        ("partitions_complete", Boolean, false),
+    ];
+    const DISK: &[JsonField] = &[
+        ("Number", Uint(32), false),
+        ("UniqueId", Text, true),
+        ("SerialNumber", Text, true),
+        ("FriendlyName", Text, true),
+        ("Size", Uint(64), true),
+        ("LogicalSectorSize", Uint(64), true),
+        ("PhysicalSectorSize", Uint(64), true),
+        ("BusType", Uint(16), true),
+        ("IsBoot", Boolean, true),
+        ("IsSystem", Boolean, true),
+        ("IsReadOnly", Boolean, true),
+        ("IsOffline", Boolean, true),
+        ("IsClustered", Boolean, true),
+        ("NumberOfPartitions", Uint(32), true),
+    ];
+    const PARTITION: &[JsonField] = &[
+        ("DiskNumber", Uint(32), false),
+        ("PartitionNumber", Uint(32), false),
+        ("IsBoot", Boolean, true),
+        ("IsSystem", Boolean, true),
+        ("IsReadOnly", Boolean, true),
+        ("IsOffline", Boolean, true),
+        ("GptType", Text, true),
+        ("MbrType", Uint(16), true),
+    ];
+    let detail = match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Err(_) => "malformed JSON or invalid encoding (content redacted)".into(),
+        Ok(value) => check_json_fields(&value, "root", ROOT)
+            .or_else(|| {
+                for (field, path, schema, limit) in [
+                    ("disks", "disks[]", DISK, 257),
+                    ("partitions", "partitions[]", PARTITION, 4097),
+                ] {
+                    if let Some(records) = value.get(field).and_then(|v| v.as_array()) {
+                        for record in records.iter().take(limit) {
+                            if let Some(detail) = check_json_fields(record, path, schema) {
+                                return Some(detail);
+                            }
+                        }
+                    }
+                }
+                None
+            })
+            .unwrap_or_else(|| "schema mismatch (content redacted)".into()),
+    };
+    invalid(&format!(
+        "Windows inventory JSON at line {}, column {}: {detail}",
+        error.line(),
+        error.column()
+    ))
+}
+
 fn invalid(message: &str) -> InventoryError {
     InventoryError::Invalid(message.into())
 }
@@ -255,7 +391,7 @@ pub(super) fn discover(runner: &impl CommandRunner) -> Result<Inventory, Invento
         ));
     }
     let listing: Listing = serde_json::from_slice(&output.stdout)
-        .map_err(|_| invalid("malformed or incorrectly typed Windows inventory JSON"))?;
+        .map_err(|error| json_error(&output.stdout, &error))?;
     if listing.disks.len() > 256 || listing.partitions.len() > 4096 {
         return Err(invalid("too many Windows disks or partitions"));
     }
