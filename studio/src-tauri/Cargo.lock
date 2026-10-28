@@ -2211,6 +2211,7 @@ dependencies = [
  "isohopper-core",
  "plist",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#![cfg(target_os = "macos")]
-
 /// Opt-in only: observes host disk metadata without opening device contents.
+#[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires a macOS user session with DiskManagement service access"]
 fn native_macos_inventory_is_read_only_and_fail_closed() {
@@ -24,5 +23,24 @@ fn native_macos_inventory_is_read_only_and_fail_closed() {
             .iter()
             .map(|w| w.code.as_str())
             .collect::<Vec<_>>()
+    );
+}
+
+/// Opt-in only: the provider runs fixed read-only lsblk arguments.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a Linux user session with lsblk and sysfs access"]
+fn native_linux_inventory_is_read_only_and_fail_closed() {
+    let inventory = isohopper_inventory::discover().unwrap();
+    assert_eq!(inventory.source, "linux_lsblk");
+    for disk in &inventory.disks {
+        assert!(!disk.safety_checks_complete);
+        assert!(!isohopper_core::guard::evaluate(disk, &Default::default()).allowed);
+    }
+    println!(
+        "devices={}, warnings={}, blocked={}",
+        inventory.disks.len(),
+        inventory.warnings.len(),
+        inventory.disks.len()
     );
 }

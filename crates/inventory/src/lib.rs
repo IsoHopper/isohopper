@@ -5,6 +5,7 @@ use serde::Serialize;
 use std::io;
 use thiserror::Error;
 
+mod linux;
 mod macos;
 mod native;
 pub use native::NativeCommandRunner;
@@ -79,6 +80,7 @@ pub fn discover_for(
 ) -> Result<Inventory, InventoryError> {
     match platform {
         Platform::MacOs => macos::discover(runner),
+        Platform::Linux => linux::discover(runner),
         other => Err(InventoryError::Unsupported(other)),
     }
 }

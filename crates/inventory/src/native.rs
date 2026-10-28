@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use crate::{CommandOutput, CommandRunner, macos::whole_identifier};
+use crate::{CommandOutput, CommandRunner, linux, macos::whole_identifier};
 use std::io;
 
 pub struct NativeCommandRunner;
 
 fn allowed(program: &str, args: &[&str]) -> bool {
-    program == "/usr/sbin/diskutil"
+    (program == "/usr/sbin/diskutil"
         && match args {
             ["list", "-plist", "physical"] => true,
             ["info", "-plist", id] => *id == "/" || whole_identifier(id),
             _ => false,
-        }
+        })
+        || (program == linux::LSBLK && args == linux::ARGS)
 }
 
 impl CommandRunner for NativeCommandRunner {
@@ -22,20 +23,21 @@ impl CommandRunner for NativeCommandRunner {
             ));
         }
         #[cfg(target_os = "macos")]
-        {
-            execute(program, args)
+        if program == "/usr/sbin/diskutil" {
+            return execute(program, args);
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "native disk inventory is not implemented on this platform",
-            ))
+        #[cfg(target_os = "linux")]
+        if program == linux::LSBLK {
+            return execute(program, args);
         }
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "inventory command does not match the host platform",
+        ))
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn execute(program: &str, args: &[&str]) -> io::Result<CommandOutput> {
     use crate::MAX_OUTPUT;
     use std::{
@@ -47,6 +49,11 @@ fn execute(program: &str, args: &[&str]) -> io::Result<CommandOutput> {
     let mut child = Command::new(program)
         .args(args)
         .env("LC_ALL", "C")
+        .env_remove("LIBSMARTCOLS_JSON")
+        .env_remove("LSBLK_DEBUG")
+        .env_remove("LIBBLKID_DEBUG")
+        .env_remove("LIBMOUNT_DEBUG")
+        .env_remove("LIBSMARTCOLS_DEBUG")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -109,6 +116,9 @@ mod tests {
             ("/usr/sbin/diskutil", vec!["info", "-plist", "/dev/disk4"]),
             ("/usr/sbin/diskutil", vec!["info", "-plist", "disk4;echo"]),
             ("diskutil", vec!["list", "-plist", "physical"]),
+            ("lsblk", vec!["--json"]),
+            ("/usr/bin/lsblk", vec!["--json", "/dev/sda"]),
+            ("/usr/bin/lsblk", vec!["--json", "--sysroot", "/tmp"]),
         ] {
             assert_eq!(
                 runner.run(program, &args).unwrap_err().kind(),
@@ -121,5 +131,9 @@ mod tests {
         ));
         assert!(allowed("/usr/sbin/diskutil", &["info", "-plist", "/"]));
         assert!(allowed("/usr/sbin/diskutil", &["info", "-plist", "disk4"]));
+        assert!(allowed(linux::LSBLK, linux::ARGS));
+        let mut injected = linux::ARGS.to_vec();
+        injected.push("/dev/sda");
+        assert!(!allowed(linux::LSBLK, &injected));
     }
 }

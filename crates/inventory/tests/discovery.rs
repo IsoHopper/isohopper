@@ -232,7 +232,7 @@ fn malformed_empty_and_excessive_output_fail_closed() {
 
 #[test]
 fn unsupported_platforms_execute_nothing() {
-    for platform in [Platform::Linux, Platform::Windows, Platform::Other] {
+    for platform in [Platform::Windows, Platform::Other] {
         let runner = MockRunner::new(vec![]);
         assert!(discover_for(platform, &runner).is_err());
         assert!(runner.calls.borrow().is_empty());
