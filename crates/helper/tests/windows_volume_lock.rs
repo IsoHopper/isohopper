@@ -2,6 +2,56 @@
 #[path = "support/lock_image.rs"]
 mod lock_image;
 
+fn volume_name(buffer: &[u16]) -> std::io::Result<String> {
+    let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+    let end = buffer
+        .iter()
+        .position(|value| *value == 0)
+        .ok_or_else(|| invalid("unterminated volume GUID"))?;
+    let name =
+        String::from_utf16(&buffer[..end]).map_err(|_| invalid("invalid volume GUID encoding"))?;
+    let guid = name
+        .strip_prefix(r"\\?\Volume{")
+        .and_then(|s| s.strip_suffix("}\\"))
+        .ok_or_else(|| invalid("invalid volume GUID path"))?;
+    if guid.len() != 36
+        || !guid.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        return Err(invalid("invalid volume GUID"));
+    }
+    // Volume APIs document the canonical Volume prefix. Normalize only the
+    // GUID, matching production VolumeName, and retain the trailing backslash.
+    Ok(format!(r"\\?\Volume{{{}}}\", guid.to_ascii_lowercase()))
+}
+
+#[test]
+fn enumerated_volume_path_keeps_canonical_prefix_and_normalizes_only_guid() {
+    let input = r"\\?\Volume{01234567-89AB-CDEF-0123-456789ABCDEF}\";
+    let wide: Vec<_> = input.encode_utf16().chain(Some(0)).collect();
+    assert_eq!(
+        volume_name(&wide).unwrap(),
+        r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\"
+    );
+    for invalid in [
+        r"\\?\volume{01234567-89ab-cdef-0123-456789abcdef}\",
+        r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}",
+        r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdeg}\",
+        r"\\?\Volume{0123456789ab-cdef-0123-456789abcdef}\",
+        r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\extra",
+    ] {
+        let wide: Vec<_> = invalid.encode_utf16().chain(Some(0)).collect();
+        assert!(volume_name(&wide).is_err());
+    }
+    assert!(volume_name(&wide[..wide.len() - 1]).is_err());
+    assert!(volume_name(&[0xd800, 0]).is_err());
+}
+
 // Shared VHD support also has diagnostic entry points used by windows_vhd.rs.
 #[cfg(windows)]
 #[allow(dead_code)]
@@ -56,7 +106,7 @@ fn adapted_lock_fixture_has_two_fat_volumes_and_verified_gpt_copies() {
 
 #[cfg(windows)]
 mod native {
-    use super::{lock_image, vhd_support};
+    use super::{lock_image, vhd_support, volume_name};
     use isohopper_core::layout::Layout;
     use isohopper_helper::{
         windows_lock::{self, LockError},
@@ -138,31 +188,6 @@ mod native {
             return Err(invalid("oversized test volume discovery result"));
         }
         Ok(returned as usize)
-    }
-
-    fn volume_name(buffer: &[u16]) -> io::Result<String> {
-        let end = buffer
-            .iter()
-            .position(|value| *value == 0)
-            .ok_or_else(|| invalid("unterminated volume GUID"))?;
-        let name = String::from_utf16(&buffer[..end])
-            .map_err(|_| invalid("invalid volume GUID encoding"))?;
-        let guid = name
-            .strip_prefix(r"\\?\Volume{")
-            .and_then(|s| s.strip_suffix("}\\"))
-            .ok_or_else(|| invalid("invalid volume GUID path"))?;
-        if guid.len() != 36
-            || !guid.bytes().enumerate().all(|(index, byte)| {
-                if [8, 13, 18, 23].contains(&index) {
-                    byte == b'-'
-                } else {
-                    byte.is_ascii_hexdigit()
-                }
-            })
-        {
-            return Err(invalid("invalid volume GUID"));
-        }
-        Ok(name.to_ascii_lowercase())
     }
 
     fn inspect_volume(name: String, disk_number: u32) -> io::Result<Option<Volume>> {
