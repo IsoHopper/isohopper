@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: 2026 S33G
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: Manual Windows inventory checks
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-inventory-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  inventory:
+    name: Read-only inventory on Windows
+    runs-on: windows-2022
+    timeout-minutes: 8
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: 2
+      CI: true
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+
+      - name: Run inventory fixture tests
+        run: cargo +1.98.0 test --locked -p isohopper-inventory --lib --tests
+
+      - name: Check read-only Windows inventory
+        run: cargo +1.98.0 test --locked -p isohopper-inventory --test native_smoke native_windows_inventory_is_read_only_and_fail_closed -- --ignored --exact --nocapture
