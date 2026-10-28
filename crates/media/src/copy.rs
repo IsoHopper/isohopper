@@ -13,6 +13,21 @@ use std::{
 
 const CHUNK_BYTES: usize = 1024 * 1024;
 
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows::open_or_create_parent;
+
+#[cfg(not(windows))]
+fn open_or_create_parent(parent: &Dir, component: &str) -> io::Result<Dir> {
+    match parent.create_dir(component) {
+        Ok(()) => (),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
+        Err(e) => return Err(e),
+    }
+    parent.open_dir_nofollow(component)
+}
+
 #[derive(Debug, Clone)]
 pub struct CopyEntry {
     pub relative_path: String,
@@ -274,12 +289,7 @@ pub fn copy_one(
         let components: Vec<_> = entry.relative_path.split('/').collect();
         for component in &components[..components.len() - 1] {
             check_cancel(cancel)?;
-            match parent.create_dir(component) {
-                Ok(()) => (),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
-                Err(e) => return Err(e),
-            }
-            parent = parent.open_dir_nofollow(component)?;
+            parent = open_or_create_parent(&parent, component)?;
         }
         let mut options = OpenOptions::new();
         options

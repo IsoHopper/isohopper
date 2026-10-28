@@ -94,7 +94,7 @@ mod native {
         ffi::OsString,
         fs::{File, OpenOptions},
         io::{self, Read, Write},
-        os::windows::{ffi::OsStringExt, fs::OpenOptionsExt, process::CommandExt},
+        os::windows::{ffi::OsStringExt, fs::OpenOptionsExt, io::AsRawHandle, process::CommandExt},
         path::PathBuf,
         process::{Child, Command, Stdio},
         sync::atomic::AtomicBool,
@@ -103,7 +103,10 @@ mod native {
     };
     use volume_support::{Volume, volume_extents, wait_for_data_volume};
     use windows_sys::Win32::{
-        Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE},
+        Storage::FileSystem::{
+            FILE_SHARE_READ, FILE_SHARE_WRITE, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+            VOLUME_NAME_GUID,
+        },
         System::SystemInformation::GetSystemDirectoryW,
     };
 
@@ -189,6 +192,42 @@ try {
             return Err(io::Error::other("system directory is not absolute"));
         }
         Ok(path.join(r"WindowsPowerShell\v1.0\powershell.exe"))
+    }
+
+    // cap-primitives 4.0.3 mkdir uses winx's default DOS-name lookup. Microsoft
+    // documents ERROR_PATH_NOT_FOUND when a volume has no drive letter. Report
+    // both naming modes from the exact retained root, without logging paths or
+    // assigning a mount path. This is diagnostic only, not a fallback.
+    // https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew
+    fn diagnose_root_paths(root: &Dir) {
+        for (name, flags) in [("dos", VOLUME_NAME_DOS), ("guid", VOLUME_NAME_GUID)] {
+            let mut buffer = [0u16; 32768];
+            // SAFETY: retained root and bounded output remain live throughout
+            // this synchronous read-only filename query.
+            let count = unsafe {
+                GetFinalPathNameByHandleW(
+                    root.as_raw_handle(),
+                    buffer.as_mut_ptr(),
+                    buffer.len() as u32,
+                    flags,
+                )
+            };
+            if count == 0 {
+                eprintln!(
+                    "Owned VHD retained-root name query: mode={name}, status=error, win32={:?}",
+                    io::Error::last_os_error().raw_os_error()
+                );
+            } else {
+                eprintln!(
+                    "Owned VHD retained-root name query: mode={name}, status={}, units={count}",
+                    if (count as usize) < buffer.len() {
+                        "ok"
+                    } else {
+                        "oversized"
+                    }
+                );
+            }
+        }
     }
 
     struct FinishChild(Child);
@@ -384,11 +423,18 @@ try {
         }
         validate_manifest(&entries, volume.length / 2, 4096)?;
         let root = Dir::open_ambient_dir(&volume.name, cap_std::ambient_authority())?;
-        for (entry, source) in entries.iter().zip(&mut sources) {
+        diagnose_root_paths(&root);
+        for (index, (entry, source)) in entries.iter().zip(&mut sources).enumerate() {
             let mut final_phase = None;
-            let report = copy_one(&root, source, entry, &AtomicBool::new(false), |progress| {
+            let copied = copy_one(&root, source, entry, &AtomicBool::new(false), |progress| {
                 assert!(progress.completed_bytes <= entry.bytes);
                 final_phase = Some(progress.phase);
+            });
+            let report = copied.inspect_err(|error| {
+                eprintln!(
+                    "Owned VHD copy failed: file_index={index}, phase={final_phase:?}, destination_incomplete={}, bytes_written={}",
+                    error.destination_incomplete, error.bytes_written
+                );
             })?;
             assert_eq!(final_phase, Some(Phase::Complete));
             assert_eq!(report.bytes_written, entry.bytes);
