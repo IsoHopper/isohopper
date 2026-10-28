@@ -73,7 +73,16 @@ impl SourceBinding {
 /// `target` must be fresh evidence from the caller's retained target handle.
 /// No target path is accepted or opened. The source remains owned until the
 /// binding is dropped; callers must separately retain source write exclusion.
-pub fn bind_source(source: File, target: &DeviceSnapshot) -> Result<SourceBinding, SourceError> {
+///
+/// # Safety
+/// `source` must hold a live, readable file handle opened synchronously, without
+/// FILE_FLAG_OVERLAPPED. Its control queries use no OVERLAPPED structure and
+/// wait for completion. The returned binding retains this handle invariant,
+/// allowing subsequent calls to `SourceBinding::revalidate` to remain safe.
+pub unsafe fn bind_source(
+    source: File,
+    target: &DeviceSnapshot,
+) -> Result<SourceBinding, SourceError> {
     target
         .geometry
         .validate()

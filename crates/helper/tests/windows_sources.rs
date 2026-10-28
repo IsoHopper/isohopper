@@ -87,7 +87,9 @@ fn windows_sources_reject_target_extents_and_virtual_dependencies()
         );
         let mut source = open_payload(volume)?;
         verify_payload(&mut source)?;
-        match windows_sources::bind_source(source, &source_target) {
+        // SAFETY: open_payload uses synchronous OpenOptions without
+        // FILE_FLAG_OVERLAPPED and transfers its live readable file handle.
+        match unsafe { windows_sources::bind_source(source, &source_target) } {
             Err(SourceError::OnTarget { extents }) => {
                 assert_eq!(extent_tuples(&extents), independent);
             }
@@ -99,7 +101,10 @@ fn windows_sources_reject_target_extents_and_virtual_dependencies()
 
         // An unrelated target does not turn VHD-backed storage into direct
         // physical storage. Missing ancestry proof must not be called safe.
-        match windows_sources::bind_source(open_payload(volume)?, &other_target) {
+        let source = open_payload(volume)?;
+        // SAFETY: open_payload opens a live readable handle synchronously,
+        // without FILE_FLAG_OVERLAPPED, as required by bind_source.
+        match unsafe { windows_sources::bind_source(source, &other_target) } {
             Err(SourceError::VirtualDependency) => {}
             Err(error) => {
                 return Err(format!("VHD ancestry was not identified: {error:?}").into());
@@ -114,7 +119,10 @@ fn windows_sources_reject_target_extents_and_virtual_dependencies()
     // evidence, rather than skipping or inventing a direct physical mapping.
     let host_path = directory.path().join("host-source.efi");
     std::fs::write(&host_path, lock_image::payload())?;
-    let binding = windows_sources::bind_source(File::open(&host_path)?, &source_target)
+    let source = File::open(&host_path)?;
+    // SAFETY: File::open creates a live readable synchronous handle; it does
+    // not set FILE_FLAG_OVERLAPPED. The binding takes ownership of that handle.
+    let binding = unsafe { windows_sources::bind_source(source, &source_target) }
         .map_err(|error| format!("ordinary host source mapping failed: {error:?}"))?;
     let independent = volume_extents(binding.volume_guid())?;
     assert!(!independent.is_empty());
