@@ -9,9 +9,11 @@ on:
     paths:
       - .github/workflows/writer-windows-vhd.yml
       - crates/helper/tests/windows_vhd.rs
+      - crates/helper/tests/support/**
       - crates/helper/src/writer.rs
       - crates/helper/src/writer/**
       - crates/helper/Cargo.toml
+      - crates/media/**
 
 permissions:
   contents: read
@@ -37,6 +39,22 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal
+
+      - name: Check actual filesystem copies and readback on Windows
+        shell: bash
+        run: |
+          if cargo +1.98.0 test --locked -p isohopper-media > media-tests.log 2>&1; then
+            cat media-tests.log
+          else
+            python - <<'PY'
+          from pathlib import Path
+          text = Path('media-tests.log').read_text(errors='replace')[-12000:]
+          print(text)
+          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=Windows media integration failed::' + text)
+          PY
+            exit 1
+          fi
 
       - name: Write and verify only a newly created temporary VHDX
         shell: bash
