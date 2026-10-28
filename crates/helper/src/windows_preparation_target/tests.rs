@@ -223,6 +223,22 @@ fn stage_host_partial_use_does_not_bypass_identity_or_membership_checks() {
 }
 
 #[test]
+fn stage_host_refuses_unknown_disk_serial_even_when_pool_metadata_agrees() {
+    let (_, mut disk, mut pools) = fixture();
+    for serial in [None, Some(String::new()), Some("   ".into())] {
+        disk.serial_number = serial.clone();
+        pools.physical_disks[0].serial_number = serial;
+        assert!(matches!(
+            require_stage_host_pool(&disk, &pools),
+            Err(PreparationError::Refused(
+                "physical storage serial is unknown"
+            ))
+        ));
+        assert!(require_standalone_pool(&disk, &pools).is_err());
+    }
+}
+
+#[test]
 fn pool_size_bus_and_serial_must_agree_and_be_known() {
     let (_, disk, pools) = fixture();
     let mut variants = vec![];

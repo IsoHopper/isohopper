@@ -417,3 +417,27 @@ jobs:
                       result[handle] = observation
                   safe['same_object_reopen'] = result
               print('::notice title=Windows backing diagnostic::' + json.dumps(safe, separators=(',', ':')))
+          path = Path('sealed-stage-test.log')
+          seen = set()
+          for raw in re.findall(r'^OWNED_STAGE_HOST_DIAGNOSTIC (\{[^\r\n]{1,2048}\})$', path.read_text(errors='replace') if path.exists() else '', re.M):
+              try:
+                  record = json.loads(raw)
+              except (ValueError, RecursionError):
+                  continue
+              if not isinstance(record, dict):
+                  continue
+              location = record.get('location')
+              if location not in ('default_temp', 'system_temp') or location in seen:
+                  continue
+              seen.add(location)
+              safe = {'location': location}
+              if record.get('status') in ('observed', 'error'):
+                  safe['status'] = record['status']
+              for key in ('serial_known', 'native_bound', 'native_serial_known', 'pool_serial_known', 'stage_host_pool_supported', 'system_volume_matches'):
+                  if type(record.get(key)) is bool:
+                      safe[key] = record[key]
+              for key in ('disk_number', 'bus_type', 'size_bytes', 'unique_id_format', 'pool_matches'):
+                  value = record.get(key)
+                  if type(value) is int and 0 <= value <= 0xffffffffffffffff:
+                      safe[key] = value
+              print('::notice title=Windows staging host::' + json.dumps(safe, separators=(',', ':')))

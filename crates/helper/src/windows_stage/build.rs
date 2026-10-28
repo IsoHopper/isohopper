@@ -499,7 +499,7 @@ mod tests {
         let payloads = imported.payloads();
         let _privilege = super::super::tests::Privilege::set(true);
         let token_stamp = super::super::tests::modified_id();
-        let temp = tempfile::tempdir().unwrap();
+        let temp = coordinator_test::temp_root();
         let path = temp.path().join("private-build");
         let descriptor = Descriptor::private().unwrap();
         let handle = create_private_directory(&path, &descriptor).unwrap();

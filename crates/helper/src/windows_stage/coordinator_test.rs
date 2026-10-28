@@ -14,6 +14,113 @@ use crate::{
 };
 use std::sync::mpsc::SyncSender;
 
+/// Production staging lives under the machine installation, not the runner's
+/// environment-selected scratch disk. Keep this fixture on the Windows volume
+/// too, without changing the process environment or relaxing host binding.
+pub(super) fn temp_root() -> tempfile::TempDir {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buffer = [0u16; 32768];
+    // SAFETY: bounded writable buffer remains live for this synchronous query.
+    let count = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    assert!(
+        count > 0 && (count as usize) < buffer.len(),
+        "system directory query failed"
+    );
+    let system = PathBuf::from(OsString::from_wide(&buffer[..count as usize]));
+    assert!(system.is_absolute(), "system directory must be absolute");
+    let parent = system
+        .parent()
+        .expect("system directory requires a parent")
+        .join("Temp");
+    // These are read-only observations, not permission to use either host.
+    // bind_target below must still establish all production evidence itself.
+    let temp = tempfile::Builder::new()
+        .prefix("isohopper-stage-")
+        .tempdir_in(parent)
+        .expect("create unique fixture beneath existing Windows Temp");
+    diagnose_host("default_temp", &std::env::temp_dir());
+    diagnose_host("system_temp", temp.path());
+    assert!(
+        directory_volume(temp.path()).expect("fixture volume")
+            == directory_volume(&system).expect("Windows volume"),
+        "fixture must remain on the Windows volume"
+    );
+    temp
+}
+
+fn directory_volume(path: &Path) -> Result<String, &'static str> {
+    // Resolve the directory as tempfile does, including any redirected parent.
+    // This is a zero-access observation, never a target or write capability.
+    let directory = OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(|_| "directory_open")?;
+    crate::windows_sources::source_guid(&directory).map_err(|_| "volume_guid")
+}
+
+fn diagnose_host(location: &'static str, path: &Path) {
+    use crate::{
+        windows_preparation_target::require_stage_host_pool, windows_sources::volume_extents,
+    };
+    use isohopper_inventory::{windows::collect_evidence, windows_pools};
+
+    let observation = (|| -> Result<serde_json::Value, &'static str> {
+        let guid = directory_volume(path)?;
+        let volume = OpenOptions::new()
+            .access_mode(0)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&guid[..guid.len() - 1])
+            .map_err(|_| "volume_open")?;
+        // SAFETY: retained synchronous access-zero volume handle from its GUID.
+        let extents = unsafe { volume_extents(&volume) }.map_err(|_| "volume_extents")?;
+        let [extent] = extents.as_slice() else {
+            return Err("multiple_extents");
+        };
+        let inventory = collect_evidence().map_err(|_| "disk_inventory")?;
+        let mut matches = inventory
+            .disks
+            .iter()
+            .filter(|disk| disk.number == extent.disk_number);
+        let disk = matches.next().ok_or("host_missing")?;
+        if matches.next().is_some() {
+            return Err("host_ambiguous");
+        }
+        let pools = windows_pools::collect().map_err(|_| "pool_inventory")?;
+        let matched_pools: Vec<_> = pools
+            .physical_disks
+            .iter()
+            .filter(|pool| disk.unique_id.as_deref() == Some(pool.unique_id.as_str()))
+            .collect();
+        let known = |value: Option<&str>| value.is_some_and(|value| !value.trim().is_empty());
+        let native = disk
+            .path
+            .as_deref()
+            .and_then(|selector| BoundTarget::open_present_interface(selector).ok());
+        Ok(serde_json::json!({
+            "status": "observed",
+            "disk_number": disk.number,
+            "serial_known": known(disk.serial_number.as_deref()),
+            "native_bound": native.is_some(),
+            "native_serial_known": native.as_ref().map(|host| !host.observation().handle.device.serial.trim().is_empty()),
+            "bus_type": disk.bus_type,
+            "size_bytes": disk.size,
+            "unique_id_format": disk.unique_id_format,
+            "pool_matches": matched_pools.len(),
+            "pool_serial_known": (matched_pools.len() == 1).then(|| known(matched_pools[0].serial_number.as_deref())),
+            "stage_host_pool_supported": require_stage_host_pool(disk, &pools).is_ok(),
+        }))
+    })();
+    let mut value =
+        observation.unwrap_or_else(|stage| serde_json::json!({"status":"error", "stage":stage}));
+    value["location"] = location.into();
+    // No paths, serials or unique IDs are emitted. All strings above are fixed.
+    println!("OWNED_STAGE_HOST_DIAGNOSTIC {value}");
+}
+
 struct FixtureReady {
     target: BoundTarget,
     stage: TargetBoundStage,
