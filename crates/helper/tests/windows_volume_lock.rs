@@ -90,6 +90,7 @@ mod native {
     use isohopper_helper::{
         windows_encryption_check,
         windows_lock::{self, LockError, TargetVolumeProbe},
+        windows_target::BoundTarget,
         writer::{RetainedDevice, write_image},
     };
     use std::{
@@ -143,8 +144,9 @@ mod native {
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .open(device_path)?;
         vhd_support::assert_readback_binding(&read_only, number)?;
+        let provider_target = read_only.try_clone()?;
         // SAFETY: synchronous read-only whole-device handle from this owned
-        // VHD only. No FILE_FLAG_OVERLAPPED and no other handle aliases.
+        // VHD only. No FILE_FLAG_OVERLAPPED; duplicates query metadata only.
         let mut probe =
             unsafe { TargetVolumeProbe::from_owned_handle(read_only.into(), &expected)? };
         assert_eq!(probe.coverage().device, expected);
@@ -180,10 +182,22 @@ mod native {
                 .filter(|p| p.observation.is_some())
                 .count()
         );
+        // SAFETY: this duplicates the same synchronous read-only handle for
+        // the owned VHD. The correlation owner performs metadata queries only.
+        let mut binding =
+            unsafe { BoundTarget::from_owned_handle(provider_target.into(), &expected)? };
+        assert_eq!(binding.observation().coverage, coverage);
+        assert_eq!(binding.observation().partitions.len(), 2);
+        let first_binding = binding.observation().clone();
+        assert_eq!(binding.revalidate()?, &first_binding);
+        println!(
+            "Owned formatted VHD provider binding agrees for 2 GPT partitions across a fresh collection; no physical device tested"
+        );
         // A held ordinary file cannot prevent read-only probing. Fresh file
         // opens while the probe lives independently show no volume lock/dismount.
         verify_payload(&mut held_file)?;
         verify_payload(&mut open_payload(&volumes[0])?)?;
+        drop(binding);
         drop(probe);
         match windows_lock::lock(device, &expected) {
             Err(LockError::Io {
