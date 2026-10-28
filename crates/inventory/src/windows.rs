@@ -22,11 +22,36 @@ $env:PSModulePath = $PSHOME + '\Modules'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 Import-Module ($PSHOME + '\Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1') -ErrorAction Stop
 Import-Module ($PSHOME + '\Modules\Storage\Storage.psd1') -ErrorAction Stop
-$disks = @(Storage\Get-Disk -ErrorAction Stop | Microsoft.PowerShell.Utility\Select-Object -First 257 -Property Number,UniqueId,SerialNumber,FriendlyName,Size,LogicalSectorSize,PhysicalSectorSize,BusType,IsBoot,IsSystem,IsReadOnly,IsOffline,IsClustered,NumberOfPartitions)
+# CIM enum display properties can be strings. Project the underlying UInt16
+# values explicitly, preserving missing values instead of inventing enum zero.
+$disks = @(Storage\Get-Disk -ErrorAction Stop | Microsoft.PowerShell.Utility\Select-Object -First 257 | Microsoft.PowerShell.Core\ForEach-Object {
+    $busType = $null
+    if ($null -ne $_.CimInstanceProperties['BusType'].Value) {
+        $busType = [uint16]$_.CimInstanceProperties['BusType'].Value
+    }
+    [pscustomobject]@{
+        Number=$_.Number; UniqueId=$_.UniqueId; SerialNumber=$_.SerialNumber
+        FriendlyName=$_.FriendlyName; Size=$_.Size
+        LogicalSectorSize=$_.LogicalSectorSize; PhysicalSectorSize=$_.PhysicalSectorSize
+        BusType=$busType; IsBoot=$_.IsBoot; IsSystem=$_.IsSystem
+        IsReadOnly=$_.IsReadOnly; IsOffline=$_.IsOffline; IsClustered=$_.IsClustered
+        NumberOfPartitions=$_.NumberOfPartitions
+    }
+})
 $complete = $true
 $partitions = @()
 try {
-    $partitions = @(Storage\Get-Partition -ErrorAction Stop | Microsoft.PowerShell.Utility\Select-Object -First 4097 -Property DiskNumber,PartitionNumber,IsBoot,IsSystem,IsReadOnly,IsOffline,GptType,MbrType)
+    $partitions = @(Storage\Get-Partition -ErrorAction Stop | Microsoft.PowerShell.Utility\Select-Object -First 4097 | Microsoft.PowerShell.Core\ForEach-Object {
+        $mbrType = $null
+        if ($null -ne $_.CimInstanceProperties['MbrType'].Value) {
+            $mbrType = [uint16]$_.CimInstanceProperties['MbrType'].Value
+        }
+        [pscustomobject]@{
+            DiskNumber=$_.DiskNumber; PartitionNumber=$_.PartitionNumber
+            IsBoot=$_.IsBoot; IsSystem=$_.IsSystem; IsReadOnly=$_.IsReadOnly
+            IsOffline=$_.IsOffline; GptType=$_.GptType; MbrType=$mbrType
+        }
+    })
 } catch {
     $complete = $false
 }

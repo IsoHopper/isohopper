@@ -207,4 +207,63 @@ mod tests {
             io::ErrorKind::Unsupported
         );
     }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_projects_cim_enum_values_without_display_strings() {
+        // Exercise the production PowerShell projection with synthetic objects.
+        // Replace both storage queries before execution; no host disks are read.
+        let fixtures = r#"
+function Get-TestDisk {
+    [CmdletBinding()] param()
+    [pscustomobject]@{Number=1; BusType='USB'; CimInstanceProperties=@{BusType=@{Value = [uint16]7}}}
+    [pscustomobject]@{Number=2; BusType='Unknown display'; CimInstanceProperties=@{BusType=@{Value=[uint16]65535}}}
+    [pscustomobject]@{Number=3; BusType='Missing'; CimInstanceProperties=@{BusType=@{Value=$null}}}
+}
+function Get-TestPartition {
+    [CmdletBinding()] param()
+    [pscustomobject]@{DiskNumber=1; PartitionNumber=1; MbrType='LDM'; CimInstanceProperties=@{MbrType=@{Value = [uint16]66}}}
+    [pscustomobject]@{DiskNumber=2; PartitionNumber=1; MbrType='Missing'; CimInstanceProperties=@{MbrType=@{Value=$null}}}
+}
+"#;
+        let script = windows::ARGS[4]
+            .replace(
+                "Import-Module ($PSHOME + '\\Modules\\Storage\\Storage.psd1') -ErrorAction Stop",
+                fixtures,
+            )
+            .replace("Storage\\Get-Disk", "Get-TestDisk")
+            .replace("Storage\\Get-Partition", "Get-TestPartition");
+        assert!(!script.contains("Storage\\Get-"));
+        assert!(script.contains("function Get-TestDisk"));
+        let run = |script: &str| {
+            execute(
+                &powershell_path().unwrap(),
+                &[
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    script,
+                ],
+            )
+            .unwrap()
+        };
+        let result = run(&script);
+        assert!(result.success, "synthetic PowerShell projection failed");
+        let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(value["disks"][0]["BusType"], 7);
+        assert_eq!(value["disks"][1]["BusType"], 65535);
+        assert!(value["disks"][2]["BusType"].is_null());
+        assert_eq!(value["partitions"][0]["MbrType"], 66);
+        assert!(value["partitions"][1]["MbrType"].is_null());
+        assert_eq!(value["partitions_complete"], true);
+
+        let result = run(&script.replace("Value = [uint16]7", "Value = 'invalid-bus'"));
+        assert!(!result.success, "malformed bus enum must fail the command");
+        let result = run(&script.replace("Value = [uint16]66", "Value = 'invalid-mbr'"));
+        assert!(result.success);
+        let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(value["partitions_complete"], false);
+        assert_eq!(value["partitions"], serde_json::json!([]));
+    }
 }

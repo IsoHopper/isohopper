@@ -359,3 +359,34 @@ fn malformed_missing_and_unknown_fields_keep_diagnostics_redacted() {
     assert!(error.contains("disks[].Number"), "{error}");
     assert!(error.contains("received missing field"), "{error}");
 }
+
+#[test]
+fn command_projects_underlying_enum_numbers_and_null_remains_unknown() {
+    struct ProjectionRunner;
+    impl CommandRunner for ProjectionRunner {
+        fn run(&self, _: &str, args: &[&str]) -> io::Result<CommandOutput> {
+            for field in ["BusType", "MbrType"] {
+                let raw = format!("$_.CimInstanceProperties['{field}'].Value");
+                assert!(args[4].contains(&format!("$null -ne {raw}")));
+                assert!(args[4].contains(&format!("[uint16]{raw}")));
+            }
+            let mut d = disk(1);
+            d["BusType"] = Value::Null;
+            let mut p = partition(1);
+            p["MbrType"] = Value::Null;
+            Ok(CommandOutput {
+                success: true,
+                stdout: serde_json::to_vec(&input(vec![d], vec![p])).unwrap(),
+                stderr: vec![],
+            })
+        }
+    }
+    let result = discover_for(Platform::Windows, &ProjectionRunner).unwrap();
+    assert_eq!(result.disks[0].bus, "unknown");
+    assert!(!result.disks[0].safety_checks_complete);
+    assert!(warned(
+        &result,
+        Some(&result.disks[0].id),
+        "transport_unknown"
+    ));
+}
