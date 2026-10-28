@@ -18,6 +18,17 @@ MAX_QMP_LINE = 65536
 MARKER = b'ISOHOPPER:SMOKE:ENTRY'
 
 
+def utility_returned(output):
+    """Require the parent start, test child's entry, and parent return in order."""
+    position = 0
+    for marker in [b'ISOHOPPER:UTILITY:START', b'ISOHOPPER:TEST_UTILITY:ENTRY', b'ISOHOPPER:UTILITY:RETURN']:
+        found = output.find(marker, position)
+        if found < 0:
+            return False
+        position = found + len(marker)
+    return True
+
+
 def open_regular(path):
     """Keep the validated inode open; do not ask QEMU to reopen the source path."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -67,7 +78,7 @@ def main():
     parser.add_argument('--image', required=True, type=Path)
     parser.add_argument('--code', required=True, type=Path, help='OVMF/EDK2 x64 code image')
     parser.add_argument('--vars', required=True, type=Path, help='Matching clean vars template')
-    parser.add_argument('--action', choices=['shutdown', 'reboot', 'firmware-setup'], help='Exercise a confirmed power action inside QEMU only')
+    parser.add_argument('--action', choices=['shutdown', 'reboot', 'firmware-setup', 'utility'], help='Exercise a confirmed guest power action or the test EFI utility')
     parser.add_argument('--qemu', default='qemu-system-x86_64')
     parser.add_argument('--timeout', type=int, default=45)
     parser.add_argument('--log', type=Path, help='New log file; existing files are refused')
@@ -169,14 +180,18 @@ def main():
                                         return reply['return']
                                 raise RuntimeError('QMP event limit exceeded')
                             qmp('qmp_capabilities')
-                            for key_name in [{'shutdown': 's', 'reboot': 'r', 'firmware-setup': 'f'}[args.action], 'y']:
+                            for key_name in [{'shutdown': 's', 'reboot': 'r', 'firmware-setup': 'f', 'utility': 'u'}[args.action], 'y']:
                                 qmp('send-key', {'keys': [{'type': 'qcode', 'data': key_name}], 'hold-time': 50})
                                 time.sleep(0.15)
                         action_sent = True
+                    if args.action == 'utility' and utility_returned(output):
+                        passed = True
+                        reason = 'utility-started-and-returned'
+                        break
                 if not selector.get_map():
                     reason = 'qemu-exited'
                     process.wait(timeout=5)
-                    if args.action and action_markers[args.action] in output and process.returncode == 0:
+                    if args.action in action_markers and action_markers[args.action] in output and process.returncode == 0:
                         passed = True
                         reason = 'power-action-exited-qemu'
                     break

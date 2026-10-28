@@ -12,6 +12,15 @@ spec = importlib.util.spec_from_file_location('smoke', Path(__file__).with_name(
 smoke = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(smoke)
 
+class UtilityEvidence(unittest.TestCase):
+    def test_utility_requires_start_child_entry_and_return(self):
+        start = b'ISOHOPPER:UTILITY:START'
+        child = b'ISOHOPPER:TEST_UTILITY:ENTRY'
+        returned = b'ISOHOPPER:UTILITY:RETURN'
+        self.assertTrue(smoke.utility_returned(start + child + returned))
+        for partial in [b'', start, start + returned, child + returned, returned + child + start]:
+            self.assertFalse(smoke.utility_returned(partial))
+
 class InputSafety(unittest.TestCase):
     def test_retained_file_survives_path_replacement(self):
         with tempfile.TemporaryDirectory() as root:

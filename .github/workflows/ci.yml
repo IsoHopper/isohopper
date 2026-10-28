@@ -54,6 +54,9 @@ jobs:
       - name: Run checks and Chromium integration tests
         run: ./scripts/check.sh --install-browser
 
+      - name: Check read-only Linux inventory
+        run: cargo test --locked -p isohopper-inventory --test native_smoke native_linux_inventory_is_read_only_and_fail_closed -- --ignored --nocapture
+
       - name: Save browser failure traces
         if: failure()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6

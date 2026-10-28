@@ -20,7 +20,6 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       CARGO_BUILD_JOBS: 2
-      SMOKE_ROOT: ${{ runner.temp }}/isohopper-firmware-smoke
       OVMF_CODE: /usr/share/OVMF/OVMF_CODE_4M.fd
       OVMF_VARS: /usr/share/OVMF/OVMF_VARS_4M.fd
     steps:
@@ -31,6 +30,8 @@ jobs:
 
       - name: Install emulator and firmware
         run: |
+          SMOKE_ROOT="$RUNNER_TEMP/isohopper-firmware-smoke"
+          printf 'SMOKE_ROOT=%s\n' "$SMOKE_ROOT" >> "$GITHUB_ENV"
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y qemu-system-x86 ovmf
           test -f "$OVMF_CODE"
@@ -47,24 +48,26 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts -p test_firmware_smoke.py
           cargo test --locked -p isohopper-launcher --lib
+          cargo test --locked -p isohopper-launcher --features firmware --bin isohopper-launcher
 
       - name: Build CLI and firmware
         run: |
           cargo build --locked --release -p isohopper-cli
           cargo build --locked --release -p isohopper-launcher --features firmware --target x86_64-unknown-uefi
+          cargo build --locked --release -p isohopper-launcher --features test-utility --bin isohopper-test-utility --target x86_64-unknown-uefi
           rustc --version >> "$SMOKE_ROOT/evidence/tool-versions.txt"
           sha256sum "$OVMF_CODE" "$OVMF_VARS" target/x86_64-unknown-uefi/release/isohopper-launcher.efi > "$SMOKE_ROOT/evidence/input-sha256.txt"
 
       - name: Create and verify isolated virtual disk
         run: |
-          target/release/isohopper image create "$SMOKE_ROOT/usb.img" --size-mib 256 --efi target/x86_64-unknown-uefi/release/isohopper-launcher.efi > "$SMOKE_ROOT/evidence/create.json"
-          target/release/isohopper image verify "$SMOKE_ROOT/usb.img" --efi target/x86_64-unknown-uefi/release/isohopper-launcher.efi > "$SMOKE_ROOT/evidence/verify.json"
+          target/release/isohopper image create "$SMOKE_ROOT/usb.img" --size-mib 256 --efi target/x86_64-unknown-uefi/release/isohopper-launcher.efi --utility target/x86_64-unknown-uefi/release/isohopper-test-utility.efi > "$SMOKE_ROOT/evidence/create.json"
+          target/release/isohopper image verify "$SMOKE_ROOT/usb.img" --efi target/x86_64-unknown-uefi/release/isohopper-launcher.efi --utility target/x86_64-unknown-uefi/release/isohopper-test-utility.efi > "$SMOKE_ROOT/evidence/verify.json"
 
       - name: Exercise entry and confirmed guest power requests
         shell: bash
         run: |
           failed=0
-          for action in entry shutdown reboot firmware-setup; do
+          for action in entry shutdown reboot firmware-setup utility; do
             action_args=()
             if [[ "$action" != entry ]]; then
               action_args=(--action "$action")
@@ -91,6 +94,7 @@ jobs:
           x64 UEFI tests use QEMU TCG and an emulated USB disk with fresh OVMF variables per run.
           Entry means the launcher reported its entry marker.
           Power results cover confirmed guest requests and emulator exit. Firmware setup is a request/reset test; the next firmware UI is not inspected.
+          Utility results require ordered launcher-start, test-utility-entry, and launcher-return markers. The utility is a tiny source-built test program.
           These tests do not validate OS boot, physical hardware, Secure Boot enforcement, or signed release artifacts.
           The data partition remains unformatted. Logs and input hashes are retained below; disk images are not uploaded.
           EOF

@@ -48,6 +48,8 @@ printf '\nRust lint\n'
 cargo clippy --workspace --all-targets --locked -- -D warnings
 printf '\nRust tests\n'
 cargo test --workspace --all-targets --locked
+printf '\nFirmware handoff policy tests\n'
+cargo test --locked -p isohopper-launcher --features firmware --bin isohopper-launcher
 printf '\nFirmware harness tests\n'
 python3 -m unittest discover -s scripts -p 'test_*.py'
 
