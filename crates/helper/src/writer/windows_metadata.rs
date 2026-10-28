@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+use super::StableDeviceId;
 use std::io;
 
 pub(super) const MAX_DESCRIPTOR: usize = 65_536;
@@ -34,6 +35,9 @@ pub(super) fn parse_descriptor(bytes: &[u8]) -> io::Result<(String, u32)> {
         return Err(invalid());
     }
     let offset = number(bytes, 24)? as usize;
+    if offset == 0 {
+        return Ok((String::new(), number(bytes, 28)?));
+    }
     if !(DESCRIPTOR_PREFIX..size).contains(&offset) {
         return Err(invalid());
     }
@@ -53,6 +57,99 @@ pub(super) fn parse_descriptor(bytes: &[u8]) -> io::Result<(String, u32)> {
         return Err(invalid());
     }
     Ok((serial, number(bytes, 28)?))
+}
+
+fn invalid_id() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "invalid storage device ID descriptor",
+    )
+}
+
+pub(super) fn id_descriptor_size(header: &[u8]) -> io::Result<usize> {
+    let version = number(header, 0).map_err(|_| invalid_id())?;
+    let size = number(header, 4).map_err(|_| invalid_id())? as usize;
+    // The known structure is 16 bytes including its one-byte trailing array.
+    // Unknown versions require a separate parser, not guessed field offsets.
+    if version != 16 || !(16..=MAX_DESCRIPTOR).contains(&size) {
+        return Err(invalid_id());
+    }
+    Ok(size)
+}
+
+pub(super) fn parse_device_ids(bytes: &[u8]) -> io::Result<Option<StableDeviceId>> {
+    let size = id_descriptor_size(bytes)?;
+    if size != bytes.len() {
+        return Err(invalid_id());
+    }
+    let count = number(bytes, 8).map_err(|_| invalid_id())? as usize;
+    if count == 0 {
+        return if size == 16 {
+            Ok(None)
+        } else {
+            Err(invalid_id())
+        };
+    }
+    if count > 64 {
+        return Err(invalid_id());
+    }
+    let mut offset = 12;
+    let mut result = None;
+    for index in 0..count {
+        let record = bytes.get(offset..).ok_or_else(invalid_id)?;
+        let header = record.get(..16).ok_or_else(invalid_id)?;
+        let code_set = number(header, 0).map_err(|_| invalid_id())?;
+        let kind = number(header, 4).map_err(|_| invalid_id())?;
+        let length = u16::from_le_bytes([header[8], header[9]]) as usize;
+        let next = u16::from_le_bytes([header[10], header[11]]) as usize;
+        let association = number(header, 12).map_err(|_| invalid_id())?;
+        let end = 16 + length;
+        let identifier = record.get(16..end).ok_or_else(invalid_id)?;
+        if length == 0 || !(1..=3).contains(&code_set) || association > 2 {
+            return Err(invalid_id());
+        }
+        // At most seven bytes of structure/alignment padding are supported.
+        // Validate the complete chain even when an earlier record supplied ID.
+        let span = if index + 1 == count {
+            if next != 0 && next != record.len() {
+                return Err(invalid_id());
+            }
+            record.len()
+        } else {
+            if next == 0 || next >= record.len() {
+                return Err(invalid_id());
+            }
+            next
+        };
+        if span < end || span - end > 7 {
+            return Err(invalid_id());
+        }
+        if kind == 3 {
+            if code_set != 1 {
+                return Err(invalid_id());
+            }
+            // NAA 2/3/5 are defined 64-bit forms but are not accepted as the
+            // fallback identity here. Reserved types and wrong lengths fail.
+            match (identifier[0] >> 4, identifier.len()) {
+                (2 | 3 | 5, 8) => {}
+                (6, 16) => {
+                    if association == 0 {
+                        let id = StableDeviceId::from_naa128(
+                            identifier.try_into().map_err(|_| invalid_id())?,
+                        )
+                        .map_err(|_| invalid_id())?;
+                        if result.as_ref().is_some_and(|previous| *previous != id) {
+                            return Err(invalid_id());
+                        }
+                        result = Some(id);
+                    }
+                }
+                _ => return Err(invalid_id()),
+            }
+        }
+        offset += span;
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -87,7 +184,6 @@ mod tests {
             (0, 49),
             (4, u32::MAX),
             (4, 35),
-            (24, 0),
             (24, 8),
             (24, 48),
             (24, u32::MAX),
@@ -112,5 +208,166 @@ mod tests {
         bytes[36..43].fill(b' ');
         bytes[43] = 0;
         assert!(parse_descriptor(&bytes).is_err());
+    }
+
+    // Captured from a newly created, test-owned VHDX. Its parsed device ID was
+    // unchanged after detach/reattach. The final NextOffset points to the end.
+    fn device_ids() -> Vec<u8> {
+        hex::decode(concat!(
+            "100000005c00000002000000",
+            "010000000100000018002c0000000000",
+            "4d53465420202020b279f9ad1a924a47a00dd4604957317200000000",
+            "01000000030000001000240000000000",
+            "60022480b279f9ad1a92d4604957317200000000"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn absent_serial_is_distinct_from_a_malformed_reported_serial() {
+        let mut bytes = descriptor();
+        bytes[24..28].fill(0);
+        assert_eq!(parse_descriptor(&bytes).unwrap(), (String::new(), 7));
+    }
+
+    #[test]
+    fn observed_device_id_uses_semantic_naa_bytes_not_padding() {
+        let bytes = device_ids();
+        assert_eq!(id_descriptor_size(&bytes[..8]).unwrap(), 92);
+        let expected = StableDeviceId::from_naa128(
+            hex::decode("60022480b279f9ad1a92d46049573172")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parse_device_ids(&bytes).unwrap(), Some(expected.clone()));
+        let mut changed_padding = bytes.clone();
+        changed_padding[52..56].fill(0xa5);
+        changed_padding[88..92].fill(0x5a);
+        assert_eq!(
+            parse_device_ids(&changed_padding).unwrap(),
+            Some(expected.clone())
+        );
+        changed_padding[66..68].fill(0); // Last record may also terminate with zero.
+        assert_eq!(parse_device_ids(&changed_padding).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn device_id_rejects_truncation_counts_overlaps_and_out_of_bounds_links() {
+        let original = device_ids();
+        for length in 0..original.len() {
+            assert!(
+                parse_device_ids(&original[..length]).is_err(),
+                "length {length}"
+            );
+        }
+        for (offset, value) in [
+            (0, 0u32),
+            (0, 17),
+            (4, 15),
+            (4, u32::MAX),
+            (8, 0),
+            (8, 1),
+            (8, 3),
+            (8, u32::MAX),
+        ] {
+            let mut bytes = original.clone();
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(parse_device_ids(&bytes).is_err(), "u32 {offset}={value}");
+        }
+        for (offset, value) in [
+            (20, u16::MAX),
+            (22, 0),
+            (22, 1),
+            (22, 39),
+            (22, u16::MAX),
+            (64, 0),
+            (64, 15),
+            (64, 17),
+            (64, u16::MAX),
+            (66, 1),
+            (66, 31),
+            (66, 35),
+            (66, 37),
+            (66, u16::MAX),
+        ] {
+            let mut bytes = original.clone();
+            bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+            assert!(parse_device_ids(&bytes).is_err(), "u16 {offset}={value}");
+        }
+    }
+
+    #[test]
+    fn device_id_requires_binary_device_associated_supported_naa() {
+        let original = device_ids();
+        for association in [1u32, 2] {
+            let mut bytes = original.clone();
+            bytes[68..72].copy_from_slice(&association.to_le_bytes());
+            assert_eq!(parse_device_ids(&bytes).unwrap(), None);
+        }
+        for (offset, value) in [(56, 0u32), (56, 2), (56, 3), (56, 4), (68, 3)] {
+            let mut bytes = original.clone();
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(parse_device_ids(&bytes).is_err(), "{offset}={value}");
+        }
+        for kind in [0u32, 1, 2, 4, 5, 6, 7, 8, u32::MAX] {
+            let mut bytes = original.clone();
+            bytes[60..64].copy_from_slice(&kind.to_le_bytes());
+            assert_eq!(parse_device_ids(&bytes).unwrap(), None);
+        }
+        for naa in 0..16 {
+            if naa == 6 {
+                continue;
+            }
+            let mut bytes = original.clone();
+            bytes[72] = naa << 4;
+            assert!(parse_device_ids(&bytes).is_err(), "NAA {naa}");
+        }
+    }
+
+    #[test]
+    fn device_id_detects_conflicting_candidates_independent_of_order() {
+        let original = device_ids();
+        let mut bytes = original.clone();
+        bytes[4..8].copy_from_slice(&128u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&original[56..]);
+        assert_eq!(
+            parse_device_ids(&bytes).unwrap(),
+            parse_device_ids(&original).unwrap()
+        );
+        bytes[123] ^= 1;
+        assert!(parse_device_ids(&bytes).is_err());
+        // Put the NAA record before the vendor record; its identity is unchanged.
+        let mut reordered = original[..12].to_vec();
+        reordered.extend_from_slice(&original[56..]);
+        reordered.extend_from_slice(&original[12..56]);
+        assert_eq!(
+            parse_device_ids(&reordered).unwrap(),
+            parse_device_ids(&original).unwrap()
+        );
+    }
+
+    #[test]
+    fn empty_or_defined_unsupported_ids_do_not_fabricate_identity() {
+        let mut bytes = vec![0; 16];
+        bytes[..4].copy_from_slice(&16u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&16u32.to_le_bytes());
+        assert_eq!(parse_device_ids(&bytes).unwrap(), None);
+        // Defined 64-bit NAA forms are well-formed, but this implementation
+        // only uses the validated 128-bit NAA-6 form as fallback identity.
+        for naa in [2, 3, 5] {
+            let mut bytes = device_ids();
+            bytes.truncate(84);
+            bytes[4..8].copy_from_slice(&84u32.to_le_bytes());
+            bytes[64..66].copy_from_slice(&8u16.to_le_bytes());
+            bytes[66..68].copy_from_slice(&28u16.to_le_bytes());
+            bytes[72] = naa << 4;
+            assert_eq!(parse_device_ids(&bytes).unwrap(), None);
+        }
+        let mut trailing = device_ids();
+        trailing.push(0);
+        assert!(parse_device_ids(&trailing).is_err());
     }
 }

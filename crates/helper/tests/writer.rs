@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use isohopper_helper::writer::{
-    CHUNK_BYTES, DeviceSnapshot, Failure, Geometry, Phase, RetainedDevice, write_image,
+    CHUNK_BYTES, DeviceSnapshot, Failure, Geometry, Phase, RetainedDevice, StableDeviceId,
+    write_image,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -18,6 +19,7 @@ fn snapshot(size: u64, logical: u32, physical: u32) -> DeviceSnapshot {
     DeviceSnapshot {
         device_number: 7,
         serial: "TEST-USB-1234".into(),
+        device_id: None,
         bus_type: 7,
         geometry: Geometry {
             size_bytes: size,
@@ -25,6 +27,13 @@ fn snapshot(size: u64, logical: u32, physical: u32) -> DeviceSnapshot {
             physical_sector_size: physical,
         },
     }
+}
+
+fn device_id(last: u8) -> StableDeviceId {
+    let mut bytes = [0x23; 16];
+    bytes[0] = 0x60;
+    bytes[15] = last;
+    StableDeviceId::from_naa128(bytes).unwrap()
 }
 
 struct Device {
@@ -74,6 +83,16 @@ impl RetainedDevice for Device {
         }
         if self.fault == "identity_before_write" && self.snapshots > 1 {
             result.serial.push('X');
+        }
+        if (self.fault == "device_id_before_write" && self.snapshots > 1)
+            || (self.fault == "device_id_after_write" && self.writes > 0)
+        {
+            result.device_id = Some(device_id(2));
+        }
+        if (self.fault == "device_id_missing_before_write" && self.snapshots > 1)
+            || (self.fault == "device_id_missing_after_write" && self.writes > 0)
+        {
+            result.device_id = None;
         }
         Ok(result)
     }
@@ -155,11 +174,20 @@ fn identity_geometry_size_and_digest_fail_before_any_write() {
     let digest: [u8; 32] = Sha256::digest(&image).into();
     let good = snapshot(image.len() as u64, 512, 4096);
     let mut cases = Vec::new();
-    for field in ["number", "serial", "bus", "size", "logical", "physical"] {
+    for field in [
+        "number",
+        "serial",
+        "device_id",
+        "bus",
+        "size",
+        "logical",
+        "physical",
+    ] {
         let mut changed = good.clone();
         match field {
             "number" => changed.device_number += 1,
             "serial" => changed.serial.push('X'),
+            "device_id" => changed.device_id = Some(device_id(1)),
             "bus" => changed.bus_type += 1,
             "size" => changed.geometry.size_bytes += 512,
             "logical" => changed.geometry.logical_sector_size = 4096,
@@ -200,6 +228,88 @@ fn identity_geometry_size_and_digest_fail_before_any_write() {
         ));
         assert!(!error.target_may_be_incomplete);
         assert_eq!(device.writes, 0);
+    }
+}
+
+#[test]
+fn validated_device_identity_allows_actual_absent_serial_but_not_malformed_serial() {
+    let image = image();
+    let digest: [u8; 32] = Sha256::digest(&image).into();
+    let mut expected = snapshot(image.len() as u64, 512, 4096);
+    expected.device_id = Some(device_id(1));
+    for serial in [String::new(), "ACTUAL-SERIAL".into()] {
+        expected.serial = serial;
+        let mut device = Device::new(expected.clone());
+        let report = write_image(
+            &mut device,
+            &mut Cursor::new(&image),
+            &expected,
+            digest,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(report.sha256, digest);
+        assert_eq!(device.bytes, image);
+    }
+    for serial in [" ".into(), "\n".into(), "a".repeat(4097)] {
+        expected.serial = serial;
+        let mut device = Device::new(expected.clone());
+        let error = write_image(
+            &mut device,
+            &mut Cursor::new(&image),
+            &expected,
+            digest,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(matches!(error.failure, Failure::Identity));
+        assert_eq!(device.snapshots, 0);
+        assert_eq!(device.writes, 0);
+    }
+    for nibble in 0..16 {
+        let mut bytes = [0x23; 16];
+        bytes[0] = nibble << 4;
+        assert_eq!(StableDeviceId::from_naa128(bytes).is_ok(), nibble == 6);
+    }
+    assert_eq!(device_id(1).as_bytes()[15], 1);
+}
+
+#[test]
+fn device_id_changes_or_disappearance_never_allow_success() {
+    let image = image();
+    let digest: [u8; 32] = Sha256::digest(&image).into();
+    for serial in ["", "ACTUAL-SERIAL"] {
+        let mut expected = snapshot(image.len() as u64, 512, 4096);
+        expected.serial = serial.into();
+        expected.device_id = Some(device_id(1));
+        for fault in [
+            "device_id_before_write",
+            "device_id_after_write",
+            "device_id_missing_before_write",
+            "device_id_missing_after_write",
+        ] {
+            let mut device = Device::new(expected.clone());
+            device.fault = fault;
+            let mut completed = false;
+            let error = write_image(
+                &mut device,
+                &mut Cursor::new(&image),
+                &expected,
+                digest,
+                &AtomicBool::new(false),
+                |e| completed |= e.phase == Phase::Complete,
+            )
+            .unwrap_err();
+            assert!(matches!(error.failure, Failure::IdentityChanged), "{fault}");
+            assert!(!completed);
+            assert_eq!(
+                error.target_may_be_incomplete,
+                fault.ends_with("after_write")
+            );
+            assert_eq!(device.writes == 0, fault.ends_with("before_write"));
+        }
     }
 }
 

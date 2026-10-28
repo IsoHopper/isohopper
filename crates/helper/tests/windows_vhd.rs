@@ -46,14 +46,28 @@ fn windows_vhd_writer_persists_verified_gpt() -> Result<(), Box<dyn std::error::
     let mut vhd = TemporaryVhd::create(directory.path().join("writer-test.vhdx"))?;
     vhd.attach(false)?;
     vhd.diagnose_device_ids()?;
+    let first = vhd.open_raw_device()?;
+    let first_id = first
+        .initial_snapshot()
+        .device_id
+        .clone()
+        .expect("VHD must expose a device-associated NAA-6 identifier");
+    assert!(
+        first.initial_snapshot().serial.is_empty(),
+        "VHD fixture reports no hardware serial"
+    );
+    drop(first);
+    vhd.detach()?;
+    vhd.attach(false)?;
     let mut device = vhd.open_raw_device()?;
     let expected = device.initial_snapshot().clone();
     assert_eq!(expected.geometry.size_bytes, CAPACITY);
     assert_eq!(expected.geometry.logical_sector_size, 512);
     assert_eq!(expected.geometry.physical_sector_size, 4096);
-    // No serial or geometry exceptions: missing VHD identity must fail exactly
-    // as it does for a production raw-device handle.
-    assert!(!expected.serial.is_empty());
+    // Compare parsed device identity, independent of descriptor padding or
+    // enumeration number. No serial is fabricated for a serial-less VHD.
+    assert!(expected.serial.is_empty());
+    assert_eq!(expected.device_id, Some(first_id));
     let mut phases = Vec::new();
     let report = write_image(
         &mut device,

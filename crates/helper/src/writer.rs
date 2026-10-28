@@ -63,11 +63,44 @@ impl Geometry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StableDeviceId([u8; 16]);
+
+impl StableDeviceId {
+    /// A device-associated, binary IEEE registered extended (NAA 6) identifier.
+    /// This validates the supported encoding, not the device's trustworthiness.
+    pub fn from_naa128(bytes: [u8; 16]) -> Result<Self, Failure> {
+        if bytes[0] >> 4 != 6 {
+            return Err(Failure::Identity);
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceSnapshot {
     pub device_number: u32,
+    /// Actual hardware serial, empty only when the device reports none.
     pub serial: String,
+    pub device_id: Option<StableDeviceId>,
     pub bus_type: u32,
     pub geometry: Geometry,
+}
+
+impl DeviceSnapshot {
+    fn validate_identity(&self) -> Result<(), Failure> {
+        if (self.serial.is_empty() && self.device_id.is_none())
+            || (!self.serial.is_empty() && self.serial.trim().is_empty())
+            || self.serial.len() > 4096
+            || self.serial.chars().any(char::is_control)
+        {
+            return Err(Failure::Identity);
+        }
+        Ok(())
+    }
 }
 
 /// Implementations must use the same device handle throughout the job.
@@ -242,12 +275,7 @@ fn execute(
     state: &mut State,
 ) -> Result<Report, Failure> {
     expected.geometry.validate()?;
-    if expected.serial.trim().is_empty()
-        || expected.serial.len() > 4096
-        || expected.serial.chars().any(char::is_control)
-    {
-        return Err(Failure::Identity);
-    }
+    expected.validate_identity()?;
     cancelled(cancel)?;
     unchanged(device, expected)?;
     let size = expected.geometry.size_bytes;

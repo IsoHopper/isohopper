@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Synchronous raw I/O through one caller-owned, already authorized handle.
-use super::{DeviceSnapshot, Geometry, RetainedDevice, windows_metadata};
+use super::{DeviceSnapshot, Geometry, RetainedDevice, StableDeviceId, windows_metadata};
 use std::{
     io,
     mem::size_of,
@@ -8,6 +8,7 @@ use std::{
     ptr,
 };
 use windows_sys::Win32::{
+    Foundation::{ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED},
     Storage::FileSystem::{
         FILE_BEGIN, FILE_DEVICE_DISK, FILE_TYPE_DISK, FlushFileBuffers, GetFileType, ReadFile,
         SetFilePointerEx, WriteFile,
@@ -18,7 +19,7 @@ use windows_sys::Win32::{
             GET_LENGTH_INFORMATION, IOCTL_DISK_GET_LENGTH_INFO, IOCTL_STORAGE_GET_DEVICE_NUMBER,
             IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery,
             STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, STORAGE_DEVICE_NUMBER, STORAGE_PROPERTY_QUERY,
-            StorageAccessAlignmentProperty, StorageDeviceProperty,
+            StorageAccessAlignmentProperty, StorageDeviceIdProperty, StorageDeviceProperty,
         },
     },
 };
@@ -44,6 +45,9 @@ impl WindowsRawDevice {
             return Err(invalid("handle is not a disk device"));
         }
         let initial = inspect(&handle)?;
+        initial
+            .validate_identity()
+            .map_err(|_| invalid("device has no hardware serial or supported NAA-6 device ID"))?;
         Ok(Self { handle, initial })
     }
 
@@ -254,10 +258,53 @@ fn inspect(handle: &OwnedHandle) -> io::Result<DeviceSnapshot> {
         descriptor.len(),
     )?;
     let (serial, bus_type) = windows_metadata::parse_descriptor(&descriptor[..returned])?;
+    let device_id = inspect_device_id(handle)?;
     Ok(DeviceSnapshot {
         device_number: number.DeviceNumber,
         serial,
+        device_id,
         bus_type,
         geometry,
     })
+}
+
+fn inspect_device_id(handle: &OwnedHandle) -> io::Result<Option<StableDeviceId>> {
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceIdProperty,
+        QueryType: PropertyStandardQuery,
+        ..Default::default()
+    };
+    let mut header = [0u8; 8];
+    match control(
+        handle,
+        IOCTL_STORAGE_QUERY_PROPERTY,
+        Some(&query),
+        header.as_mut_ptr().cast(),
+        header.len(),
+    ) {
+        // Some devices only expose a serial. Unsupported VPD83 is not a
+        // substitute identity: the constructor still requires serial or ID,
+        // and later snapshots compare any previously present ID as well.
+        Err(error)
+            if error.raw_os_error().is_some_and(|code| {
+                code == ERROR_INVALID_FUNCTION as i32 || code == ERROR_NOT_SUPPORTED as i32
+            }) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+        Ok(count) if count != header.len() => {
+            return Err(invalid("truncated storage device ID descriptor header"));
+        }
+        Ok(_) => {}
+    }
+    let mut descriptor = vec![0u8; windows_metadata::id_descriptor_size(&header)?];
+    let returned = control(
+        handle,
+        IOCTL_STORAGE_QUERY_PROPERTY,
+        Some(&query),
+        descriptor.as_mut_ptr().cast(),
+        descriptor.len(),
+    )?;
+    windows_metadata::parse_device_ids(&descriptor[..returned])
 }

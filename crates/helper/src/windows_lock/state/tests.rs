@@ -7,6 +7,7 @@ fn target() -> DeviceSnapshot {
     DeviceSnapshot {
         device_number: 7,
         serial: "OWNED-TEST-DISK".into(),
+        device_id: None,
         bus_type: 7,
         geometry: Geometry {
             size_bytes: 64 * 1024 * 1024,
