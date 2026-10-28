@@ -5,7 +5,7 @@ export interface Disk { id: string; serial: string; model: string; bus: string; 
 export interface DiskRecord { disk: Disk; verdict: { state: string; hard_blocks: Reason[] | null; risks: Reason[] | null; challenge?: string }; challenge?: string }
 export interface Partition { name: string; start_lba: number; end_lba: number }
 export interface DiskPlan { size_bytes: number; logical_sector_size: number; partitions: Partition[] }
-export interface MediaImage { id: string; name: string; size: number; sample: boolean; relativePath?: string; origin?: 'native' | 'browser'; hash?: string; status: 'sample' | 'hashing' | 'hashed' | 'error'; error?: string }
+export interface MediaImage { id: string; name: string; size: number; sample: boolean; sourceId?: string; relativePath?: string; origin?: 'native' | 'browser'; hash?: string; status: 'sample' | 'hashing' | 'hashed' | 'error'; error?: string }
 export function challengeFor(disk: DiskRecord): string { return disk.challenge || disk.verdict.challenge || ''; }
 export function confirmationMatches(disk: DiskRecord, input: string): boolean {
   const challenge = challengeFor(disk);

@@ -6,13 +6,21 @@ interface NativeScenario {
   capabilityError?: string;
   inventoryError?: string;
   pickerOutcome?: 'image' | 'cancel' | 'error';
+  releaseFailures?: number;
+  sourceListError?: string;
 }
 
 async function installNativeBridge(page: Page, scenario: NativeScenario = {}) {
-  await page.addInitScript(({ capabilityError, inventoryError, pickerOutcome }) => {
-    const host = window as unknown as { __TAURI__: unknown; nativeCommands: string[] };
+  await page.addInitScript(({ capabilityError, inventoryError, pickerOutcome, releaseFailures, sourceListError }) => {
+    const host = window as unknown as { __TAURI__: unknown; nativeCommands: string[]; releasedSourceIds: string[][] };
     host.nativeCommands = [];
-    host.__TAURI__ = { core: { invoke: async (command: string) => {
+    host.releasedSourceIds = [];
+    let failuresLeft = releaseFailures || 0;
+    type StoredSource = { source_id: string; name: string; relative_path?: string; bytes: number; verification: { algorithm: string; digest: string; bytes: number; status: string; publisher_verified: boolean } };
+    let retained: StoredSource[] = JSON.parse(sessionStorage.getItem('test-retained-sources') || '[]');
+    const store = (entries: StoredSource[]) => { retained = entries; sessionStorage.setItem('test-retained-sources', JSON.stringify(entries)); };
+
+    host.__TAURI__ = { core: { invoke: async (command: string, args?: { ids?: string[] }) => {
       host.nativeCommands.push(command);
       if (command === 'capabilities') {
         if (capabilityError) throw new Error(capabilityError);
@@ -22,14 +30,27 @@ async function installNativeBridge(page: Page, scenario: NativeScenario = {}) {
         if (inventoryError) throw new Error(inventoryError);
         return { source: 'test-host-adapter', disks: [{ id: 'host-system-unique-id', serial: 'HOST-SERIAL-1234', model: 'Host system storage', bus: 'nvme', size_bytes: 512_000_000_000, logical_sector_size: 512, physical_sector_size: 4096, system_disk: true, external: false, safety_checks_complete: false }], warnings: [{ disk_id: 'host-system-unique-id', code: 'safety_unknown', message: 'Safety metadata is not complete.' }] };
       }
+      if (command === 'list_sources') {
+        if (sourceListError) throw new Error(sourceListError);
+        return retained;
+      }
       if (command === 'pick_images') {
         if (pickerOutcome === 'error') throw new Error('file read failed');
         if (pickerOutcome === 'cancel') return [];
-        return [{ name: '/private/media/native-large.iso', bytes: 6_000_000_000, verification: { algorithm: 'sha256', digest: 'a'.repeat(64), bytes: 6_000_000_000, status: 'hash-only', publisher_verified: false } }];
+        const selected = [{ source_id: `src_${'a'.repeat(64)}`, name: '/private/media/native-large.iso', bytes: 6_000_000_000, verification: { algorithm: 'sha256', digest: 'a'.repeat(64), bytes: 6_000_000_000, status: 'hash-only', publisher_verified: false } }];
+        store([...retained, ...selected]); return selected;
       }
       if (command === 'pick_directory') {
-        const image = (relative_path: string) => ({ name: 'boot.iso', relative_path, bytes: 3, verification: { algorithm: 'sha256', digest: 'b'.repeat(64), bytes: 3, status: 'hash-only', publisher_verified: false } });
-        return { images: [image('Mac/boot.iso'), image('Windows/boot.iso'), image('MAC/BOOT.ISO')], warnings: ['Skipped symbolic link: external'] };
+        const image = (relative_path: string, id: string) => ({ source_id: `src_${id.repeat(64)}`, name: 'boot.iso', relative_path, bytes: 3, verification: { algorithm: 'sha256', digest: 'b'.repeat(64), bytes: 3, status: 'hash-only', publisher_verified: false } });
+        const selected = [image('Mac/boot.iso', 'b'), image('Windows/boot.iso', 'c'), image('MAC/BOOT.ISO', 'd')];
+        store([...retained, ...selected]);
+        return { images: selected, warnings: ['Skipped symbolic link: external'] };
+      }
+      if (command === 'release_sources') {
+        host.releasedSourceIds.push(args!.ids!);
+        if (failuresLeft-- > 0) throw new Error('Source is leased by a job');
+        store(retained.filter(source => !args!.ids!.includes(source.source_id)));
+        return null;
       }
       if (command === 'check_config') return { valid: true };
       throw new Error(`Unexpected native operation: ${command}`);
@@ -73,7 +94,7 @@ for (const url of ['/', '/?demo=1']) {
     await expect(page.locator('.image-row')).toHaveCount(0);
     await expect(page.locator('#choose-drive')).toHaveCount(0);
     await expectNoDemoContent(page);
-    expect(await nativeCommands(page)).toEqual(['capabilities', 'inspect_devices']);
+    expect(await nativeCommands(page)).toEqual(['capabilities', 'list_sources', 'inspect_devices']);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
     await page.locator('nav').getByRole('button', { name: 'Image library' }).click();
     await expect(page.locator('.image-row')).toHaveCount(0);
@@ -90,7 +111,7 @@ for (const stage of ['capabilities', 'inventory'] as const) {
     await expect(page.locator('.target-panel')).toContainText('Preparation unavailable');
     await expect(page.locator('.image-row')).toHaveCount(0);
     await expectNoDemoContent(page);
-    expect(await nativeCommands(page)).toEqual(stage === 'capabilities' ? ['capabilities'] : ['capabilities', 'inspect_devices']);
+    expect(await nativeCommands(page)).toEqual(stage === 'capabilities' ? ['capabilities'] : ['capabilities', 'list_sources', 'inspect_devices']);
   });
 }
 
@@ -251,7 +272,7 @@ test('power preview clicks remain inert even with the native bridge available', 
     await page.getByRole('button', { name, exact: true }).click();
     await expect(page.locator('#toast')).toContainText(`${name}: preview only. No host action performed.`);
   }
-  expect(await nativeCommands(page)).toEqual(['capabilities', 'inspect_devices']);
+  expect(await nativeCommands(page)).toEqual(['capabilities', 'list_sources', 'inspect_devices']);
 });
 
 for (const outcome of ['image', 'cancel', 'error'] as const) {
@@ -271,7 +292,7 @@ for (const outcome of ['image', 'cancel', 'error'] as const) {
       if (outcome === 'error') await expect(page.getByRole('status')).toContainText('Native image selection failed');
     }
     await expect(page.getByRole('button', { name: 'Add images', exact: true })).toBeEnabled();
-    expect(await nativeCommands(page)).toEqual(['capabilities', 'inspect_devices', 'pick_images']);
+    expect(await nativeCommands(page)).toEqual(['capabilities', 'list_sources', 'inspect_devices', 'pick_images']);
     await expect(page.getByRole('button', { name: 'Simulate preparation' })).toHaveCount(0);
   });
 }
@@ -288,7 +309,7 @@ test('directory import preserves nested names and reports conflicting destinatio
   await page.locator('nav').getByRole('button', { name: 'Activity' }).click();
   await expect(page.getByText('Directory import warning')).toBeVisible();
   await expect(page.getByText('Destination skipped')).toBeVisible();
-  expect(await nativeCommands(page)).toEqual(['capabilities', 'inspect_devices', 'pick_directory']);
+  expect(await nativeCommands(page)).toEqual(['capabilities', 'list_sources', 'inspect_devices', 'pick_directory', 'release_sources']);
 });
 
 test('host inventory stays read only and can be inspected and exported', async ({ page }) => {
@@ -316,5 +337,82 @@ test('host inventory stays read only and can be inspected and exported', async (
   await expect(page.getByRole('button', { name: 'Inspect host devices (read only)' })).toBeFocused();
   await expect(page.locator('.target-panel')).toContainText('Preparation unavailable');
   await expect(page.locator('#choose-drive')).toHaveCount(0);
-  expect(await nativeCommands(page)).toEqual(['capabilities', 'inspect_devices', 'inspect_devices']);
+  expect(await nativeCommands(page)).toEqual(['capabilities', 'list_sources', 'inspect_devices', 'inspect_devices']);
+});
+
+for (const failOnce of [false, true]) {
+  test(`native removal ${failOnce ? 'retains state after failure and retries' : 'releases its opaque source ID'}`, async ({ page }) => {
+    await installNativeBridge(page, { releaseFailures: failOnce ? 1 : 0 });
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Add images', exact: true }).click();
+    const row = page.locator('.image-row').filter({ hasText: 'native-large.iso' });
+    await expect(row).toContainText(`src_${'a'.repeat(64)}`);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await row.getByRole('button', { name: 'Remove native-large.iso' }).click();
+    if (failOnce) {
+      await expect(page.getByRole('status')).toContainText('collection retained');
+      await expect(row).toBeVisible();
+      await row.getByRole('button', { name: 'Remove native-large.iso' }).click();
+    }
+    await expect(row).toHaveCount(0);
+    const releases = await page.evaluate(() => (window as unknown as { releasedSourceIds: string[][] }).releasedSourceIds);
+    expect(releases).toEqual(Array.from({ length: failOnce ? 2 : 1 }, () => [`src_${'a'.repeat(64)}`]));
+    await expectNoDemoContent(page);
+  });
+}
+
+test('clear library releases remaining native sources in one batch after duplicate cleanup', async ({ page }) => {
+  await installNativeBridge(page);
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Import folder', exact: true }).click();
+  await expect(page.locator('.image-row')).toHaveCount(2);
+  await page.locator('nav').getByRole('button', { name: 'Image library' }).click();
+  await page.getByRole('button', { name: 'Clear library', exact: true }).click();
+  await expect(page.locator('.image-row')).toHaveCount(0);
+  const releases = await page.evaluate(() => (window as unknown as { releasedSourceIds: string[][] }).releasedSourceIds);
+  expect(releases).toEqual([[`src_${'d'.repeat(64)}`], [`src_${'b'.repeat(64)}`, `src_${'c'.repeat(64)}`]]);
+  await expectNoDemoContent(page);
+});
+
+test('failed duplicate cleanup keeps an error row that can release its source on removal', async ({ page }) => {
+  await installNativeBridge(page, { releaseFailures: 1 });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Import folder', exact: true }).click();
+  await expect(page.locator('.image-row')).toHaveCount(3);
+  const row = page.locator('.image-row').filter({ has: page.locator('.source-id').getByText(`src_${'d'.repeat(64)}`, { exact: true }) });
+  await expect(row).toContainText('source release failed');
+  await row.getByRole('button', { name: 'Remove MAC/BOOT.ISO' }).click();
+  await expect(row).toHaveCount(0);
+  await expect(page.locator('.image-row')).toHaveCount(2);
+  const releases = await page.evaluate(() => (window as unknown as { releasedSourceIds: string[][] }).releasedSourceIds);
+  expect(releases).toEqual([[`src_${'d'.repeat(64)}`], [`src_${'d'.repeat(64)}`]]);
+});
+
+
+test('native reload restores retained source IDs and removed sources stay absent', async ({ page }) => {
+  await installNativeBridge(page);
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Add images', exact: true }).click();
+  await expect(page.locator('.image-row')).toHaveCount(1);
+  await page.reload();
+  const row = page.locator('.image-row').filter({ hasText: 'native-large.iso' });
+  await expect(row).toContainText(`src_${'a'.repeat(64)}`);
+  expect(await nativeCommands(page)).toEqual(['capabilities', 'list_sources', 'inspect_devices']);
+  await row.getByRole('button', { name: 'Remove native-large.iso' }).click();
+  await expect(row).toHaveCount(0);
+  await page.reload();
+  await expect(page.locator('.target-panel')).toContainText('host-system-unique-id');
+  await expect(page.locator('.image-row')).toHaveCount(0);
+  await expectNoDemoContent(page);
+});
+
+test('native source listing failure stays visible and disables new imports without loading fixtures', async ({ page }) => {
+  await installNativeBridge(page, { sourceListError: 'Source catalogue unavailable' });
+  await page.goto('/?demo=1');
+  await expect(page.getByText(/Native source listing failed: Source catalogue unavailable/)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Add images', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Import folder', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Retry source listing', exact: true })).toBeEnabled();
+  await expect(page.locator('.image-row')).toHaveCount(0);
+  await expectNoDemoContent(page);
 });

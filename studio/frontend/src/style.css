@@ -342,3 +342,6 @@ main { padding: 20px; }
 .host-device summary { cursor: pointer; }
 .host-device pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #b9cbd4; font: 10px/1.6 ui-monospace, 'SFMono-Regular', Consolas, monospace; }
 @media (max-width: 640px) { .host-device-list { grid-template-columns: 1fr; } .inventory-dialog { max-height: calc(100vh - 28px); } }
+
+.source-cell { min-width: 110px; max-width: 180px; }
+.source-id { display: block; margin-top: 4px; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }

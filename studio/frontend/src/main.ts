@@ -3,7 +3,8 @@
 import './style.css';
 import { bridge, bridgeMode, initialImages, isDemo, isNative, nativeHost } from './bridge';
 import { icon } from './icons';
-import { nativeMediaImage, inspectionRecords, preparationUnavailable, type HostInventory, type StudioCapabilities } from './native';
+import { mergeNativeImages, removeMediaImages } from './image_lifecycle';
+import { nativeImageForDisplay, inspectionRecords, preparationUnavailable, type HostInventory, type StudioCapabilities } from './native';
 import { browserRelativePath, destinationKey, canSimulate, challengeFor, confirmationMatches, escapeHTML as esc, fileProblem, formatBytes, safeFileName, type DiskRecord, type DiskPlan, type MediaImage } from './state';
 
 type Tab = 'prepare' | 'images' | 'settings' | 'activity' | 'launcher';
@@ -26,6 +27,10 @@ let planLoading = false;
 let refreshing = false;
 let busy = false;
 let pickingImages = false;
+let releasingImages = false;
+let sourcesLoaded = false;
+let sourcesLoading = false;
+let sourcesError = '';
 let progress = 0;
 let complete = false;
 let runTitle = '';
@@ -45,12 +50,12 @@ const powerLabels = { reboot: 'Reboot', shutdown: 'Shut down', firmware_setup: '
 const options = { netboot: true, systemInfo: true, memtest: true, timeout: 10, theme: 'midnight', policy: 'enforce', power: { reboot: true, shutdown: true, firmware_setup: true } };
 let images: MediaImage[] = initialImages;
 let logs: Log[] = [{ time: new Date().toISOString(), title: 'Session started', detail: `${bridgeMode}. Physical preparation unavailable.`, kind: 'info' }];
-const canImport = () => capabilities?.file_import === true;
+const canImport = () => capabilities?.file_import === true && (!isNative || sourcesLoaded) && !sourcesLoading;
 const exactBytes = (bytes: number) => `${bytes.toLocaleString('en-GB')} bytes`;
 const imagePath = (image: MediaImage) => image.relativePath || image.name;
 const sumBytes = () => images.reduce((sum, image) => sum + image.size, 0);
 const pendingImages = () => images.some(image => image.status === 'hashing' || image.status === 'error');
-const runAllowed = () => isDemo && !!plan && !planLoading && !planError && !pickingImages && !pendingImages() && canSimulate(selected, confirmation, sumBytes(), busy);
+const runAllowed = () => isDemo && !!plan && !planLoading && !planError && !pickingImages && !releasingImages && !pendingImages() && canSimulate(selected, confirmation, sumBytes(), busy);
 function log(title: string, detail: string, kind: Log['kind'] = 'info') { logs.unshift({ time: new Date().toISOString(), title, detail, kind }); }
 function notify(message: string) { toast = message; clearTimeout(toastTimer); renderToast(); toastTimer = setTimeout(() => { toast = ''; renderToast(); }, 6000); }
 function renderToast() { const node = document.querySelector('#toast'); if (node) { node.textContent = toast; node.classList.toggle('visible', !!toast); } }
@@ -82,10 +87,10 @@ function prepareView() {
       <section class="panel options-panel"><div class="panel-heading"><h2>Configuration preview</h2><button class="text-button" data-tab="settings">Edit configuration</button></div>${optionRow('netboot', 'globe', 'Network boot', 'Include netboot.xyz in the configuration.', options.netboot)}${optionRow('systemInfo', 'monitor', 'System information', 'Show hardware details in the launcher preview.', options.systemInfo)}<div class="option-note">Secure Boot policy: <strong>${esc(options.policy)}</strong><span>Configuration only. Boot chain not implemented.</span></div></section>
     </div><aside class="detail-column">${targetPanel()}${layoutPanel()}</aside></div>`;
 }
-function dropZone() { return `<div class="add-images"><button class="secondary-button dropzone" id="dropzone" ${busy || pickingImages || !canImport() ? 'disabled' : ''}>${icon(pickingImages ? 'activity' : 'plus')}${pickingImages ? 'Reading selected images…' : 'Add images'}</button><button class="secondary-button" id="import-folder" ${busy || pickingImages || !canImport() ? 'disabled' : ''}>Import folder</button><span>${isNative ? 'Native picker: Rust streaming SHA-256, no preview size cap. Browser drop: 512 MiB maximum.' : isDemo ? 'Browser intake: WebCrypto SHA-256; 512 MiB per file. Desktop picker streams larger files.' : 'Local file import requires the native desktop runtime or explicit browser demo.'} Folder paths are relative to the selected directory.</span></div>`; }
+function dropZone() { return `<div class="add-images"><button class="secondary-button dropzone" id="dropzone" ${busy || pickingImages || releasingImages || !canImport() ? 'disabled' : ''}>${icon(pickingImages ? 'activity' : 'plus')}${pickingImages ? 'Reading selected images…' : 'Add images'}</button><button class="secondary-button" id="import-folder" ${busy || pickingImages || releasingImages || !canImport() ? 'disabled' : ''}>Import folder</button><span>${isNative ? 'Native picker: Rust streaming SHA-256, no preview size cap. Browser drop: 512 MiB maximum.' : isDemo ? 'Browser intake: WebCrypto SHA-256; 512 MiB per file. Desktop picker streams larger files.' : 'Local file import requires the native desktop runtime or explicit browser demo.'} Folder paths are relative to the selected directory.</span>${sourcesLoading ? '<span>Restoring retained native sources…</span>' : sourcesError ? `<p class="error-text">${esc(sourcesError)}</p><button class="text-button" id="retry-sources">Retry source listing</button>` : ''}</div>`; }
 function imageTable(items: MediaImage[]) { return `<table class="image-table"><thead><tr><th scope="col">Relative path</th><th scope="col">Size</th><th scope="col">Source</th><th scope="col">SHA-256</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead><tbody>${items.map(imageRow).join('')}</tbody></table>`; }
 function imageRow(image: MediaImage) {
-  return `<tr class="image-row"><td class="image-name">${esc(imagePath(image))}</td><td class="size-cell">${formatBytes(image.size)}<small class="exact-value">${exactBytes(image.size)}</small></td><td>${image.sample ? 'Sample' : image.origin === 'native' ? 'Native' : 'Browser'}</td><td class="hash-cell">${image.sample ? '<span class="subtle">No file loaded</span>' : image.status === 'hashing' ? 'SHA-256: computing' : image.status === 'error' ? `<span class="error-text">${esc(image.error || 'Failed')}</span>` : `<code>${image.hash!}</code><small>Hash only · publisher not verified</small>`}</td><td class="row-actions">${image.hash ? `<button class="icon-button copy-hash" data-id="${image.id}" aria-label="Copy SHA-256 for ${esc(imagePath(image))}" title="Copy SHA-256">${icon('copy')}</button>` : ''}<button class="icon-button remove-image" data-id="${image.id}" aria-label="Remove ${esc(imagePath(image))}" title="Remove image" ${busy ? 'disabled' : ''}>${icon('close')}</button></td></tr>`;
+  return `<tr class="image-row"><td class="image-name">${esc(imagePath(image))}</td><td class="size-cell">${formatBytes(image.size)}<small class="exact-value">${exactBytes(image.size)}</small></td><td class="source-cell">${image.sample ? 'Sample' : image.origin === 'native' ? 'Native' : 'Browser'}${image.sourceId ? `<code class="source-id">${esc(image.sourceId)}</code>` : ''}</td><td class="hash-cell">${image.sample ? '<span class="subtle">No file loaded</span>' : image.status === 'hashing' ? 'SHA-256: computing' : image.status === 'error' ? `<span class="error-text">${esc(image.error || 'Failed')}</span>` : `<code>${image.hash!}</code><small>Hash only · publisher not verified</small>`}</td><td class="row-actions">${image.hash ? `<button class="icon-button copy-hash" data-id="${image.id}" aria-label="Copy SHA-256 for ${esc(imagePath(image))}" title="Copy SHA-256">${icon('copy')}</button>` : ''}<button class="icon-button remove-image" data-id="${image.id}" aria-label="Remove ${esc(imagePath(image))}" title="Remove image" ${busy || pickingImages || releasingImages ? 'disabled' : ''}>${icon('close')}</button></td></tr>`;
 }
 function optionRow(key: string, _glyph: string, title: string, detail: string, checked: boolean) { return `<label class="option-row"><input class="toggle-input" type="checkbox" data-option="${key}" ${checked ? 'checked' : ''} ${busy ? 'disabled' : ''}/><span class="option-copy"><strong>${title}</strong><small>${detail}</small></span></label>`; }
 function powerSettings() {
@@ -126,7 +131,7 @@ function layoutPanel() {
   const partitions = plan?.partitions || [];
   return `<section class="panel layout-panel"><div class="panel-heading"><h3>Partition plan</h3><span class="subtle">GPT / 1 MiB alignment</span></div>${planLoading ? '<p class="subtle">Calculating partition boundaries…</p>' : planError ? `<p class="error-notice">${esc(planError)}</p>` : plan ? `<div class="geometry"><div class="geometry-summary">Logical sector: ${plan.logical_sector_size} bytes<br/>Device: ${exactBytes(plan.size_bytes)}</div>${partitions.map(part => `<section class="partition-details"><h4>${esc(part.name)}</h4><dl><div><dt>Start LBA</dt><dd>${part.start_lba.toLocaleString('en-GB')}</dd></div><div><dt>End LBA</dt><dd>${part.end_lba.toLocaleString('en-GB')}</dd></div><div><dt>Sectors</dt><dd>${(part.end_lba - part.start_lba + 1).toLocaleString('en-GB')}</dd></div><div><dt>Size</dt><dd>${exactBytes((part.end_lba - part.start_lba + 1) * plan!.logical_sector_size)}</dd></div></dl></section>`).join('')}</div>` : '<p class="subtle">Choose a device to calculate the layout.</p>'}</section>`;
 }
-function imagesView() { const filtered = images.filter(image => imagePath(image).toLowerCase().includes(query.toLowerCase())); return `${titleBlock('', 'Images', 'Local SHA-256 fingerprints. Publisher verification is not connected.', isDemo ? `<button class="secondary-button" id="load-samples" ${busy ? 'disabled' : ''}>Load samples</button>` : '')}<section class="panel library-panel">${dropZone()}<div class="library-toolbar"><h2>Image library <span class="count">${images.length}</span></h2><label class="search-field">${icon('search')}<input id="image-search" type="search" value="${esc(query)}" aria-label="Search images" placeholder="Filter filenames"/></label></div><div class="image-list" id="filtered-images">${filtered.length ? imageTable(filtered) : '<div class="empty-inline">No matching images.</div>'}</div><div class="panel-foot"><span>${isDemo ? 'Sample entries contain no files. ' : ''}Fingerprints are cleared on reload.</span><span>${formatBytes(sumBytes())} total</span></div></section>`; }
+function imagesView() { const filtered = images.filter(image => imagePath(image).toLowerCase().includes(query.toLowerCase())); return `${titleBlock('', 'Images', 'Local SHA-256 fingerprints. Publisher verification is not connected.', isDemo ? `<button class="secondary-button" id="load-samples" ${busy ? 'disabled' : ''}>Load samples</button>` : '')}<section class="panel library-panel">${dropZone()}<div class="library-toolbar"><h2>Image library <span class="count">${images.length}</span></h2><button class="text-button" id="clear-images" ${busy || pickingImages || releasingImages || !images.length ? 'disabled' : ''}>${releasingImages ? 'Releasing sources…' : 'Clear library'}</button><label class="search-field">${icon('search')}<input id="image-search" type="search" value="${esc(query)}" aria-label="Search images" placeholder="Filter filenames"/></label></div><div class="image-list" id="filtered-images">${filtered.length ? imageTable(filtered) : '<div class="empty-inline">No matching images.</div>'}</div><div class="panel-foot"><span>${isDemo ? 'Sample entries contain no files. ' : ''}${isNative ? 'Native sources stay open until removed or the application exits. Reload restores the catalogue; hashes are from import time.' : 'Browser fingerprints are cleared on reload.'}</span><span>${formatBytes(sumBytes())} total</span></div></section>`; }
 function settingsView() { return `${titleBlock('', 'Configuration', 'Edit and export YAML or TOML. Changes are not applied to a drive.')}<div class="settings-grid"><section class="panel"><div class="panel-heading"><h2>Boot settings</h2><span class="badge">Preview</span></div>${optionRow('netboot', 'globe', 'Include network boot', 'Add netboot.xyz to the planned boot menu.', options.netboot)}${optionRow('memtest', 'activity', 'Include memory test', 'Add a Memtest86+ entry to the preview.', options.memtest)}${optionRow('systemInfo', 'monitor', 'Show system information', 'Hardware details in the launcher preview.', options.systemInfo)}${powerSettings()}<label class="field-row"><span><strong>Boot timeout</strong><small>Seconds before default selection.</small></span><input id="timeout" type="number" min="0" max="300" value="${options.timeout}"/></label><label class="field-row"><span><strong>Secure Boot policy</strong><small>Configuration only; not enforced here.</small></span><select id="policy">${['enforce', 'prompt', 'off'].map(policy => `<option ${options.policy === policy ? 'selected' : ''}>${policy}</option>`).join('')}</select></label><label class="field-row"><span><strong>Launcher theme</strong><small>Used in the launcher preview.</small></span><select id="theme">${['midnight', 'aurora'].map(theme => `<option ${options.theme === theme ? 'selected' : ''}>${theme}</option>`).join('')}</select></label><div class="settings-note">${icon('info')} Boot payloads and security enforcement are not implemented.</div></section><section class="panel config-panel"><div class="panel-heading"><h2>Configuration source</h2><div class="segmented" aria-label="Configuration format"><button data-format="yaml" class="${configFormat === 'yaml' ? 'selected' : ''}">YAML</button><button data-format="toml" class="${configFormat === 'toml' ? 'selected' : ''}">TOML</button></div></div><div class="editor-label"><span class="status-dot"></span> isohopper.${configFormat === 'yaml' ? 'yml' : 'toml'}<span>LOCAL PREVIEW</span></div><textarea id="config-editor" aria-label="Configuration source" spellcheck="false">${esc(configText())}</textarea><div class="config-actions"><button class="secondary-button" id="validate-config">${icon('check')} Validate</button><button class="secondary-button" id="reset-config">Reset from settings</button><button class="primary-button compact" id="download-config">${icon('download')} Export</button></div>${configResult ? `<div class="config-result" role="status">${esc(configResult)}</div>` : ''}<p class="subtle editor-note">Changing form settings or format replaces manual edits. Export edits first.</p></section></div>`; }
 function activityView() { return `${titleBlock('', 'Activity', isDemo ? 'File hashing and simulation events for this session.' : 'Host inventory and local file hashing events for this session.', '<button class="secondary-button" id="export-activity">'+icon('download')+' Export activity</button>')}<section class="panel activity-panel"><div class="panel-heading"><h2>This session <span class="count">${logs.length}</span></h2><button class="text-button" id="clear-activity">Clear activity</button></div>${logs.length ? logs.map(item => `<article class="log-row"><span class="log-symbol ${item.kind}">[${item.kind === 'success' ? 'OK' : item.kind === 'warning' ? 'WARN' : 'INFO'}]</span><div><strong>${esc(item.title)}</strong><p>${esc(item.detail)}</p></div><time>${item.time}</time></article>`).join('') : '<div class="empty-state">No events.</div>'}</section>`; }
 function launcherView() {
@@ -170,6 +175,7 @@ function bindEvents() {
   document.querySelector('#simulate')?.addEventListener('click', simulate);
   const dropzone = document.querySelector<HTMLButtonElement>('#dropzone');
   if (dropzone) { dropzone.onclick = () => void browseImages(); dropzone.ondragover = event => { event.preventDefault(); dropzone.classList.add('dragging'); }; dropzone.ondragleave = () => dropzone.classList.remove('dragging'); dropzone.ondrop = event => { event.preventDefault(); dropzone.classList.remove('dragging'); if (!busy) void addFiles(Array.from(event.dataTransfer?.files || [])); }; }
+  document.querySelector('#retry-sources')?.addEventListener('click', () => void restoreSources());
   document.querySelector('#import-folder')?.addEventListener('click', () => void browseImages('folder'));
   document.querySelector<HTMLInputElement>('#folder-input')!.onchange = event => void addFiles(Array.from((event.target as HTMLInputElement).files || []));
   document.querySelector<HTMLInputElement>('#file-input')!.onchange = event => void addFiles(Array.from((event.target as HTMLInputElement).files || []));
@@ -177,7 +183,7 @@ function bindEvents() {
   document.querySelectorAll<HTMLInputElement>('[data-option]').forEach(input => input.onchange = () => { (options as unknown as Record<string, boolean>)[input.dataset.option!] = input.checked; customConfig = undefined; configResult = ''; complete = false; render(); });
   document.querySelectorAll<HTMLInputElement>('[data-power-option]').forEach(input => input.onchange = () => { options.power[input.dataset.powerOption as keyof typeof options.power] = input.checked; customConfig = undefined; configResult = ''; complete = false; render(); });
   document.querySelectorAll<HTMLButtonElement>('[data-power-preview]').forEach(button => button.onclick = () => { const action = button.dataset.powerPreview as keyof typeof powerLabels; notify(`${powerLabels[action]}: preview only. No host action performed.`); });
-  document.querySelector('#load-samples')?.addEventListener('click', () => { if (!isDemo || busy) return; if (!images.some(image => image.id === 'sample-linux')) images.push({ id: 'sample-linux', name: 'linux-desktop-demo.iso', size: 4_800_000_000, sample: true, status: 'sample' }); if (!images.some(image => image.id === 'sample-recovery')) images.push({ id: 'sample-recovery', name: 'recovery-toolkit-demo.img', size: 1_600_000_000, sample: true, status: 'sample' }); complete = false; log('Sample manifest loaded', 'Two illustrative entries. No image data loaded or downloaded.'); render(); });
+  document.querySelector('#load-samples')?.addEventListener('click', () => { if (!isDemo || busy || releasingImages) return; if (!images.some(image => image.id === 'sample-linux')) images.push({ id: 'sample-linux', name: 'linux-desktop-demo.iso', size: 4_800_000_000, sample: true, status: 'sample' }); if (!images.some(image => image.id === 'sample-recovery')) images.push({ id: 'sample-recovery', name: 'recovery-toolkit-demo.img', size: 1_600_000_000, sample: true, status: 'sample' }); complete = false; log('Sample manifest loaded', 'Two illustrative entries. No image data loaded or downloaded.'); render(); });
   document.querySelector<HTMLInputElement>('#image-search')?.addEventListener('input', event => { query = (event.target as HTMLInputElement).value; const filtered = images.filter(image => imagePath(image).toLowerCase().includes(query.toLowerCase())); document.querySelector('#filtered-images')!.innerHTML = filtered.length ? imageTable(filtered) : '<div class="empty-inline">No matching images.</div>'; bindImageActions(); });
   document.querySelectorAll<HTMLButtonElement>('[data-format]').forEach(button => button.onclick = () => { configFormat = button.dataset.format!; customConfig = undefined; configResult = ''; render(); });
   document.querySelector<HTMLTextAreaElement>('#config-editor')?.addEventListener('input', event => { customConfig = (event.target as HTMLTextAreaElement).value; configResult = ''; document.querySelector('.config-result')?.remove(); });
@@ -191,16 +197,49 @@ function bindEvents() {
   document.querySelectorAll<HTMLButtonElement>('[data-boot]').forEach(button => button.onclick = () => { launcherChoice = Number(button.dataset.boot); render(); document.querySelector<HTMLButtonElement>(`[data-boot="${launcherChoice}"]`)?.focus(); });
 }
 function bindImageActions() {
-  document.querySelectorAll<HTMLButtonElement>('.remove-image').forEach(button => button.onclick = () => { if (busy) return; const image = images.find(item => item.id === button.dataset.id); if (!image) return; images = images.filter(item => item.id !== image.id); complete = false; log('Image removed from collection', imagePath(image)); render(); });
+  document.querySelectorAll<HTMLButtonElement>('.remove-image').forEach(button => button.onclick = () => void removeImages(new Set([button.dataset.id!])));
+  const clear = document.querySelector<HTMLButtonElement>('#clear-images');
+  if (clear) clear.onclick = () => void removeImages(new Set(images.map(image => image.id)));
   document.querySelectorAll<HTMLButtonElement>('.copy-hash').forEach(button => button.onclick = async () => { const image = images.find(item => item.id === button.dataset.id); if (!image?.hash) return; try { await navigator.clipboard.writeText(image.hash); notify(`SHA-256 copied: ${image.hash}`); } catch { notify('Clipboard access failed. Select and copy the full checksum from the table.'); } });
+}
+async function removeImages(rowIds: ReadonlySet<string>) {
+  if (busy || pickingImages || releasingImages) return;
+  releasingImages = true; render();
+  try {
+    const removed = images.filter(image => rowIds.has(image.id));
+    images = await removeMediaImages(images, rowIds, bridge.ReleaseSources);
+    complete = false;
+    for (const image of removed) log('Image removed from collection', `path=${imagePath(image)}${image.sourceId ? ` source_id=${image.sourceId} status=${images.some(other => other.sourceId === image.sourceId) ? 'retained-by-another-row' : 'released'}` : ''}`);
+  } catch (error) {
+    const message = `Image removal failed; collection retained. ${errorMessage(error)}`;
+    log('Source release failed', message, 'warning'); notify(message);
+  } finally { releasingImages = false; render(); }
 }
 function closeDialog() { deviceDialog = false; render(); document.querySelector<HTMLButtonElement>('#choose-drive')?.focus(); }
 document.addEventListener('keydown', event => { if (!deviceDialog && !inventoryDialog) return; if (event.key === 'Escape') { if (inventoryDialog) closeInventory(); else closeDialog(); } if (event.key === 'Tab') { const dialog = document.querySelector(inventoryDialog ? '.inventory-dialog' : '.device-dialog'); const items = Array.from(dialog?.querySelectorAll<HTMLElement>('button:not(:disabled), summary') || []); const first = items[0]; const last = items[items.length - 1]; if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); } else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); } } });
+async function restoreSources() {
+  if (!isNative || sourcesLoading || pickingImages || releasingImages) return;
+  sourcesLoading = true; sourcesError = ''; render();
+  try {
+    if (!bridge.ListSources) throw new Error('Native source listing is unavailable.');
+    const retained = await bridge.ListSources();
+    const restored = retained.map(record => nativeImageForDisplay(record, crypto.randomUUID()));
+    // Rehydration is read-only: even conflicting imported destinations retain
+    // their own visible rows and IDs so each handle can be released explicitly.
+    images = [...images.filter(image => image.origin !== 'native'), ...restored];
+    sourcesLoaded = true;
+    log('Native sources restored', `count=${restored.length} hashes=import-time rehashed=false`);
+  } catch (error) {
+    sourcesError = `Native source listing failed: ${errorMessage(error)} Import is disabled until the catalogue is restored.`;
+    log('Native source listing failed', sourcesError, 'warning');
+  } finally { sourcesLoading = false; render(); }
+}
 async function loadDevices() {
-  if (busy || refreshing || pickingImages || inspectingHost) return;
+  if (busy || refreshing || pickingImages || inspectingHost || releasingImages || sourcesLoading) return;
   refreshing = true; capabilities = undefined; deviceError = ''; confirmation = ''; complete = false; render();
   try {
     capabilities = await bridge.Capabilities();
+    if (isNative && !sourcesLoaded) await restoreSources();
     if (isDemo) {
       disks = await bridge.ListDisks();
       selected = disks.find(record => record.disk.id === selected?.disk.id && record.verdict.state !== 'blocked') || disks.find(record => record.verdict.state === 'ok');
@@ -226,7 +265,7 @@ async function loadPlan() {
   finally { if (selected?.disk.id === id) { planLoading = false; render(); } }
 }
 async function browseImages(mode: 'files' | 'folder' = 'files') {
-  if (busy || pickingImages || !canImport()) return;
+  if (busy || pickingImages || releasingImages || !canImport()) return;
   const picker = mode === 'folder' ? bridge.PickDirectory : bridge.PickImages;
   if (!picker) { document.querySelector<HTMLInputElement>(mode === 'folder' ? '#folder-input' : '#file-input')?.click(); return; }
   pickingImages = true; complete = false; render();
@@ -235,35 +274,36 @@ async function browseImages(mode: 'files' | 'folder' = 'files') {
     const picked = Array.isArray(selection) ? selection : selection.images;
     const warnings = Array.isArray(selection) ? [] : selection.warnings;
     for (const warning of warnings) log('Directory import warning', warning, 'warning');
-    let added = 0;
-    for (const record of picked) {
-      const image = nativeMediaImage(record, crypto.randomUUID());
-      if (images.some(existing => !existing.sample && destinationKey(existing) === destinationKey(image))) { log('Destination skipped', `path=${imagePath(image)} reason=destination-already-present`, 'warning'); continue; }
-      images.push(image); added++;
-      log('Native SHA-256 calculated', `path=${imagePath(image)} bytes=${image.size} source=native algorithm=SHA-256 status=hash-only digest=${image.hash} publisher_verified=false`, 'success');
-    }
-    if (warnings.length) notify(`${added} images added; ${warnings.length} directory warning(s). ${warnings[0]} See Activity for all warnings.`);
-    else if (picked.length) notify(`${added} image${added === 1 ? '' : 's'} added. SHA-256 only; publisher not verified.`);
-  } catch {
-    const message = 'Native image selection failed. Check that the selected files are readable.';
+    const incoming = picked.map(record => nativeImageForDisplay(record, crypto.randomUUID()));
+    const result = await mergeNativeImages(images, incoming, bridge.ReleaseSources);
+    images = result.images;
+    for (const image of result.added) log(image.status === 'error' ? 'Native metadata rejected' : 'Native SHA-256 calculated', `path=${imagePath(image)} bytes=${image.size} source=native source_id=${image.sourceId || 'unavailable'} algorithm=SHA-256 status=${image.status === 'error' ? 'error' : 'hash-only'} digest=${image.hash || 'unavailable'} publisher_verified=false`, image.status === 'error' ? 'warning' : 'success');
+    for (const image of result.skipped) log('Destination skipped', `path=${imagePath(image)} reason=destination-already-present${image.sourceId ? ` source_id=${image.sourceId} status=released-or-retained-by-existing-row` : ''}`, 'warning');
+    if (result.releaseError) { log('Source release failed', result.releaseError, 'warning'); notify(`Duplicate source release failed: ${result.releaseError} Remove the error row to retry.`); }
+    else if (warnings.length) notify(`${result.added.length} images added; ${warnings.length} directory warning(s). ${warnings[0]} See Activity for all warnings.`);
+    else if (picked.length) notify(`${result.added.length} image${result.added.length === 1 ? '' : 's'} added. SHA-256 only; publisher not verified.`);
+  } catch (error) {
+    const message = `Native image selection failed. ${errorMessage(error)}`;
     log('Image selection failed', message, 'warning'); notify(message);
   } finally { pickingImages = false; render(); }
 }
 async function addFiles(files: File[]) {
-  if (busy || pickingImages || !canImport()) return;
-  complete = false;
-  for (const file of files) {
-    const name = safeFileName(file.name); let relativePath: string;
-    try { relativePath = browserRelativePath(file.webkitRelativePath || '', file.name); } catch (error) { notify(`Invalid relative image path: ${errorMessage(error)}`); log('Image path rejected', errorMessage(error), 'warning'); continue; }
-    const problem = fileProblem(file);
-    if (problem) { notify(`${name}: ${problem}`); log('Image not added', `${name}: ${problem}`, 'warning'); continue; }
-    if (images.some(image => !image.sample && destinationKey(image) === destinationKey({ name, relativePath }))) { notify(`Destination already present: ${relativePath}`); log('Destination skipped', `path=${relativePath} reason=destination-already-present`, 'warning'); continue; }
-    const image: MediaImage = { id: crypto.randomUUID(), name, relativePath, size: file.size, sample: false, origin: 'browser', status: 'hashing' };
-    images.push(image); render();
-    try { const hash = await crypto.subtle.digest('SHA-256', await file.arrayBuffer()); if (!images.includes(image)) continue; image.hash = Array.from(new Uint8Array(hash)).map(value => value.toString(16).padStart(2, '0')).join(''); image.status = 'hashed'; log('Local fingerprint calculated', `path=${imagePath(image)} bytes=${image.size} source=browser algorithm=SHA-256 status=hash-only digest=${image.hash} publisher_verified=false`, 'success'); }
-    catch (error) { image.status = 'error'; image.error = errorMessage(error); log('Fingerprint failed', `${name}: ${image.error}`, 'warning'); }
-    render();
-  }
+  if (busy || pickingImages || releasingImages || !canImport()) return;
+  complete = false; pickingImages = true; render();
+  try {
+    for (const file of files) {
+      const name = safeFileName(file.name); let relativePath: string;
+      try { relativePath = browserRelativePath(file.webkitRelativePath || '', file.name); } catch (error) { notify(`Invalid relative image path: ${errorMessage(error)}`); log('Image path rejected', errorMessage(error), 'warning'); continue; }
+      const problem = fileProblem(file);
+      if (problem) { notify(`${name}: ${problem}`); log('Image not added', `${name}: ${problem}`, 'warning'); continue; }
+      if (images.some(image => !image.sample && destinationKey(image) === destinationKey({ name, relativePath }))) { notify(`Destination already present: ${relativePath}`); log('Destination skipped', `path=${relativePath} reason=destination-already-present`, 'warning'); continue; }
+      const image: MediaImage = { id: crypto.randomUUID(), name, relativePath, size: file.size, sample: false, origin: 'browser', status: 'hashing' };
+      images.push(image); render();
+      try { const hash = await crypto.subtle.digest('SHA-256', await file.arrayBuffer()); if (!images.includes(image)) continue; image.hash = Array.from(new Uint8Array(hash)).map(value => value.toString(16).padStart(2, '0')).join(''); image.status = 'hashed'; log('Local fingerprint calculated', `path=${imagePath(image)} bytes=${image.size} source=browser algorithm=SHA-256 status=hash-only digest=${image.hash} publisher_verified=false`, 'success'); }
+      catch (error) { image.status = 'error'; image.error = errorMessage(error); log('Fingerprint failed', `${name}: ${image.error}`, 'warning'); }
+      render();
+    }
+  } finally { pickingImages = false; render(); }
 }
 async function simulate() {
   if (!runAllowed() || !selected) return;
