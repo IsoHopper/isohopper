@@ -23,10 +23,26 @@ $cache = Join-Path $settingsRoot 'installer-test-cache.bin'
 [IO.File]::WriteAllBytes($cache, [byte[]](1, 9, 2, 8, 3, 7))
 $sentinels = @{}
 foreach ($path in @($settings, $cache)) { $sentinels[$path] = (Get-FileHash -LiteralPath $path).Hash }
+# Tauri CLI 2.12.4 bundle.rs patches the first marker while packaging NSIS,
+# then restores the original build file. Hash the exact packaged bytes.
+$studioPath = (Resolve-Path -LiteralPath 'studio/src-tauri/target/debug/isohopper-studio.exe').Path
+$studioBytes = [IO.File]::ReadAllBytes($studioPath)
+$originalMarker = '__TAURI_BUNDLE_TYPE_VAR_UNK'
+$packagedMarker = [Text.Encoding]::ASCII.GetBytes('__TAURI_BUNDLE_TYPE_VAR_NSS')
+$markerOffset = [Text.Encoding]::Latin1.GetString($studioBytes).IndexOf($originalMarker, [StringComparison]::Ordinal)
+if ($markerOffset -lt 0 -or $originalMarker.Length -ne $packagedMarker.Length) {
+    throw 'Missing or incompatible Tauri bundle marker; review the pinned bundler before testing.'
+}
+[Array]::Copy($packagedMarker, 0, $studioBytes, $markerOffset, $packagedMarker.Length)
 $expected = @{
-    'isohopper-studio.exe' = (Get-FileHash 'studio/src-tauri/target/debug/isohopper-studio.exe').Hash
+    'isohopper-studio.exe' = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($studioBytes))
     'isohopper-helper.exe' = (Get-FileHash 'target/debug/isohopper-helper.exe').Hash
 }
+$expectedSizes = @{
+    'isohopper-studio.exe' = $studioBytes.Length
+    'isohopper-helper.exe' = (Get-Item 'target/debug/isohopper-helper.exe').Length
+}
+$studioBytes = $null
 $registry = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\IsoHopper'
 $skipCleanup = $false
 $installerInvocation = 0
@@ -34,6 +50,7 @@ $installerInvocation = 0
 function Invoke-Installer([string]$Path, [string]$Mode, [int]$ExpectedExit = 0) {
     $script:installerInvocation++
     $label = "#$script:installerInvocation $([IO.Path]::GetFileName($Path)) $Mode"
+    $script:lastInstaller = $label
     $stderrPath = Join-Path $temporary ("installer-$script:installerInvocation.stderr.txt")
     Write-Output "Running installer $label; expected exit $ExpectedExit."
     # The parent owns this output file. Elevated setup only receives an inherited
@@ -65,8 +82,11 @@ function Assert-Settings {
 
 function Assert-Installed {
     foreach ($name in $expected.Keys) {
-        if ((Get-FileHash -LiteralPath (Join-Path $installation $name)).Hash -ne $expected[$name]) {
-            throw "Installed executable does not match this build: $name"
+        $path = Join-Path $installation $name
+        $hash = (Get-FileHash -LiteralPath $path).Hash
+        $size = (Get-Item -LiteralPath $path).Length
+        if ($hash -ne $expected[$name] -or $size -ne $expectedSizes[$name]) {
+            throw "Installed executable mismatch after $script:lastInstaller`: $name; SHA256=$hash expected=$($expected[$name]); bytes=$size expected=$($expectedSizes[$name])."
         }
     }
     if (-not (Test-Path -LiteralPath (Join-Path $installation 'uninstall.exe') -PathType Leaf)) {
