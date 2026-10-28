@@ -6,10 +6,15 @@
 mod support;
 use isohopper_core::{layout, virtualdisk};
 use isohopper_helper::{
+    raw_image_job::{
+        BootArtifactFingerprint, ImageFingerprint, PreparedRawImage, RawImageDescription,
+        RawImageError,
+    },
     windows_lock,
     windows_target::BoundTarget,
     writer::{CHUNK_BYTES, Phase, write_image},
 };
+use sha2::{Digest, Sha256};
 use std::{
     fs::OpenOptions,
     io::{self, Read, Seek, SeekFrom, Write},
@@ -46,6 +51,7 @@ fn windows_vhd_writer_persists_verified_gpt() -> Result<(), Box<dyn std::error::
     source.sync_all()?;
     virtualdisk::verify(&source_path)?;
     let expected_hash = hash_exact(&mut source)?;
+    let source_bytes = source.metadata()?.len();
 
     let mut vhd = TemporaryVhd::create(directory.path().join("writer-test.vhdx"))?;
     vhd.attach(false)?;
@@ -72,6 +78,53 @@ fn windows_vhd_writer_persists_verified_gpt() -> Result<(), Box<dyn std::error::
     // enumeration number. No serial is fabricated for a serial-less VHD.
     assert!(expected.serial.is_empty());
     assert_eq!(expected.device_id, Some(first_id));
+    // This describes the actual retained image and target. The provenance is
+    // only our generated sentinel input; this fixture contains no OS payload
+    // and passing this test establishes neither bootability nor USB safety.
+    let prepared = PreparedRawImage::new(RawImageDescription {
+        target: expected.clone(),
+        image: ImageFingerprint {
+            bytes: source_bytes,
+            sha256: expected_hash,
+        },
+        boot_artifacts: vec![BootArtifactFingerprint {
+            role: "test_sentinel".into(),
+            version: None,
+            bytes: sentinel.len() as u64,
+            sha256: Sha256::digest(&sentinel).into(),
+        }],
+    })?;
+    let digest = prepared.digest();
+    let challenge = prepared.challenge().to_owned();
+    let mut pending = prepared.into_confirmation();
+    let mut wrong_digest = digest;
+    wrong_digest[0] ^= 1;
+    assert!(matches!(
+        pending.confirm(&wrong_digest, &expected, &challenge),
+        Err(RawImageError::DigestMismatch)
+    ));
+    let mut wrong_target = expected.clone();
+    wrong_target.device_number ^= 1;
+    assert!(matches!(
+        pending.confirm(&digest, &wrong_target, &challenge),
+        Err(RawImageError::TargetMismatch)
+    ));
+    assert!(matches!(
+        pending.confirm(&digest, &expected, &format!("{challenge} ")),
+        Err(RawImageError::ChallengeMismatch)
+    ));
+    let receipt = pending.confirm(&digest, &expected, &challenge)?;
+    assert!(matches!(
+        pending.confirm(&digest, &expected, &challenge),
+        Err(RawImageError::AlreadyConfirmed)
+    ));
+    let confirmed = receipt.description();
+    assert_eq!(confirmed.target(), &expected);
+    assert_eq!(confirmed.image().bytes, source.metadata()?.len());
+    assert_eq!(confirmed.image().sha256, expected_hash);
+    // All rejected attempts and the single successful confirmation above
+    // precede any volume lock or raw write. The receipt describes the job;
+    // the disposable VHD fixture independently establishes the allowed target.
     let (physical_path, number) = vhd.physical_path()?;
     let read_only = OpenOptions::new()
         .read(true)
@@ -80,7 +133,7 @@ fn windows_vhd_writer_persists_verified_gpt() -> Result<(), Box<dyn std::error::
     assert_readback_binding(&read_only, number)?;
     // SAFETY: this is a synchronous read-only whole-device handle obtained
     // only from the retained, newly created VHD fixture. No host disk selected.
-    let binding = unsafe { BoundTarget::from_owned_handle(read_only.into(), &expected)? };
+    let binding = unsafe { BoundTarget::from_owned_handle(read_only.into(), confirmed.target())? };
     assert!(binding.observation().coverage.partitions.is_empty());
     let mut device = windows_lock::lock_observed(device, binding)?;
     assert_eq!(device.locked_volume_count(), 0);
@@ -91,8 +144,8 @@ fn windows_vhd_writer_persists_verified_gpt() -> Result<(), Box<dyn std::error::
     let report = write_image(
         &mut device,
         &mut source,
-        &expected,
-        expected_hash,
+        confirmed.target(),
+        confirmed.image().sha256,
         &AtomicBool::new(false),
         |progress| {
             assert_eq!(progress.total_bytes, CAPACITY);
@@ -147,7 +200,7 @@ fn windows_vhd_writer_persists_verified_gpt() -> Result<(), Box<dyn std::error::
     vhd.detach()?;
     virtualdisk::verify(&persisted_path)?;
     println!(
-        "VHD integration passed: checked target-to-lock handoff and first-write gate; {CAPACITY} bytes written and read back after intended GPT change; read-only reattachment digest and primary/backup GPT verified; no USB hardware exercised"
+        "VHD integration passed: exact one-shot raw-image confirmation, checked target-to-lock handoff and first-write gate; {CAPACITY} bytes written and read back after intended GPT change; read-only reattachment digest and primary/backup GPT verified; generated test image only, no OS boot or USB hardware exercised"
     );
     Ok(())
 }
