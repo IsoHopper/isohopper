@@ -167,14 +167,15 @@ pub(super) fn exercise(sealed: SealedStage, root: Root, entries: Vec<CopyEntry>)
     };
     let mut owner = OwnedStageDisk::create_under(root, geometry).unwrap();
     owner.attach(false).unwrap();
-    let view = View::open(&owner).unwrap();
+    let mut view = View::open(&owner).unwrap();
+    view.verify_blank(&AtomicBool::new(false)).unwrap();
     let expected = view.snapshot.clone();
     // SAFETY: read-only synchronous handle from this exact newly owned VHD.
     let target =
         unsafe { BoundTarget::from_owned_handle(view.file.try_clone().unwrap().into(), &expected) }
             .unwrap();
     assert!(target.observation().coverage.partitions.is_empty());
-    assert_eq!(target.observation().coverage.partition_style, 2);
+    assert!([0, 2].contains(&target.observation().coverage.partition_style));
     drop(view);
     let stage = sealed.bind_target(&expected).unwrap();
     let description = || {

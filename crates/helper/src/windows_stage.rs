@@ -42,6 +42,8 @@ mod policy;
 pub use native::{OwnedStageDisk, SealedStage, TargetBoundStage, build};
 
 #[cfg(any(windows, test))]
+mod blank;
+#[cfg(any(windows, test))]
 mod build_policy;
 #[cfg(any(windows, test))]
 mod host_policy;

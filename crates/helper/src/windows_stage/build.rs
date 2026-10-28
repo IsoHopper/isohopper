@@ -333,11 +333,8 @@ fn build_under(
         .map_err(|e| context("build pinned engine seed", e))?;
     let digest = hash(&mut seed, geometry.size_bytes, cancel)?;
     owner.attach(false)?;
-    let view = View::open(&owner)?;
-    let coverage = view.coverage()?;
-    if coverage.partition_style != 2 || !coverage.partitions.is_empty() {
-        return Err(StageError::Invalid("new VHD is not blank RAW"));
-    }
+    let mut view = View::open(&owner)?;
+    view.verify_blank(cancel)?;
     let facts = view.facts();
     let mut writer = view.writer()?;
     write_image(

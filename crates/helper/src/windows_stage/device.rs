@@ -157,6 +157,20 @@ impl<'a> View<'a> {
         self.check()?;
         Ok(value)
     }
+    pub(super) fn verify_blank(
+        &mut self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), StageError> {
+        let before = self.coverage()?;
+        super::super::blank::verify(&mut self.file, &before, cancel)?;
+        self.check()?;
+        if self.coverage()? != before {
+            return Err(StageError::Invalid(
+                "blank stage layout changed during readback",
+            ));
+        }
+        Ok(())
+    }
     pub(super) fn writer(&self) -> Result<WindowsRawDevice, StageError> {
         self.check()?;
         let file = OpenOptions::new()
@@ -167,7 +181,8 @@ impl<'a> View<'a> {
             .open(&self.path)
             .map_err(|e| error("open owned VHD writer", e))?;
         // SAFETY: private synchronous unbuffered write-through handle for a NEW
-        // owned VHD. Caller verified RAW/empty layout, so no filesystem locks exist.
+        // owned VHD. Caller verified an empty layout and all-zero contents;
+        // this private disk has no existing filesystems to lock.
         let device = unsafe { WindowsRawDevice::from_owned_handle(file.into()) }
             .map_err(|e| error("validate owned VHD writer", e))?;
         if device.initial_snapshot() != &self.snapshot {
