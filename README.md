@@ -18,6 +18,7 @@ Public releases are on hold until real USB preparation and operating-system boot
 - Read-only macOS, Linux and Windows device inspection. Host devices remain blocked from preparation.
 - Labelled mock devices, preparation simulation and typed confirmation; no disk writes.
 - New GPT test images with verified primary/backup metadata and FAT32 A/B boot slots. Existing files are refused; the data partition remains unformatted.
+- `image engine`: offline import of the exact Ventoy 1.1.18 Linux archive, bounded decoding and verified GPT/engine image creation. Data remains unformatted; this is not USB preparation.
 - An x64 UEFI launcher with confirmed EFI utility handoff and configurable reboot/shutdown/firmware-setup actions. Firmware security policy applies. Studio power controls are inert previews.
 
 Image inspection and checksum calculation do not prove publisher authenticity or boot compatibility. Physical-device preparation, an end-to-end OS boot workflow, and production Secure Boot signing remain unavailable.
@@ -57,10 +58,11 @@ The shared script checks Rust, frontend code, and Chromium at desktop and compac
 
 Validation on 28 October 2026:
 
-- **419 Rust workspace tests passed locally for `1450c5f`; two external-fixture tests were skipped.** Native Studio previously passed 32 tests at `e4b84c4`; unchanged frontend/tooling checks passed 36 frontend tests, 48 Python tests and 64 Chromium cases. The workspace includes 23 catalogue tests also covered by native tests. Browser bridge tests use mocks; filesystem tests use real temporary files. Hosted results are in [Actions](https://github.com/IsoHopper/isohopper/actions).
+- **437 Rust workspace tests and 32 native Studio tests passed locally for `1ad036b`.** Four workspace fixture tests were skipped by default; pinned archive import and CLI image creation also passed separately against the real archive. Unchanged frontend/tooling checks passed 36 frontend tests, 48 Python tests and 64 Chromium cases. The workspace includes 23 catalogue tests also covered by native tests. Browser bridge tests use mocks; filesystem tests use real temporary files. Hosted results are in [Actions](https://github.com/IsoHopper/isohopper/actions).
 - [Windows storage integration](https://github.com/IsoHopper/isohopper/actions/runs/40723017082) passed source-handle protection, authenticated cross-process file transfer, retained target checks, volume locks, and a 256 MiB VHD write/readback. Three nested files copied to an unlettered exFAT volume matched their SHA-256 hashes after read-only reattachment; GPT and both boot slots were preserved. Source-change, read-only disk, deadline and cancellation refusals also passed. These are real Windows API tests on disposable virtual disks, not USB hardware tests.
-- [Windows Studio integration](https://github.com/IsoHopper/isohopper/actions/runs/40723017109) passed 26 native tests, fresh NSIS installation, installed helper permissions/checksum and process-role checks, and repeated silent/passive installer refusal with unchanged files and permissions. Interactive UAC remains untested; the helper connection check does not enable preparation.
-- Windows CI currently cannot retain active pagefile handles (Win32 32), and executable external-backing queries are unsupported there (Win32 1). Tests record these limits; they do not count as safe or enable physical preparation.
+- [Windows Studio integration](https://github.com/IsoHopper/isohopper/actions/runs/40724726404) passed 31 native tests, fresh NSIS installation, installed helper permissions/checksum and process-role checks, and repeated silent/passive installer refusal with unchanged files and permissions. Interactive UAC remains untested; the helper connection check does not enable preparation.
+- Windows CI cannot retain active pagefile handles (Win32 32). The low-level executable backing query also fails there, but the protected-path WOF API successfully reports both installed files as inline. Full preflight integration remains under development; neither result enables physical preparation.
+- The Rust-built GPT engine image booted Alpine 3.24.3 in QEMU to a live root shell; the running guest verified its mounted ISO checksum. Data was populated by the test harness, not the production Windows staging pipeline.
 - QEMU passed firmware entry, EFI utility handoff/return, and confirmed guest power requests. The next firmware setup screen was not inspected.
 - An Ubuntu 6.8.0-147 kernel reached PID 1 in a tiny diagnostic initramfs and shut down cleanly. With disposable Secure Boot keys, its signed unified kernel image booted; unsigned, tampered and revoked copies were refused. The smaller EFI test utility passed the same four cases.
 
@@ -72,7 +74,7 @@ The diagnostic is not an Ubuntu installer. General ISO booting, installation com
 
 ## Relation to Ventoy
 
-[Ventoy](https://www.ventoy.net/en/index.html) provides direct image booting and extensive compatibility coverage. IsoHopper is an independent, early-stage implementation focused on inspectable metadata and explicit device authorization. It does not yet offer equivalent coverage or replace Ventoy.
+[Ventoy](https://www.ventoy.net/en/index.html) provides direct image booting and extensive compatibility coverage. IsoHopper's experimental engine-image builder uses its pinned, externally supplied boot components; that compatibility work belongs to Ventoy and its contributors. IsoHopper adds a Rust preparation layer and desktop interface focused on inspectable metadata and explicit device authorization. It does not yet offer a complete replacement. See [third-party components](THIRD_PARTY.md).
 
 ## License and contact
 
