@@ -39,6 +39,8 @@ pub enum SourceError {
 
 #[cfg(windows)]
 pub use native::{SourceBinding, bind_source};
+#[cfg(windows)]
+pub(crate) use native::{no_virtual_dependencies, source_guid, volume_extents};
 
 #[cfg(any(windows, test))]
 const MAX_PATH_UNITS: usize = 32_768;

@@ -66,7 +66,8 @@ impl SourceBinding {
         let actual = mapping(&self.source, &self.volume)?;
         unchanged(&self.mapping, &actual)?;
         reject_target(&actual.extents, target.device_number)?;
-        no_virtual_dependencies(&self.volume)?;
+        // SAFETY: bind_source owns this synchronously opened volume handle.
+        unsafe { no_virtual_dependencies(&self.volume)? };
         no_external_backing(&self.source)?;
         unchanged(&actual, &mapping(&self.source, &self.volume)?)
     }
@@ -104,7 +105,8 @@ pub unsafe fn bind_source(
         return Err(SourceError::Changed);
     }
     reject_target(&observed.extents, target.device_number)?;
-    no_virtual_dependencies(&volume)?;
+    // SAFETY: volume was opened synchronously above and remains live.
+    unsafe { no_virtual_dependencies(&volume)? };
     no_external_backing(&source)?;
     unchanged(&observed, &mapping(&source, &volume)?)?;
     Ok(SourceBinding {
@@ -146,7 +148,7 @@ fn file_identity(file: &File) -> Result<FileIdentity, SourceError> {
     })
 }
 
-fn source_guid(source: &File) -> Result<String, SourceError> {
+pub(crate) fn source_guid(source: &File) -> Result<String, SourceError> {
     let mut path = vec![0u16; MAX_PATH_UNITS];
     // SAFETY: retained source and bounded writable UTF-16 buffer. No path
     // input or fallback is used, including when a network GUID is absent.
@@ -172,6 +174,18 @@ fn source_guid(source: &File) -> Result<String, SourceError> {
 fn mapping(source: &File, volume: &File) -> Result<Mapping, SourceError> {
     let file = file_identity(source)?;
     let guid = source_guid(source)?;
+    // SAFETY: both callers use the synchronous volume owned by bind_source.
+    let extents = unsafe { volume_extents(volume)? };
+    Ok(Mapping {
+        file,
+        guid,
+        extents,
+    })
+}
+
+/// # Safety
+/// Caller retains a synchronous, access-zero volume handle for this query.
+pub(crate) unsafe fn volume_extents(volume: &File) -> Result<Vec<SourceExtent>, SourceError> {
     let mut bytes = [0u8; 8 + MAX_EXTENTS * 24];
     let mut returned = 0;
     // SAFETY: live access-zero retained volume, fixed output capacity, and
@@ -197,15 +211,12 @@ fn mapping(source: &File, volume: &File) -> Result<Mapping, SourceError> {
     if returned as usize > bytes.len() {
         return Err(SourceError::Mapping("oversized source volume extents"));
     }
-    let extents = parse_extents(&bytes[..returned as usize])?;
-    Ok(Mapping {
-        file,
-        guid,
-        extents,
-    })
+    parse_extents(&bytes[..returned as usize])
 }
 
-fn no_virtual_dependencies(volume: &File) -> Result<(), SourceError> {
+/// # Safety
+/// Caller retains a synchronous volume handle for this query.
+pub(crate) unsafe fn no_virtual_dependencies(volume: &File) -> Result<(), SourceError> {
     // u64 allocation supplies alignment for STORAGE_DEPENDENCY_INFO. Only
     // its integer-only version-1 prefix/entries are parsed, never pointers.
     // A sentinel count prevents untouched bytes from becoming a valid
