@@ -8,7 +8,7 @@ use thiserror::Error;
 mod linux;
 mod macos;
 mod native;
-mod windows;
+pub mod windows;
 pub mod windows_encryption;
 pub mod windows_pagefiles;
 pub mod windows_pools;

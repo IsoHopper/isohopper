@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use isohopper_core::guard;
+use isohopper_inventory::windows::{WindowsEvidenceIssue, WindowsTextField, collect_evidence_with};
 use isohopper_inventory::{CommandOutput, CommandRunner, Inventory, Platform, discover_for};
 use serde_json::{Value, json};
 use std::{cell::RefCell, io};
@@ -365,11 +366,17 @@ fn command_projects_underlying_enum_numbers_and_null_remains_unknown() {
     struct ProjectionRunner;
     impl CommandRunner for ProjectionRunner {
         fn run(&self, _: &str, args: &[&str]) -> io::Result<CommandOutput> {
-            for field in ["BusType", "MbrType"] {
+            for field in ["BusType", "MbrType", "UniqueIdFormat"] {
                 let raw = format!("$_.CimInstanceProperties['{field}'].Value");
                 assert!(args[4].contains(&format!("$null -ne {raw}")));
                 assert!(args[4].contains(&format!("[uint16]{raw}")));
             }
+            for field in ["Offset", "Size"] {
+                let raw = format!("$_.CimInstanceProperties['{field}'].Value");
+                assert!(args[4].contains(&format!("$null -ne {raw}")));
+                assert!(args[4].contains(&format!("[uint64]{raw}")));
+            }
+            assert!(args[4].contains("Path=$_.CimInstanceProperties['Path'].Value"));
             let mut d = disk(1);
             d["BusType"] = Value::Null;
             let mut p = partition(1);
@@ -389,4 +396,287 @@ fn command_projects_underlying_enum_numbers_and_null_remains_unknown() {
         Some(&result.disks[0].id),
         "transport_unknown"
     ));
+}
+
+fn evidence_input() -> Value {
+    let mut d = disk(5);
+    d["Path"] = json!(r"\\?\scsi#disk&ven_test#5");
+    d["UniqueIdFormat"] = json!(3);
+    let mut p = partition(5);
+    p["Offset"] = json!(1_048_576u64);
+    p["Size"] = json!(32_000_000_000u64);
+    input(vec![d], vec![p])
+}
+
+#[test]
+fn evidence_preserves_raw_identity_false_flags_and_full_width_geometry() {
+    let mut value = evidence_input();
+    let path = r"\\?\scsi#disk&ven_test#$(not-a-command); literal";
+    value["disks"][0]["Path"] = json!(path);
+    value["disks"][0]["UniqueId"] = json!("  MixedCase-ID  ");
+    value["partitions"][0]["Offset"] = json!(u64::MAX - 1);
+    value["partitions"][0]["Size"] = json!(u64::MAX);
+    let e = collect_evidence_with(&MockRunner::json(value.clone())).unwrap();
+    assert_eq!(e.source, "windows_powershell");
+    assert_eq!(e.disks[0].path.as_deref(), Some(path));
+    assert_eq!(e.disks[0].unique_id.as_deref(), Some("  MixedCase-ID  "));
+    assert_eq!(e.disks[0].unique_id_format, Some(3));
+    assert_eq!(e.disks[0].is_boot, Some(false));
+    assert_eq!(e.partitions[0].is_system, Some(false));
+    assert_eq!(e.partitions[0].offset, Some(u64::MAX - 1));
+    assert_eq!(e.partitions[0].size, Some(u64::MAX));
+    // Presence is deliberately separate from geometry validity or authority.
+    assert!(e.completeness.geometry_fields_present);
+    assert!(e.completeness.identity_fields_present);
+    assert!(e.completeness.status_fields_present);
+    assert!(e.completeness.partition_membership_consistent);
+    assert!(e.completeness.identity_values_unique);
+    assert!(e.completeness.command_clean);
+    assert!(e.issues.is_empty());
+    let r = report(value);
+    assert_eq!(r.disks[0].system_disk, None);
+}
+
+#[test]
+fn old_fixtures_and_nulls_do_not_invent_new_evidence() {
+    for mut value in [input(vec![disk(5)], vec![partition(5)]), evidence_input()] {
+        if value["disks"][0].get("Path").is_some() {
+            for key in ["Path", "UniqueIdFormat"] {
+                value["disks"][0][key] = Value::Null;
+            }
+            for key in ["Offset", "Size", "IsBoot"] {
+                value["partitions"][0][key] = Value::Null;
+            }
+        }
+        let e = collect_evidence_with(&MockRunner::json(value)).unwrap();
+        assert_eq!(e.disks[0].path, None);
+        assert_eq!(e.disks[0].unique_id_format, None);
+        assert_eq!(e.partitions[0].offset, None);
+        assert_eq!(e.partitions[0].size, None);
+        assert!(!e.completeness.identity_fields_present);
+        assert!(!e.completeness.geometry_fields_present);
+    }
+}
+
+#[test]
+fn evidence_retains_orphans_and_every_duplicate_identity_member() {
+    let mut value = evidence_input();
+    let mut duplicate = value["disks"][0].clone();
+    duplicate["Number"] = json!(6);
+    duplicate["Path"] = json!(duplicate["Path"].as_str().unwrap().to_ascii_uppercase());
+    value["disks"].as_array_mut().unwrap().push(duplicate);
+    value["partitions"]
+        .as_array_mut()
+        .unwrap()
+        .push(partition(99));
+    let e = collect_evidence_with(&MockRunner::json(value)).unwrap();
+    assert_eq!(e.partitions.len(), 2);
+    assert!(!e.completeness.partition_membership_consistent);
+    assert!(!e.completeness.identity_values_unique);
+    assert!(e.issues.contains(&WindowsEvidenceIssue::OrphanPartition {
+        disk_number: 99,
+        partition_number: 1,
+    }));
+    for number in [5, 6] {
+        for field in [
+            WindowsTextField::Path,
+            WindowsTextField::UniqueId,
+            WindowsTextField::SerialNumber,
+        ] {
+            assert!(e.issues.contains(&WindowsEvidenceIssue::DuplicateIdentity {
+                disk_number: number,
+                field,
+            }));
+        }
+    }
+    assert!(
+        e.issues
+            .contains(&WindowsEvidenceIssue::PartitionCountMismatch {
+                disk_number: 6,
+                reported: Some(1),
+                observed: 0,
+            })
+    );
+}
+
+#[test]
+fn evidence_bounds_text_without_disguising_invalid_fields_as_observations() {
+    let mut value = evidence_input();
+    value["disks"][0]["Path"] = json!("x".repeat(4097));
+    value["disks"][0]["SerialNumber"] = json!("private\u{0}serial");
+    value["partitions"][0]["GptType"] = json!("x".repeat(1025));
+    let e = collect_evidence_with(&MockRunner::json(value)).unwrap();
+    assert_eq!(e.disks[0].path, None);
+    assert_eq!(e.disks[0].serial_number, None);
+    assert_eq!(e.partitions[0].gpt_type, None);
+    assert!(!e.completeness.identity_fields_present);
+    for (partition_number, field) in [
+        (None, WindowsTextField::Path),
+        (None, WindowsTextField::SerialNumber),
+        (Some(1), WindowsTextField::GptType),
+    ] {
+        assert!(e.issues.contains(&WindowsEvidenceIssue::InvalidText {
+            disk_number: 5,
+            partition_number,
+            field,
+        }));
+    }
+}
+
+#[test]
+fn evidence_exposes_failed_enumeration_and_diagnostics_without_their_contents() {
+    let mut value = evidence_input();
+    value["partitions_complete"] = json!(false);
+    let runner = MockRunner::json(value);
+    runner.0.borrow_mut().as_mut().unwrap().stderr = b"private diagnostic".to_vec();
+    let e = collect_evidence_with(&runner).unwrap();
+    assert!(!e.completeness.partition_query_complete);
+    assert!(!e.completeness.command_clean);
+    assert!(!format!("{e:?}").contains("private diagnostic"));
+}
+
+#[test]
+fn evidence_new_fields_remain_strictly_typed_and_errors_redacted() {
+    for (group, field, bad) in [
+        ("disks", "Path", json!(["private"])),
+        ("disks", "UniqueIdFormat", json!("private")),
+        ("disks", "UniqueIdFormat", json!(65536)),
+        ("partitions", "Offset", json!(-1)),
+        ("partitions", "Size", json!("private")),
+    ] {
+        let mut value = evidence_input();
+        value[group][0][field] = bad;
+        let error = collect_evidence_with(&MockRunner::json(value))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&format!("{group}[].{field}")), "{error}");
+        assert!(!error.contains("private"));
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "read-only Windows Storage provider observation; no complete-safety claim"]
+fn native_windows_typed_evidence_is_read_only() {
+    use isohopper_inventory::windows::collect_evidence;
+    use std::collections::BTreeSet;
+
+    let evidence = collect_evidence().expect("Windows typed evidence query must complete");
+    assert_eq!(evidence.source, "windows_powershell");
+    assert!(evidence.disks.len() <= 256);
+    assert!(evidence.partitions.len() <= 4096);
+    let numbers: BTreeSet<_> = evidence.disks.iter().map(|d| d.number).collect();
+    assert!(numbers.len() == evidence.disks.len(), "duplicate disk key");
+    let partition_keys: BTreeSet<_> = evidence
+        .partitions
+        .iter()
+        .map(|p| (p.disk_number, p.partition_number))
+        .collect();
+    assert!(
+        partition_keys.len() == evidence.partitions.len(),
+        "duplicate partition key"
+    );
+    for part in &evidence.partitions {
+        assert!(part.partition_number > 0, "invalid partition key");
+        let orphan = !numbers.contains(&part.disk_number);
+        assert!(
+            orphan
+                == evidence
+                    .issues
+                    .contains(&WindowsEvidenceIssue::OrphanPartition {
+                        disk_number: part.disk_number,
+                        partition_number: part.partition_number,
+                    }),
+            "orphan partition evidence must remain explicit"
+        );
+    }
+    for disk in &evidence.disks {
+        let observed = evidence
+            .partitions
+            .iter()
+            .filter(|p| p.disk_number == disk.number)
+            .count() as u32;
+        assert!(observed <= 256);
+        let mismatch = disk.number_of_partitions != Some(observed);
+        assert!(
+            mismatch
+                == evidence
+                    .issues
+                    .contains(&WindowsEvidenceIssue::PartitionCountMismatch {
+                        disk_number: disk.number,
+                        reported: disk.number_of_partitions,
+                        observed,
+                    }),
+            "partition count evidence must remain explicit"
+        );
+    }
+    if evidence.completeness.partition_membership_consistent {
+        assert!(
+            evidence
+                .partitions
+                .iter()
+                .all(|p| numbers.contains(&p.disk_number))
+        );
+        assert!(evidence.disks.iter().all(|d| {
+            d.number_of_partitions
+                == Some(
+                    evidence
+                        .partitions
+                        .iter()
+                        .filter(|p| p.disk_number == d.number)
+                        .count() as u32,
+                )
+        }));
+    }
+    if evidence.completeness.identity_fields_present {
+        assert!(evidence.disks.iter().all(|d| {
+            d.path.as_ref().is_some_and(|p| !p.trim().is_empty())
+                && d.unique_id.as_ref().is_some_and(|id| !id.trim().is_empty())
+                && d.serial_number
+                    .as_ref()
+                    .is_some_and(|id| !id.trim().is_empty())
+                && d.unique_id_format.is_some()
+        }));
+    }
+    if evidence.completeness.geometry_fields_present {
+        assert!(evidence.disks.iter().all(|d| d.size.is_some()
+            && d.logical_sector_size.is_some()
+            && d.physical_sector_size.is_some()));
+        assert!(
+            evidence
+                .partitions
+                .iter()
+                .all(|p| p.offset.is_some() && p.size.is_some())
+        );
+    }
+    if evidence.completeness.status_fields_present {
+        assert!(evidence.disks.iter().all(|d| d.is_boot.is_some()
+            && d.is_system.is_some()
+            && d.is_read_only.is_some()
+            && d.is_offline.is_some()
+            && d.is_clustered.is_some()));
+        assert!(evidence.partitions.iter().all(|p| p.is_boot.is_some()
+            && p.is_system.is_some()
+            && p.is_read_only.is_some()
+            && p.is_offline.is_some()));
+    }
+    let incomplete = [
+        evidence.completeness.partition_query_complete,
+        evidence.completeness.partition_membership_consistent,
+        evidence.completeness.identity_fields_present,
+        evidence.completeness.geometry_fields_present,
+        evidence.completeness.status_fields_present,
+        evidence.completeness.identity_values_unique,
+        evidence.completeness.command_clean,
+    ]
+    .iter()
+    .filter(|&&complete| !complete)
+    .count();
+    println!(
+        "OBSERVED Windows typed evidence: disks={}, partitions={}, issues={}, incomplete_components={}; no target safety conclusion",
+        evidence.disks.len(),
+        evidence.partitions.len(),
+        evidence.issues.len(),
+        incomplete
+    );
 }
