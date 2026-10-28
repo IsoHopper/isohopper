@@ -248,6 +248,16 @@ impl SourceCatalog {
     }
 
     pub fn release_sources(&mut self, ids: &[String]) -> Result<(), String> {
+        self.check_release_sources(ids)?;
+        for id in ids {
+            self.sources.remove(id);
+        }
+        Ok(())
+    }
+
+    /// Validate without closing a handle. A caller coordinating two catalogues
+    /// must keep both catalogue locks until it performs the validated releases.
+    pub fn check_release_sources(&self, ids: &[String]) -> Result<(), String> {
         if ids.len() > MAX_SOURCES {
             return Err("Too many source IDs in release request.".into());
         }
@@ -261,9 +271,6 @@ impl SourceCatalog {
             if Arc::strong_count(&source.source) != 1 {
                 return Err("Source is leased by a job and cannot be released yet.".into());
             }
-        }
-        for id in ids {
-            self.sources.remove(id);
         }
         Ok(())
     }

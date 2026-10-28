@@ -8,6 +8,8 @@ mod installation;
 mod windows;
 #[cfg(windows)]
 pub use windows::run;
+#[cfg(windows)]
+pub(crate) use windows::{Launched, launch_preparation};
 
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 S33G
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+const PHYSICAL_PREPARATION_ENABLED: bool = false;
 #[tauri::command]
 fn capabilities() -> serde_json::Value {
     serde_json::json!({
@@ -9,7 +10,8 @@ fn capabilities() -> serde_json::Value {
         "file_import": true,
         "host_inventory": cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux")),
         "helper_probe": cfg!(windows),
-        "physical_preparation": false,
+        "preparation_available": cfg!(windows),
+        "physical_preparation": cfg!(windows) && PHYSICAL_PREPARATION_ENABLED,
         "preparation_unavailable_reason": "Physical preparation is unavailable. Disk preparation and OS boot integration are unfinished."
     })
 }
@@ -23,6 +25,95 @@ fn check_config(text: String, format: String) -> serde_json::Value {
 #[cfg(any(windows, test))]
 mod elevation;
 mod imports;
+mod preparation;
+#[tauri::command]
+fn preparation_status() -> Result<Option<preparation::Snapshot>, String> {
+    preparation::status()
+}
+#[tauri::command]
+fn selected_engine_archive() -> Result<Option<preparation::inputs::ArchiveSelection>, String> {
+    preparation::inputs::selected_archive()
+}
+#[tauri::command]
+async fn pick_engine_archive() -> Result<Option<preparation::inputs::ArchiveSelection>, String> {
+    let job = NativeJob::begin()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _job = job;
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Choose the official Ventoy 1.1.18 Linux archive")
+            .add_filter("Ventoy Linux archive", &["gz"])
+            .pick_file()
+        else {
+            return Ok(None);
+        };
+        preparation::inputs::select_archive(&path).map(Some)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+async fn list_preparation_targets() -> Result<Vec<preparation::targets::TargetSelection>, String> {
+    let job = NativeJob::begin()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _job = job;
+        preparation::targets::refresh()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+fn start_preparation(
+    window: tauri::WebviewWindow,
+    target_token: String,
+    source_ids: Vec<String>,
+    archive_token: String,
+) -> Result<preparation::Snapshot, String> {
+    #[cfg(windows)]
+    {
+        use tauri::Manager;
+        if window.label() != "main" {
+            return Err("Preparation requires the main Studio window".into());
+        }
+        let directory = window
+            .app_handle()
+            .path()
+            .resource_dir()
+            .map_err(|e| e.to_string())?;
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let owner = window.clone();
+        window
+            .run_on_main_thread(move || {
+                let _ = send.send(
+                    owner
+                        .hwnd()
+                        .map(|h| h.0 as usize)
+                        .map_err(|e| e.to_string()),
+                );
+            })
+            .map_err(|e| e.to_string())?;
+        preparation::start(receive, directory, target_token, source_ids, archive_token)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, target_token, source_ids, archive_token);
+        Err("Preparation is available only on Windows".into())
+    }
+}
+#[tauri::command]
+fn confirm_preparation(
+    job_id: String,
+    description_digest: String,
+    challenge: String,
+) -> Result<(), String> {
+    if !PHYSICAL_PREPARATION_ENABLED {
+        return Err("Physical writing is not enabled in this build".into());
+    }
+    preparation::confirm(&job_id, description_digest, challenge)
+}
+#[tauri::command]
+fn cancel_preparation(job_id: String) -> Result<(), String> {
+    preparation::cancel(&job_id)
+}
 #[tauri::command]
 fn release_sources(ids: Vec<String>) -> Result<(), String> {
     imports::release_sources(&ids)
@@ -168,10 +259,17 @@ fn main() {
             release_sources,
             list_sources,
             inspect_devices,
-            probe_helper
+            probe_helper,
+            pick_engine_archive,
+            selected_engine_archive,
+            list_preparation_targets,
+            preparation_status,
+            start_preparation,
+            confirm_preparation,
+            cancel_preparation
         ])
         .on_window_event(|_, event| {
-            if HELPER_PROBE_ACTIVE.load(Ordering::Acquire)
+            if (HELPER_PROBE_ACTIVE.load(Ordering::Acquire) || preparation::active())
                 && let tauri::WindowEvent::CloseRequested { api, .. } = event
             {
                 api.prevent_close();
@@ -180,7 +278,7 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("could not start IsoHopper Studio")
         .run(|_, event| {
-            if HELPER_PROBE_ACTIVE.load(Ordering::Acquire)
+            if (HELPER_PROBE_ACTIVE.load(Ordering::Acquire) || preparation::active())
                 && let tauri::RunEvent::ExitRequested { api, .. } = event
             {
                 api.prevent_exit();
