@@ -21,15 +21,12 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE},
     Storage::FileSystem::{
-        CREATE_NEW, CreateFileW, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
-        ReOpenFile, WRITE_OWNER,
+        CREATE_NEW, CreateFileW, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx, ReOpenFile,
     },
 };
 
 const SEED: &str = "seed.img";
 const FINAL: &str = "final.img";
-#[path = "seed_owner.rs"]
-mod seed_owner;
 fn cancelled(cancel: &AtomicBool) -> Result<(), StageError> {
     if cancel.load(Ordering::Relaxed) {
         Err(StageError::Invalid("staging cancelled"))
@@ -319,21 +316,15 @@ fn build_under(
     }
     let mut owner = OwnedStageDisk::create_under(root, geometry.clone())?;
     let seed_path = owner.directory.join(SEED);
-    owner.owned_files.push(SEED);
     progress(StageProgress {
         phase: "building_seed",
         completed_bytes: 0,
         total_bytes: geometry.size_bytes,
         file_index: None,
     });
-    let image = engine::create(&seed_path, plan, payloads)
+    let mut seed = create_file(&mut owner, SEED)?;
+    let image = engine::initialize_empty_file(&mut seed, plan, payloads)
         .map_err(|e| context("build pinned engine seed", e))?;
-    let mut seed = OpenOptions::new()
-        .access_mode(GENERIC_READ | WRITE_OWNER)
-        .share_mode(FILE_SHARE_READ)
-        .open(&seed_path)
-        .map_err(|e| error("retain engine seed", e))?;
-    seed_owner::fix(&seed)?;
     let digest = hash(&mut seed, geometry.size_bytes, cancel)?;
     owner.attach(false)?;
     let view = View::open(&owner)?;
