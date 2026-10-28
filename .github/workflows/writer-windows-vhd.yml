@@ -96,7 +96,8 @@ jobs:
       - name: Inspect protected storage and retained disk identity without writes
         shell: bash
         run: |
-          if cargo +1.98.0 test --locked -p isohopper-helper --lib --test windows_protected --test probe_command > helper-unit.log 2>&1; then
+          if cargo +1.98.0 test --locked -p isohopper-helper --lib --test windows_protected --test probe_command > helper-unit.log 2>&1 &&
+             cargo +1.98.0 test --locked -p isohopper-helper --lib windows_peer::native::tests::native_linked_token_relationship_is_observed_without_elevation -- --exact --ignored --nocapture >> helper-unit.log 2>&1; then
             cat helper-unit.log
           else
             python - <<'PY'
@@ -238,6 +239,7 @@ jobs:
           import re
           from pathlib import Path
           patterns = {
+              'helper-unit.log': r'LINKED_TOKEN status=(?:observed same_user=(?:true|false) same_logon=(?:true|false) same_session=(?:true|false) same_authentication=(?:true|false) current_full=(?:true|false) current_limited=(?:true|false) linked_full=(?:true|false) linked_limited=(?:true|false)|unsupported reason=(?:no_split_token|linked_query_unavailable win32=\d+))',
               'windows_discovery.log': r'OBSERVED Windows typed evidence: disks=\d+, partitions=\d+, issues=\d+, incomplete_components=\d+; no target safety conclusion',
               'windows_pagefiles.log': r'active_pagefiles=\d+',
               'windows_encryption.log': r'BitLocker provider (?:observed \d+ volumes; no write authorization|unavailable: (?:MissingNamespace|MissingClass); encryption state unknown)',

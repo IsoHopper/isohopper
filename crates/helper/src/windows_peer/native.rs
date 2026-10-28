@@ -264,6 +264,140 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "read-only current/linked-token diagnostic; no UAC or token changes"]
+    fn native_linked_token_relationship_is_observed_without_elevation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::windows_peer::ElevationType;
+        use windows_sys::Win32::{
+            Security::{TOKEN_LINKED_TOKEN, TokenLinkedToken},
+            System::Threading::{
+                GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+                PROCESS_SYNCHRONIZE,
+            },
+        };
+
+        fn stamp(token: &OwnedHandle) -> Result<decode::Stamp, PeerError> {
+            decode::statistics(query(token, TokenStatistics, "diagnostic stamp")?.bytes())
+        }
+
+        // Only query this process. The retained process and token handles are
+        // never impersonated, assigned, elevated, or used to create a process.
+        // SAFETY: these functions have no pointer inputs or asynchronous work.
+        let raw = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                GetCurrentProcessId(),
+            )
+        };
+        if raw.is_null() {
+            return Err(io::Error::last_os_error().into());
+        }
+        // SAFETY: successful OpenProcess returned one owned process handle.
+        let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let current = primary_token(&process)?;
+        let current_before = stamp(&current)?;
+        let current_type = decode::elevation(
+            query(&current, TokenElevationType, "diagnostic elevation type")?.bytes(),
+        )?;
+        if current_type == ElevationType::Default {
+            decode::stable_token(
+                current_before,
+                stamp(&current)?,
+                stamp(&primary_token(&process)?)?,
+            )?;
+            println!("LINKED_TOKEN status=unsupported reason=no_split_token");
+            return Ok(());
+        }
+
+        // This class returns an owned HANDLE, not a byte buffer. Query its
+        // exact SDK structure once and close the returned handle on every
+        // successful path, including a rejected returned length.
+        // https://learn.microsoft.com/windows/win32/api/winnt/ns-winnt-token_linked_token
+        let mut output = TOKEN_LINKED_TOKEN::default();
+        let mut returned = 0;
+        // SAFETY: current is live; output and returned are initialized, typed
+        // locations of the exact supplied sizes. The operation is synchronous.
+        if unsafe {
+            GetTokenInformation(
+                current.as_raw_handle(),
+                TokenLinkedToken,
+                (&mut output as *mut TOKEN_LINKED_TOKEN).cast(),
+                size_of::<TOKEN_LINKED_TOKEN>() as u32,
+                &mut returned,
+            )
+        } == 0
+        {
+            let error = io::Error::last_os_error();
+            decode::stable_token(
+                current_before,
+                stamp(&current)?,
+                stamp(&primary_token(&process)?)?,
+            )?;
+            println!(
+                "LINKED_TOKEN status=unsupported reason=linked_query_unavailable win32={}",
+                error.raw_os_error().unwrap_or(0)
+            );
+            return Ok(());
+        }
+        if output.LinkedToken.is_null() || output.LinkedToken as isize == -1 {
+            return Err(PeerError::Invalid("diagnostic linked-token handle").into());
+        }
+        // SAFETY: successful TokenLinkedToken returns a new handle whose
+        // documented cleanup is CloseHandle, performed by OwnedHandle.
+        let linked = unsafe { OwnedHandle::from_raw_handle(output.LinkedToken) };
+        if returned as usize != size_of::<TOKEN_LINKED_TOKEN>() {
+            return Err(PeerError::Invalid("diagnostic linked-token size").into());
+        }
+        let linked_before = stamp(&linked)?;
+        let same_user = query(&current, TokenUser, "diagnostic current user")?
+            .view()
+            .user()?
+            == query(&linked, TokenUser, "diagnostic linked user")?
+                .view()
+                .user()?;
+        let same_logon = query(&current, TokenLogonSid, "diagnostic current logon")?
+            .view()
+            .logon()?
+            == query(&linked, TokenLogonSid, "diagnostic linked logon")?
+                .view()
+                .logon()?;
+        let same_session =
+            decode::scalar(query(&current, TokenSessionId, "diagnostic current session")?.bytes())?
+                == decode::scalar(
+                    query(&linked, TokenSessionId, "diagnostic linked session")?.bytes(),
+                )?;
+        let linked_type = decode::elevation(
+            query(
+                &linked,
+                TokenElevationType,
+                "diagnostic linked elevation type",
+            )?
+            .bytes(),
+        )?;
+        decode::stable_token(
+            current_before,
+            stamp(&current)?,
+            stamp(&primary_token(&process)?)?,
+        )?;
+        if linked_before != stamp(&linked)? {
+            return Err(PeerError::Changed.into());
+        }
+
+        // Observations only: differing logon/authentication IDs are printed,
+        // not accepted by the broker or translated into role/ACL exceptions.
+        println!(
+            "LINKED_TOKEN status=observed same_user={same_user} same_logon={same_logon} same_session={same_session} same_authentication={} current_full={} current_limited={} linked_full={} linked_limited={}",
+            current_before.authentication == linked_before.authentication,
+            current_type == ElevationType::Full,
+            current_type == ElevationType::Limited,
+            linked_type == ElevationType::Full,
+            linked_type == ElevationType::Limited,
+        );
+        Ok(())
+    }
+
+    #[test]
     fn fixed_token_outputs_use_one_sdk_sized_call_without_a_probe() {
         for class in [
             TokenElevation,
