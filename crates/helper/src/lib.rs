@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;
 
+pub mod framing;
 pub mod job;
 pub mod windows_encryption_check;
 pub mod windows_identity;
@@ -94,7 +95,7 @@ impl Session {
 }
 /// Protocol frame bounds are checked before JSON allocation.
 pub fn decode_frame(bytes: &[u8]) -> Result<Request, Error> {
-    if bytes.len() > 65_536 {
+    if bytes.len() > framing::MAX_FRAME_BYTES {
         return Err(Error::Encoding);
     }
     serde_json::from_slice(bytes).map_err(|_| Error::Encoding)
