@@ -12,13 +12,16 @@ interface NativeScenario {
 
 async function installNativeBridge(page: Page, scenario: NativeScenario = {}) {
   await page.addInitScript(({ capabilityError, inventoryError, pickerOutcome, releaseFailures, sourceListError }) => {
-    const host = window as unknown as { __TAURI__: unknown; nativeCommands: string[]; releasedSourceIds: string[][] };
+    const host = window as unknown as { __TAURI__: unknown; nativeCommands: string[]; releasedSourceIds: string[][]; publishNativeSource: (source: StoredSource) => void; nativeSourceListError?: string; pauseSourceListing: () => void; finishSourceListing: () => void };
     host.nativeCommands = [];
     host.releasedSourceIds = [];
     let failuresLeft = releaseFailures || 0;
     type StoredSource = { source_id: string; name: string; relative_path?: string; bytes: number; verification: { algorithm: string; digest: string; bytes: number; status: string; publisher_verified: boolean } };
     let retained: StoredSource[] = JSON.parse(sessionStorage.getItem('test-retained-sources') || '[]');
     const store = (entries: StoredSource[]) => { retained = entries; sessionStorage.setItem('test-retained-sources', JSON.stringify(entries)); };
+    host.publishNativeSource = source => store([...retained, source]);
+    let sourceListPause: Promise<void> | undefined;
+    host.pauseSourceListing = () => { sourceListPause = new Promise(resolve => { host.finishSourceListing = () => { sourceListPause = undefined; resolve(); }; }); };
 
     host.__TAURI__ = { core: { invoke: async (command: string, args?: { ids?: string[] }) => {
       host.nativeCommands.push(command);
@@ -31,8 +34,10 @@ async function installNativeBridge(page: Page, scenario: NativeScenario = {}) {
         return { source: 'test-host-adapter', disks: [{ id: 'host-system-unique-id', serial: 'HOST-SERIAL-1234', model: 'Host system storage', bus: 'nvme', size_bytes: 512_000_000_000, logical_sector_size: 512, physical_sector_size: 4096, system_disk: true, external: false, safety_checks_complete: false }], warnings: [{ disk_id: 'host-system-unique-id', code: 'safety_unknown', message: 'Safety metadata is not complete.' }] };
       }
       if (command === 'list_sources') {
-        if (sourceListError) throw new Error(sourceListError);
-        return retained;
+        if (sourceListError || host.nativeSourceListError) throw new Error(sourceListError || host.nativeSourceListError);
+        const snapshot = [...retained];
+        await sourceListPause;
+        return snapshot;
       }
       if (command === 'pick_images') {
         if (pickerOutcome === 'error') throw new Error('file read failed');
@@ -415,4 +420,61 @@ test('native source listing failure stays visible and disables new imports witho
   await expect(page.getByRole('button', { name: 'Retry source listing', exact: true })).toBeEnabled();
   await expect(page.locator('.image-row')).toHaveCount(0);
   await expectNoDemoContent(page);
+});
+
+
+test('native Refresh recovers a source imported after the reload listing', async ({ page }) => {
+  await installNativeBridge(page);
+  await page.goto('/');
+  await expect(page.locator('.target-panel')).toContainText('host-system-unique-id');
+  await page.reload();
+  await expect(page.locator('.target-panel')).toContainText('host-system-unique-id');
+  await expect(page.locator('.image-row')).toHaveCount(0);
+  await page.evaluate(() => {
+    const host = window as unknown as { publishNativeSource: (source: unknown) => void };
+    host.publishNativeSource({ source_id: `src_${'e'.repeat(64)}`, name: 'late.iso', relative_path: 'Windows/late.iso', bytes: 3, verification: { algorithm: 'sha256', digest: 'a'.repeat(64), bytes: 3, status: 'hash-only', publisher_verified: false } });
+  });
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  const row = page.locator('.image-row').filter({ hasText: 'Windows/late.iso' });
+  await expect(row).toContainText(`src_${'e'.repeat(64)}`);
+  expect((await nativeCommands(page)).filter(command => command === 'list_sources')).toHaveLength(2);
+  await expectNoDemoContent(page);
+});
+
+test('failed native Refresh preserves the existing source rows', async ({ page }) => {
+  await installNativeBridge(page);
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Add images', exact: true }).click();
+  const row = page.locator('.image-row').filter({ hasText: 'native-large.iso' });
+  await expect(row).toContainText(`src_${'a'.repeat(64)}`);
+  await page.evaluate(() => { (window as unknown as { nativeSourceListError: string }).nativeSourceListError = 'Catalogue refresh failed'; });
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(page.getByText(/Native source listing failed: Catalogue refresh failed/)).toBeVisible();
+  await expect(row).toContainText(`src_${'a'.repeat(64)}`);
+  await expect(page.getByRole('button', { name: 'Add images', exact: true })).toBeDisabled();
+  expect(await page.evaluate(() => (window as unknown as { releasedSourceIds: string[][] }).releasedSourceIds)).toEqual([]);
+});
+
+
+test('pending source refresh blocks Remove and Clear until its snapshot resolves', async ({ page }) => {
+  await installNativeBridge(page);
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Add images', exact: true }).click();
+  await expect(page.locator('.image-row')).toHaveCount(1);
+  await page.evaluate(() => (window as unknown as { pauseSourceListing: () => void }).pauseSourceListing());
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await page.locator('nav').getByRole('button', { name: 'Image library' }).click();
+  const remove = page.getByRole('button', { name: 'Remove native-large.iso', exact: true });
+  const clear = page.getByRole('button', { name: 'Clear library', exact: true });
+  await expect(remove).toBeDisabled();
+  await expect(clear).toBeDisabled();
+  // Dispatch directly as well: the handlers must guard stale/programmatic events.
+  await remove.dispatchEvent('click');
+  await clear.dispatchEvent('click');
+  expect(await page.evaluate(() => (window as unknown as { releasedSourceIds: string[][] }).releasedSourceIds)).toEqual([]);
+  await page.evaluate(() => (window as unknown as { finishSourceListing: () => void }).finishSourceListing());
+  await expect(remove).toBeEnabled();
+  await expect(clear).toBeEnabled();
+  await expect(page.locator('.image-row')).toHaveCount(1);
+  expect(await page.evaluate(() => (window as unknown as { releasedSourceIds: string[][] }).releasedSourceIds)).toEqual([]);
 });
