@@ -126,6 +126,45 @@ fn synthetic_target() -> DeviceSnapshot {
     }
 }
 
+fn unsupported_external_backing(error: &ProtectedError) -> bool {
+    matches!(
+        error,
+        ProtectedError::Source(SourceError::Io { stage, source })
+            if *stage == "source external backing" && source.raw_os_error() == Some(1)
+    )
+}
+
+#[test]
+fn protected_smoke_only_classifies_exact_unsupported_external_backing() {
+    let error = |stage, code| {
+        ProtectedError::Source(SourceError::Io {
+            stage,
+            source: io::Error::from_raw_os_error(code),
+        })
+    };
+    assert!(unsupported_external_backing(&error(
+        "source external backing",
+        1
+    )));
+    for code in [5, 32, 50, 342] {
+        assert!(!unsupported_external_backing(&error(
+            "source external backing",
+            code
+        )));
+    }
+    assert!(!unsupported_external_backing(&error(
+        "source backing dependencies",
+        1
+    )));
+    assert!(!unsupported_external_backing(&ProtectedError::Io {
+        stage: "source external backing",
+        source: io::Error::from_raw_os_error(1),
+    }));
+    assert!(!unsupported_external_backing(&ProtectedError::Source(
+        SourceError::ExternalBacking
+    )));
+}
+
 #[test]
 #[ignore = "read-only mapping of the actual Windows directory and current test executable; no physical writes"]
 fn windows_protected_system_and_executable_mappings_are_read_only()
@@ -151,6 +190,9 @@ fn windows_protected_system_and_executable_mappings_are_read_only()
         }
         Ok(_) => return Err(invalid("actual system-volume disk was accepted").into()),
     }
+    let mut mapped = 1;
+    let mut overlap_refusals = 1;
+    let mut unsupported = 0;
 
     // current_exe locates a read-only fixture. It is not an authentication
     // mechanism: production must supply independently authenticated handles.
@@ -158,7 +200,22 @@ fn windows_protected_system_and_executable_mappings_are_read_only()
     for role in [ImageRole::Helper, ImageRole::Caller] {
         let image = File::open(&image_path)?;
         // SAFETY: File::open is readable and synchronous without OVERLAPPED.
-        let binding = unsafe { windows_protected::bind_file(role, image, &target) }?;
+        let binding = match unsafe { windows_protected::bind_file(role, image, &target) } {
+            Ok(binding) => binding,
+            Err(error) if unsupported_external_backing(&error) => {
+                // FSCTL_GET_EXTERNAL_BACKING documents INVALID_DEVICE_REQUEST
+                // for an absent or stopped backing service, not proof that the
+                // file has no external backing. Characterize this runner's
+                // unsupported query; production still rejects the binding.
+                // https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/fsctl-get-external-backing
+                println!(
+                    "UNSUPPORTED executable role={role:?}: external-backing query returned Win32 1; mapping remains blocked"
+                );
+                unsupported += 1;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         compare_extents(binding.volume_guid(), binding.extents())?;
         binding.revalidate(&target)?;
         if !matches!(
@@ -183,9 +240,11 @@ fn windows_protected_system_and_executable_mappings_are_read_only()
             }
             Ok(_) => return Err(invalid("actual executable-volume disk was accepted").into()),
         }
+        mapped += 1;
+        overlap_refusals += 1;
     }
     println!(
-        "Observed one Windows directory and two executable roles; all three actual-volume overlaps refused"
+        "Protected storage observations: successful_mappings={mapped}, actual_volume_overlap_refusals={overlap_refusals}, unsupported_executable_roles={unsupported}"
     );
     Ok(())
 }
