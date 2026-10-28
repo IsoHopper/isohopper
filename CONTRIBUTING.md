@@ -37,6 +37,28 @@ Add `--utility /path/to/tool.efi` to both image commands to embed and verify a s
 
 The smoke test checks a firmware-entry marker. Add `--action shutdown`, `--action reboot`, or `--action firmware-setup` to exercise confirmed guest power requests. Firmware setup checks the request and reset, not the next setup screen. `--action utility` requires the source-built `isohopper-test-utility` (feature `test-utility`); it checks ordered start/entry/return markers. These tests establish neither OS compatibility nor Secure Boot enforcement. They attach no physical disk. Native and firmware workflows run only when manually dispatched.
 
+The manual firmware workflow has an optional `secure_boot` checkbox, off by default. It tests acceptance of a utility signed with a disposable certificate and rejection of unsigned, tampered, and certificate-revoked copies. Each case must also report that firmware Secure Boot is enabled. These are QEMU tests with local test keys, not production signing or physical hardware qualification.
+
+For the same test locally on Ubuntu 24.04, install `qemu-system-x86`, `ovmf`, `openssl`, [`sbsigntool`](https://packages.ubuntu.com/noble/sbsigntool), and `python3-venv`. Use a virtual environment for the pinned [`virt-firmware` 26.9](https://pypi.org/project/virt-firmware/26.9/) tool. After the launcher build above:
+
+```sh
+python3 -m venv .local/secure-boot-venv
+.local/secure-boot-venv/bin/python -m pip install 'virt-firmware==26.9'
+cargo build -p isohopper-cli --release --locked
+cargo build -p isohopper-launcher --features test-utility --bin isohopper-test-utility --target x86_64-unknown-uefi --release --locked
+PATH="$PWD/.local/secure-boot-venv/bin:$PATH" python3 scripts/secure-boot-smoke.py \
+  --cli target/release/isohopper \
+  --launcher target/x86_64-unknown-uefi/release/isohopper-launcher.efi \
+  --utility target/x86_64-unknown-uefi/release/isohopper-test-utility.efi \
+  --code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+  --vars /usr/share/OVMF/OVMF_VARS_4M.fd \
+  --output .local/secure-boot-evidence
+```
+
+Choose a new evidence directory for each run. The script accepts only bounded regular-file inputs, uses no host firmware interface, and generates keys, signed copies, images, and variable stores in private temporary storage outside the evidence directory. It removes that storage on exit. Evidence contains logs, results, and public hashes only. Each guest has a 90-second default limit; the full run is bounded to nine minutes. Do not upload temporary storage or reuse these test keys for releases.
+
+The manual Windows inventory workflow runs fixture tests and read-only discovery on `windows-2022`. Its live smoke test reports counts only. This validates the inventory provider; it does not establish broader Windows or Studio compatibility.
+
 ## Review expectations
 
 - Add a regression test for a bug, including its failure case. Use synthetic image files and mocked device inventories.
