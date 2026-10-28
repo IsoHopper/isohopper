@@ -17,6 +17,11 @@ on:
       - crates/config/**
       - crates/inventory/**
       - studio/src-tauri/src/source_catalog.rs
+      - studio/src-tauri/src/main.rs
+      - studio/src-tauri/src/preparation.rs
+      - studio/src-tauri/src/preparation/**
+      - studio/src-tauri/src/elevation.rs
+      - studio/src-tauri/src/elevation/**
       - tests/source-catalog/**
 
 permissions:
