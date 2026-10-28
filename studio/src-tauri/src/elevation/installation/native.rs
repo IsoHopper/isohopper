@@ -66,11 +66,8 @@ unsafe fn sid_text(sid: PSID) -> Result<String, String> {
         .iter()
         .fold(0u64, |value, byte| value * 256 + u64::from(*byte));
     let mut result = format!("S-1-{authority}");
-    for part in bytes[8..].chunks_exact(4) {
-        result.push_str(&format!(
-            "-{}",
-            u32::from_le_bytes(part.try_into().unwrap())
-        ));
+    for part in bytes[8..].as_chunks::<4>().0 {
+        result.push_str(&format!("-{}", u32::from_le_bytes(*part)));
     }
     Ok(result)
 }
@@ -413,8 +410,7 @@ mod tests {
     #[test]
     #[ignore = "requires the matching NSIS package to be installed on this Windows test machine"]
     fn native_installed_helper_is_protected_and_matches_build() {
-        let expected = option_env!("ISOHOPPER_HELPER_SHA256")
-            .expect("test must run from the matching staged Studio build");
+        let expected = env!("ISOHOPPER_HELPER_SHA256");
         let directory = PathBuf::from(program_files().unwrap()).join("IsoHopper");
         let mut installation = Installation::open(&directory).unwrap();
         let digest = crate::elevation::check_digest(installation.image(), expected).unwrap();
