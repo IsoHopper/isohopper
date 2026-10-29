@@ -28,7 +28,7 @@ These builds remember the engine, image library and Studio preferences between s
 ## Install an empty bootable drive
 
 1. Open **Prepare drive** and choose the USB or SD device. Check its model, device ID, serial, exact capacity and sector sizes. Refresh and select again if the selection expires.
-2. Select **Install ISOHopper**. Studio gets the verified engine if needed, then requests Windows elevation. The helper checks the target and builds a private GPT image with an empty exFAT data partition. Staging does not write the physical target. The **Image library is independent**: imported, missing or failed images are not included in this installation.
+2. Select **Install ISOHopper**. Studio gets the verified engine if needed, then requests Windows elevation. The helper checks the target and builds a private GPT image with an exFAT data partition, the boot-menu theme and no OS images. Staging does not write the physical target. The **Image library is independent**: imported, missing or failed images are not included in this installation.
 3. At **Review & confirm**, inspect the **Helper-bound target**, image SHA-256 and description digest. These identify the retained device and staged image. No ISO is required.
 4. Enter or paste **`ENABLE_WRITE`**, then click **Install ISOHopper** again. The confirmation applies only to this device and this installation job. This authorizes replacement of the entire selected device, including every existing partition and file. The helper rechecks readiness and acquires all required volume locks before writing.
 5. Wait for writing, flushing and full readback verification to finish. Then copy your image files onto the drive's data partition using File Explorer. Subdirectories such as `Windows\Win11.iso` and `Mac\MacOS.img` are supported; file format support does not guarantee that a particular operating system boots.
@@ -47,4 +47,6 @@ A successful result has phase **`succeeded`**, **Written / verified** byte count
 
 After a successful write and helper cleanup, safely eject the device. For the initial boot test, use a spare **x64 UEFI** PC with Secure Boot off and choose its UEFI USB entry. After copying images to the drive, check that the engine menu lists the expected nested paths, then test one known image without installing over the PC's disks. Secure Boot, arbitrary OS images and installation compatibility are not established by a successful write or checksum.
 
-Studio's custom launcher settings and power-action previews are **not applied to the current engine USB menu**. They do not reboot, shut down or enter firmware setup on the Windows host.
+Newly prepared drives include the fixed IsoHopper boot-menu theme under `ventoy/isohopper/`, configured by `ventoy/ventoy.json`. The menu lists the images actually on the drive and retains the engine's tools and F7 text fallback. Existing USB drives are not updated automatically.
+
+Studio's editable launcher settings and power-action previews are **not applied to the engine USB menu**. They do not reboot, shut down or enter firmware setup on the Windows host.

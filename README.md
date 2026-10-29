@@ -19,11 +19,21 @@ Local preview with mocked runtime data; this menu is not installed on current en
 
 </details>
 
+<details>
+<summary>Installed USB theme</summary>
+
+![IsoHopper engine theme with a nested Linux folder in QEMU](docs/screenshots/usb-menu.png)
+
+Actual x64 UEFI guest using the bundled theme and real image entries. The engine menu is separate from Studio's richer preview; this is virtual-machine evidence, not a physical USB test.
+
+</details>
+
 ## Current scope
 
 - **Native imports:** files and folder trees, including `Windows/Win11.iso` and `Mac/MacOS.img`. Rust streams SHA-256 for large files; checksums and device identifiers can be copied in full.
 - **Session restore:** saved image selections are reopened and rehashed. Settings and engine selection persist; changed or missing files are reported.
 - **Windows installation:** choose a drive, select **Install ISOHopper**, review its identity, enter or paste `ENABLE_WRITE`, then confirm. The installed helper prepares an empty GPT/exFAT bootable drive and verifies the full write by readback. No ISO selection; copy files onto the USB afterwards. The pinned engine downloads automatically or can be supplied offline.
+- **USB boot menu:** newly prepared drives include an IsoHopper theme, real engine entries, existing tools and F7 text fallback. Existing drives are not updated automatically.
 - **macOS / Linux:** real device inspection and local image hashing. USB preparation is not implemented.
 - **CLI:** inspect devices/images, validate configuration and create test images. `image engine` requires the pinned external archive and leaves its data partition unformatted.
 
@@ -52,12 +62,13 @@ Local checks on 29 October 2026:
 
 | Check | Result and limit |
 | --- | --- |
-| Rust | 498 workspace tests and 4 firmware-policy tests passed; 4 fixtures skipped. Updated confirmation tests and strict Clippy passed. |
-| Studio | 87 native tests passed, 2 opt-in fixtures skipped. 51 frontend unit tests and 132 Chromium cases passed. Browser checks use mocked IPC/devices; native file tests use temporary files. |
+| Rust | 507 workspace tests and 4 firmware-policy tests passed; 4 fixtures skipped. Updated confirmation tests and strict Clippy passed. |
+| Studio | 87 native tests passed, 2 opt-in fixtures skipped. 55 frontend unit tests and 146 Chromium cases passed. Browser checks use mocked IPC/devices; native file tests use temporary files. |
 | Engine | Official pinned archive downloaded, hashed and reused from cache in a separate live test. Stream failures and cancellation use mocks. |
 | Tooling | 70 Python tests passed. Release-note checks were repeated after edits. |
 | Windows | Release gates require installed Studio and disposable-VHD checks at the exact revision. Installed UAC-token coverage is explicitly unavailable on runners without a split token. No physical USB tested. |
 | Boot | Rust-built GPT booted Alpine 3.24.3 in QEMU; mounted ISO hash matched. Windows Setup read its WIM in an adjusted GPT fixture, not an unchanged Studio-to-USB test. |
+| USB theme | Bundled asset hashes verified in QEMU staging. Empty and populated menus, nested folders and text/graphical mode switching checked on x64 UEFI. |
 
 <details>
 <summary>Windows Setup test screenshot</summary>
@@ -68,7 +79,7 @@ Actual x64 UEFI guest. Diagnostic GPT geometry was adjusted to match a transplan
 
 </details>
 
-The reported Windows helper disconnect needs human retesting; source-rejection errors and exit diagnostics are now preserved. Interactive UAC, physical USB behavior, broad OS compatibility and Secure Boot signing remain unvalidated. Windows packages are unsigned; macOS packages are not notarized. [Current Actions](https://github.com/IsoHopper/isohopper/actions).
+The reported Windows metadata error (`os error 87`) remains under investigation; current source identifies the failing query without weakening device checks. Helper-disconnect diagnostics also need human retesting. Interactive UAC, physical USB behavior, broad OS compatibility and Secure Boot signing remain unvalidated. Windows packages are unsigned; macOS packages are not notarized. [Current Actions](https://github.com/IsoHopper/isohopper/actions).
 
 ## Relation to Ventoy
 
