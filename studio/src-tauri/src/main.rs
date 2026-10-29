@@ -332,6 +332,16 @@ async fn inspect_devices() -> Result<isohopper_inventory::Inventory, String> {
     .map_err(|e| e.to_string())?
 }
 fn main() {
+    #[cfg(all(windows, debug_assertions))]
+    if preparation::diagnostic::requested() {
+        match preparation::diagnostic::run() {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("Empty preparation diagnostic failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             capabilities,

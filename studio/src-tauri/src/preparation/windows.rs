@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! One native-owned session. The renderer supplies opaque selections only.
-use super::{ACTIVE, Job, Snapshot, inputs::Inputs, jobs, protocol::ClientSession, targets};
+use super::{
+    ACTIVE, Job, Snapshot, inputs::Inputs, jobs, protocol::ClientSession, targets, with_cleanup,
+};
+#[cfg(debug_assertions)]
+#[path = "diagnostic.rs"]
+pub(crate) mod diagnostic;
 use crate::elevation::{Launched, launch_preparation};
 use isohopper_helper::prepare_protocol::{ClientMessage, Outcome, ServerFrame, ServerMessage};
 use std::{
@@ -80,7 +85,7 @@ impl Channel {
             .ok_or("Helper connection is closed")?
             .read_frame(Instant::now() + Duration::from_secs(30), &job.abort)
             .map_err(|e| e.to_string())?
-            .ok_or("Helper closed before a terminal response")?;
+            .ok_or_else(|| self.protocol.closed_error())?;
         let frame = ServerFrame::decode(&bytes).map_err(|e| e.to_string())?;
         self.protocol.accept(&frame)?;
         self.current = Some(frame);
@@ -316,7 +321,7 @@ fn run(
                     }
                 }
                 ServerMessage::AwaitConfirmation => {
-                    job.update(|s| { s.phase = "await_confirmation".into(); s.message = if crate::PHYSICAL_PREPARATION_ENABLED { "Review the exact target and staged image, then type the full challenge to write.".into() } else { "Staged image ready. Physical writing is disabled in this build; cancel to clean up.".into() }; })?;
+                    job.update(|s| { s.phase = "await_confirmation".into(); s.message = if crate::PHYSICAL_PREPARATION_ENABLED { "Review the exact target and staged image, then enter ENABLE_WRITE to write.".into() } else { "Staged image ready. Physical writing is disabled in this build; cancel to clean up.".into() }; })?;
                     let mut state = job
                         .state
                         .lock()
@@ -356,7 +361,7 @@ fn run(
         if connection.terminal_received {
             cleanup
         } else {
-            result.and(cleanup)
+            with_cleanup(result, cleanup)
         }
     } else {
         result

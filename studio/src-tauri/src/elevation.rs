@@ -6,6 +6,8 @@ mod installation;
 #[cfg(windows)]
 #[path = "elevation/windows.rs"]
 mod windows;
+#[cfg(all(windows, debug_assertions))]
+pub(crate) use windows::accept_diagnostic_helper;
 #[cfg(windows)]
 pub use windows::run;
 #[cfg(windows)]

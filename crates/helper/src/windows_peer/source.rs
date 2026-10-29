@@ -48,9 +48,18 @@ pub(super) fn receive(
     remote: u64,
 ) -> Result<File, PeerError> {
     let handle = decode::transfer(&mut Native { process, evidence }, remote)?;
+    Ok(File::from(handle))
+}
+
+pub(super) fn receive_checked(
+    process: &OwnedHandle,
+    evidence: &PeerEvidence,
+    remote: u64,
+) -> Result<Result<File, PeerError>, PeerError> {
+    let handle = decode::transfer_checked(&mut Native { process, evidence }, remote)?;
     // Only the synchronous, read-only, reclassified ReOpenFile result reaches
     // this conversion. Unknown duplicated kernel objects never become Files.
-    Ok(File::from(handle))
+    Ok(handle.map(File::from))
 }
 
 struct Native<'a> {

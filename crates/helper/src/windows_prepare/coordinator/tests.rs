@@ -15,6 +15,8 @@ struct Wire {
     fail_progress: Option<Phase>,
     cancel_progress: Option<Phase>,
     terminal: Option<ServerMessage>,
+    reject_source: bool,
+    break_source_transport: bool,
 }
 impl Transport for Wire {
     fn exchange(&mut self, body: ServerMessage) -> Result<ClientMessage, String> {
@@ -31,7 +33,8 @@ impl Transport for Wire {
                     Ok(ClientMessage::Continue)
                 }
             }
-            ServerMessage::Prepared { .. } => {
+            ServerMessage::Prepared { ref challenge, .. } => {
+                assert_eq!(challenge, "ENABLE_WRITE");
                 self.events.lock().unwrap().push("prepared");
                 Ok(self.replies.pop_front().unwrap())
             }
@@ -46,8 +49,14 @@ impl Transport for Wire {
             _ => Ok(self.replies.pop_front().unwrap()),
         }
     }
-    fn receive(&mut self, _: u64) -> Result<std::fs::File, String> {
-        Ok(tempfile::tempfile().unwrap())
+    fn receive(&mut self, _: u64) -> Result<Result<std::fs::File, String>, String> {
+        if self.break_source_transport {
+            return Err("peer authentication failed".into());
+        }
+        if self.reject_source {
+            return Ok(Err("source handle is not a disk file".into()));
+        }
+        Ok(Ok(tempfile::tempfile().unwrap()))
     }
     fn finish(&mut self) -> Result<(), String> {
         Ok(())
@@ -151,7 +160,50 @@ fn wire(events: Arc<Mutex<Vec<&'static str>>>, last: Vec<ClientMessage>) -> Wire
         fail_progress: None,
         cancel_progress: None,
         terminal: None,
+        reject_source: false,
+        break_source_transport: false,
     }
+}
+
+#[test]
+fn rejected_source_reports_failure_without_calling_executor() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut wire = wire(events.clone(), vec![]);
+    wire.reject_source = true;
+    run(
+        &mut wire,
+        Backend {
+            events: events.clone(),
+            source_count: 1,
+            wait_cancel: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(*events.lock().unwrap(), ["failed"]);
+    assert!(matches!(wire.terminal, Some(ServerMessage::Terminal {
+        outcome: Outcome::Failed, phase: Phase::Receiving, ref message,
+        bytes_written: 0, bytes_verified: 0, target_may_be_incomplete: false, ..
+    }) if message.contains("source handle is not a disk file")));
+}
+
+#[test]
+fn source_authentication_failure_never_attempts_a_terminal_reply() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut wire = wire(events.clone(), vec![]);
+    wire.break_source_transport = true;
+    assert_eq!(
+        run(
+            &mut wire,
+            Backend {
+                events: events.clone(),
+                source_count: 1,
+                wait_cancel: false
+            }
+        ),
+        Err("peer authentication failed".into())
+    );
+    assert!(events.lock().unwrap().is_empty());
+    assert!(wire.terminal.is_none());
 }
 #[test]
 fn release_and_exact_confirmation_precede_write() {
@@ -186,20 +238,20 @@ fn missing_release_or_changed_confirmation_never_writes() {
     for replies in [
         vec![ClientMessage::Confirm {
             description_digest: hex::encode(description().digest()),
-            challenge: "WIPE SERIAL".into(),
+            challenge: "ENABLE_WRITE".into(),
         }],
         vec![
             ClientMessage::SourcesReleased,
             ClientMessage::Confirm {
                 description_digest: hex::encode([9; 32]),
-                challenge: "WIPE SERIAL".into(),
+                challenge: "ENABLE_WRITE".into(),
             },
         ],
         vec![
             ClientMessage::SourcesReleased,
             ClientMessage::Confirm {
                 description_digest: hex::encode(description().digest()),
-                challenge: "WIPE RIAL".into(),
+                challenge: "enable_write".into(),
             },
         ],
         vec![ClientMessage::Cancel],

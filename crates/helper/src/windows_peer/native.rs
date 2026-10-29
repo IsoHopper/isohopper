@@ -133,6 +133,18 @@ impl ProcessPeer {
         self.revalidate()?;
         result
     }
+
+    /// Preserve the distinction between a rejected file and failed peer checks
+    /// for a terminal failure report. Neither failure grants a source handle.
+    pub(crate) fn receive_source_file_checked(
+        &mut self,
+        remote: u64,
+    ) -> Result<Result<std::fs::File, PeerError>, PeerError> {
+        self.revalidate()?;
+        let result = source::receive_checked(&self.process, &self.evidence, remote);
+        self.revalidate()?;
+        result
+    }
 }
 
 struct InstalledPeer<'a> {

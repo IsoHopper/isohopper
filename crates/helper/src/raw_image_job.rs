@@ -68,25 +68,12 @@ impl PreparedRawImage {
     pub fn new(description: RawImageDescription) -> Result<Self, RawImageError> {
         validate(&description)?;
         let digest = digest(&description);
-        let challenge = if description.target.serial.is_empty() {
-            format!(
-                "WIPE NAA:{}",
-                hex::encode(
-                    description
-                        .target
-                        .device_id
-                        .as_ref()
-                        .expect("validated identity")
-                        .as_bytes()
-                )
-            )
-        } else {
-            format!("WIPE {}", description.target.serial)
-        };
         Ok(Self {
             description,
             digest,
-            challenge,
+            // The phrase is an explicit acknowledgement; the immutable
+            // description/digest and one-shot receipt bind the actual target.
+            challenge: "ENABLE_WRITE".into(),
         })
     }
     pub fn target(&self) -> &DeviceSnapshot {
@@ -117,7 +104,7 @@ pub struct PendingConfirmation {
 }
 
 impl PendingConfirmation {
-    /// Match the exact digest, supplied target snapshot and full challenge.
+    /// Match the exact digest, supplied target snapshot and acknowledgement.
     /// This does not inspect the target or prove a human supplied the challenge.
     /// Failed comparisons leave the instance pending; success consumes it once.
     pub fn confirm(

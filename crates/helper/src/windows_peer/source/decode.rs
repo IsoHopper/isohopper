@@ -71,18 +71,43 @@ pub(super) trait Backend {
 }
 
 pub(super) fn transfer<B: Backend>(backend: &mut B, remote: u64) -> Result<B::Handle, PeerError> {
-    let remote = remote_handle(remote)?;
-    backend.peer()?;
-    let original = backend.duplicate(remote)?;
-    let before = backend.snapshot(&original)?;
-    let reopened = backend.reopen(&original)?;
-    unchanged(&before, &backend.snapshot(&reopened)?)?;
-    unchanged(&before, &backend.snapshot(&original)?)?;
+    transfer_checked(backend, remote)?
+}
+
+// An outer failure means peer authentication failed. An inner failure means
+// the selected file was rejected, so an authenticated caller may report why.
+pub(super) fn transfer_checked<B: Backend>(
+    backend: &mut B,
+    remote: u64,
+) -> Result<Result<B::Handle, PeerError>, PeerError> {
+    match classified_transfer(backend, remote) {
+        Ok(handle) => Ok(Ok(handle)),
+        Err(TransferError::Source(error)) => Ok(Err(error)),
+        Err(TransferError::Peer(error)) => Err(error),
+    }
+}
+
+enum TransferError {
+    Peer(PeerError),
+    Source(PeerError),
+}
+fn classified_transfer<B: Backend>(
+    backend: &mut B,
+    remote: u64,
+) -> Result<B::Handle, TransferError> {
+    use TransferError::{Peer, Source};
+    let remote = remote_handle(remote).map_err(Source)?;
+    backend.peer().map_err(Peer)?;
+    let original = backend.duplicate(remote).map_err(Source)?;
+    let before = backend.snapshot(&original).map_err(Source)?;
+    let reopened = backend.reopen(&original).map_err(Source)?;
+    unchanged(&before, &backend.snapshot(&reopened).map_err(Source)?).map_err(Source)?;
+    unchanged(&before, &backend.snapshot(&original).map_err(Source)?).map_err(Source)?;
     // The sender must still retain the same source. A closed/reused remote
     // value must not silently change which file this transfer describes.
-    let fresh = backend.duplicate(remote)?;
-    unchanged(&before, &backend.snapshot(&fresh)?)?;
-    backend.peer()?;
+    let fresh = backend.duplicate(remote).map_err(Source)?;
+    unchanged(&before, &backend.snapshot(&fresh).map_err(Source)?).map_err(Source)?;
+    backend.peer().map_err(Peer)?;
     Ok(reopened)
 }
 

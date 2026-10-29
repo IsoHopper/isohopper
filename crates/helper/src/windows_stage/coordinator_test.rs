@@ -259,8 +259,8 @@ impl Transport for Wire {
             }
         })
     }
-    fn receive(&mut self, _: u64) -> Result<File, String> {
-        tempfile::tempfile().map_err(|e| e.to_string())
+    fn receive(&mut self, _: u64) -> Result<Result<File, String>, String> {
+        Ok(tempfile::tempfile().map_err(|e| e.to_string()))
     }
     fn finish(&mut self) -> Result<(), String> {
         assert!(self.finished);

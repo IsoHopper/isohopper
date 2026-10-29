@@ -171,18 +171,18 @@ impl Transport for Wire {
             .ok_or("Preparation sequence exhausted")?;
         Ok(reply.body)
     }
-    fn receive(&mut self, remote: u64) -> Result<File, String> {
+    fn receive(&mut self, remote: u64) -> Result<Result<File, String>, String> {
         self.local.revalidate().map_err(|e| e.to_string())?;
         let result = self
             .connection
-            .receive_source_file(
+            .receive_source_file_checked(
                 remote,
                 Instant::now() + Duration::from_secs(30),
                 &self.io_cancel,
             )
             .map_err(|e| e.to_string());
         self.local.revalidate().map_err(|e| e.to_string())?;
-        result
+        result.map(|received| received.map_err(|error| error.to_string()))
     }
     fn finish(&mut self) -> Result<(), String> {
         self.local.revalidate().map_err(|e| e.to_string())?;
@@ -460,3 +460,7 @@ fn write_phase(phase: writer::Phase) -> Phase {
         writer::Phase::Complete => Phase::Complete,
     }
 }
+
+#[cfg(test)]
+#[path = "native_tests.rs"]
+mod tests;

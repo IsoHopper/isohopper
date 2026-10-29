@@ -194,44 +194,7 @@ fn launch(
     else {
         return Ok(None);
     };
-    let launched = (|| -> Result<Launched, String> {
-        let handle = restricted_duplicate(original.as_raw_handle())?;
-        let exit_handle = restricted_duplicate(original.as_raw_handle())?;
-        let cancel = AtomicBool::new(false);
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut evidence = None;
-        // The preparation helper enables its volume privilege before connecting.
-        // Capture its token only after that rendezvous; the retained ShellExecute
-        // process handle still selects the exact child, without reopening a PID.
-        let connection = server
-            .accept_with_peer(
-                || {
-                    let remote = ProcessPeer::from_owned_handle(handle)?
-                        .bind_installation(Arc::clone(&installation), InstalledRole::Helper)?;
-                    local.revalidate()?;
-                    check_pair(local.evidence(), remote.evidence()).map_err(|error| {
-                        PipeError::Io {
-                            stage: "capture prepared helper",
-                            source: io::Error::other(error.to_string()),
-                        }
-                    })?;
-                    evidence = Some(remote.evidence().clone());
-                    Ok(remote)
-                },
-                deadline,
-                &cancel,
-            )
-            .map_err(|e| e.to_string())?;
-        let evidence = evidence.ok_or("Missing launched helper identity")?;
-        Ok(Launched {
-            connection: Some(connection),
-            local,
-            exit_handle,
-            digest,
-            helper_pid: evidence.process_id,
-            helper_created: evidence.creation_time,
-        })
-    })();
+    let launched = accept_helper(server, &original, local, installation, digest);
     // The closure consumes the server, so failed setup closes its pipe before
     // waiting. Keep the exact ShellExecute handle until the child has unwound.
     if launched.is_err() {
@@ -246,6 +209,49 @@ fn launch(
         }
     }
     launched.map(Some)
+}
+
+fn accept_helper(
+    server: Server,
+    original: &OwnedHandle,
+    mut local: ProcessPeer,
+    installation: Arc<isohopper_helper::windows_installation::MachineInstallation>,
+    digest: String,
+) -> Result<Launched, String> {
+    let handle = restricted_duplicate(original.as_raw_handle())?;
+    let exit_handle = restricted_duplicate(original.as_raw_handle())?;
+    let cancel = AtomicBool::new(false);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut evidence = None;
+    // The preparation helper enables its volume privilege before connecting.
+    // Capture its token only after that rendezvous; the retained ShellExecute
+    // process handle still selects the exact child, without reopening a PID.
+    let connection = server
+        .accept_with_peer(
+            || {
+                let remote = ProcessPeer::from_owned_handle(handle)?
+                    .bind_installation(Arc::clone(&installation), InstalledRole::Helper)?;
+                local.revalidate()?;
+                check_pair(local.evidence(), remote.evidence()).map_err(|error| PipeError::Io {
+                    stage: "capture prepared helper",
+                    source: io::Error::other(error.to_string()),
+                })?;
+                evidence = Some(remote.evidence().clone());
+                Ok(remote)
+            },
+            deadline,
+            &cancel,
+        )
+        .map_err(|e| e.to_string())?;
+    let evidence = evidence.ok_or("Missing launched helper identity")?;
+    Ok(Launched {
+        connection: Some(connection),
+        local,
+        exit_handle,
+        digest,
+        helper_pid: evidence.process_id,
+        helper_created: evidence.creation_time,
+    })
 }
 
 pub(crate) struct Launched {
@@ -293,6 +299,41 @@ pub(crate) fn launch_preparation(
     expected_digest: &str,
 ) -> Result<Option<Launched>, String> {
     launch(owner, directory, expected_digest, true)
+}
+
+/// Debug-only installed integration: the elevated test parent starts the exact
+/// helper instead of displaying UAC. All subsequent checks match normal launch.
+#[cfg(debug_assertions)]
+pub(crate) fn accept_diagnostic_helper(
+    server: Server,
+    helper_pid: u32,
+) -> Result<Launched, String> {
+    use isohopper_helper::windows_installation::MachineInstallation;
+    use windows_sys::Win32::System::Threading::OpenProcess;
+    let mut local = current_peer().map_err(|e| e.to_string())?;
+    check_studio(local.evidence()).map_err(|e| e.to_string())?;
+    let installation = Arc::new(MachineInstallation::open()?);
+    local = local
+        .bind_installation(Arc::clone(&installation), InstalledRole::Studio)
+        .map_err(|e| e.to_string())?;
+    let digest = check_digest(
+        &mut installation.image(InstalledRole::Helper),
+        env!("ISOHOPPER_HELPER_SHA256"),
+    )?;
+    // The public routing PID is retained once, then checked against the fixed
+    // installed role, split-token pair and kernel pipe PID in accept_helper.
+    let raw = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            helper_pid,
+        )
+    };
+    if raw.is_null() {
+        return Err(last("Open diagnostic helper"));
+    }
+    let original = unsafe { OwnedHandle::from_raw_handle(raw) };
+    accept_helper(server, &original, local, installation, digest)
 }
 
 pub fn run(owner: usize, directory: &Path, expected_digest: &str) -> Result<ProbeOutcome, String> {

@@ -19,7 +19,9 @@ use std::{
 
 pub(crate) trait Transport {
     fn exchange(&mut self, body: ServerMessage) -> Result<ClientMessage, String>;
-    fn receive(&mut self, handle: u64) -> Result<File, String>;
+    // Outer failure is a broken/authentication-failed transport; inner failure
+    // is a rejected source and must produce a terminal report without execution.
+    fn receive(&mut self, handle: u64) -> Result<Result<File, String>, String>;
     fn finish(&mut self) -> Result<(), String>;
 }
 pub(crate) struct Inputs {
@@ -116,7 +118,10 @@ fn active(reply: ClientMessage, phase: Phase) -> Result<ClientMessage, RunError>
     }
 }
 fn transfer(transport: &mut impl Transport, handle: u64) -> Result<File, RunError> {
-    transport.receive(handle).map_err(RunError::Transport)
+    transport
+        .receive(handle)
+        .map_err(RunError::Transport)?
+        .map_err(invalid)
 }
 
 struct Joined<R> {

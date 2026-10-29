@@ -224,6 +224,35 @@ fn any_failed_step_returns_no_file_and_closes_every_created_duplicate() {
     assert!(fixture.events.borrow().is_empty());
 }
 
+#[test]
+fn source_rejections_are_distinct_from_peer_authentication_failures() {
+    for step in ["peer before", "peer after"] {
+        let mut fixture = Fixture::new();
+        fixture.fail = Some(step);
+        assert!(
+            decode::transfer_checked(&mut fixture, 0x1234).is_err(),
+            "{step}"
+        );
+    }
+    for step in [
+        "original",
+        "snapshot original",
+        "reopen",
+        "snapshot reopened",
+        "fresh",
+        "snapshot fresh",
+    ] {
+        let mut fixture = Fixture::new();
+        fixture.fail = Some(step);
+        assert!(
+            decode::transfer_checked(&mut fixture, 0x1234)
+                .unwrap()
+                .is_err(),
+            "{step}"
+        );
+    }
+}
+
 #[cfg(windows)]
 fn source_bytes() -> Vec<u8> {
     (0..8193).map(|index| (index % 251) as u8).collect()

@@ -185,6 +185,25 @@ try {
     $testExit = $LASTEXITCODE
     Get-Content installed-check.log
     if ($testExit -ne 0) { throw 'Production installed-file protection check failed after upgrades.' }
+    # Execute the actual installed debug Studio and helper with Limited/Full
+    # linked tokens. This fixed flow cancels at InputsReady, before any target
+    # lookup or staging. It complements the separate owned-VHD storage tests.
+    & cargo test --manifest-path studio/src-tauri/Cargo.toml --locked native_installed_empty_preparation_handoff_cancels_before_execution -- --ignored --nocapture *> installed-preparation-check.log
+    $testExit = $LASTEXITCODE
+    Get-Content installed-preparation-check.log
+    if ($testExit -ne 0) {
+        $detail = [IO.File]::ReadAllText((Join-Path $env:GITHUB_WORKSPACE 'installed-preparation-check.log'))
+        if ($detail.Length -gt 2800) { $detail = $detail.Substring($detail.Length - 2800) }
+        throw "Installed empty preparation handoff failed: $detail"
+    }
+    $handoff = [IO.File]::ReadAllText((Join-Path $env:GITHUB_WORKSPACE 'installed-preparation-check.log'))
+    if ($handoff.Contains('INSTALLED_EMPTY_PREPARATION_HANDOFF_UNSUPPORTED reason=no_split_token')) {
+        Write-Output '::warning title=Installed preparation coverage unavailable::This runner has no linked Limited token. The real installed cross-integrity handoff was not executed; native pipe/source tests are separate evidence.'
+    } elseif ($handoff.Contains('INSTALLED_EMPTY_PREPARATION_HANDOFF_OK')) {
+        Write-Output '::notice title=Installed empty preparation handoff::Real Limited Studio and elevated helper transferred the engine handle and cancelled before target access. No interactive UAC or physical-device operation tested.'
+    } else {
+        throw 'Installed preparation test returned without a supported result marker.'
+    }
     Write-Output '::notice title=Windows installer check::Fresh install, published .3 upgrade, silent/passive repair, retained executable busy refusal, registry isolation, partial/empty recovery, user-data preservation and native protected-file checks passed; no physical-device operation or interactive UAC tested.'
 } finally {
     if (-not $skipCleanup) {

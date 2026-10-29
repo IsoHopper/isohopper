@@ -286,6 +286,16 @@ pub fn cancel(id: &str) -> Result<(), String> {
     selected(id)?.cancel()
 }
 
+fn with_cleanup(result: Result<(), String>, cleanup: Result<(), String>) -> Result<(), String> {
+    match (result, cleanup) {
+        (Err(primary), Err(cleanup)) => Err(format!("{primary}. {cleanup}")),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+#[cfg(all(windows, debug_assertions))]
+pub(crate) use windows::diagnostic;
 #[cfg(windows)]
 pub use windows::start;
 
@@ -294,6 +304,26 @@ mod tests {
     use super::*;
     use crate::imports::source_catalog::{PreparedSource, SourceCatalog};
     use std::fs::File;
+
+    #[test]
+    fn helper_exit_failure_is_preserved_after_a_transport_failure() {
+        assert_eq!(
+            with_cleanup(
+                Err("Helper closed before a terminal response".into()),
+                Err("Helper exited with status 3".into()),
+            ),
+            Err("Helper closed before a terminal response. Helper exited with status 3".into())
+        );
+        assert_eq!(
+            with_cleanup(Ok(()), Err("cleanup".into())),
+            Err("cleanup".into())
+        );
+        assert_eq!(
+            with_cleanup(Err("transport".into()), Ok(())),
+            Err("transport".into())
+        );
+        assert_eq!(with_cleanup(Ok(()), Ok(())), Ok(()));
+    }
 
     fn input_fixture(
         names: &[&str],
@@ -675,7 +705,7 @@ mod tests {
         job.update(|s| {
             s.phase = "await_confirmation".into();
             s.description_digest = Some("a".repeat(64));
-            s.challenge = Some("WIPE Serial-AbC".into());
+            s.challenge = Some("ENABLE_WRITE".into());
         })
         .unwrap();
         job
@@ -686,7 +716,7 @@ mod tests {
         let job = pending();
         job.note_reply(&ClientMessage::Confirm {
             description_digest: "a".repeat(64),
-            challenge: "WIPE Serial-AbC".into(),
+            challenge: "ENABLE_WRITE".into(),
         })
         .unwrap();
         assert!(job.snapshot().unwrap().target_may_be_incomplete);
@@ -702,43 +732,23 @@ mod tests {
     #[test]
     fn confirmation_requires_exact_current_state_and_can_only_be_queued_once() {
         let job = pending();
-        assert!(
-            job.confirm("b".repeat(64), "WIPE Serial-AbC".into())
-                .is_err()
-        );
-        assert!(
-            job.confirm("a".repeat(64), "WIPE SERIAL-ABC".into())
-                .is_err()
-        );
-        job.confirm("a".repeat(64), "WIPE Serial-AbC".into())
-            .unwrap();
-        assert!(
-            job.confirm("a".repeat(64), "WIPE Serial-AbC".into())
-                .is_err()
-        );
+        assert!(job.confirm("b".repeat(64), "ENABLE_WRITE".into()).is_err());
+        assert!(job.confirm("a".repeat(64), "enable_write".into()).is_err());
+        job.confirm("a".repeat(64), "ENABLE_WRITE".into()).unwrap();
+        assert!(job.confirm("a".repeat(64), "ENABLE_WRITE".into()).is_err());
         let mut state = job.state.lock().unwrap();
-        assert_eq!(
-            state.confirmation.take().unwrap().challenge,
-            "WIPE Serial-AbC"
-        );
+        assert_eq!(state.confirmation.take().unwrap().challenge, "ENABLE_WRITE");
         drop(state);
-        assert!(
-            job.confirm("a".repeat(64), "WIPE Serial-AbC".into())
-                .is_err()
-        );
+        assert!(job.confirm("a".repeat(64), "ENABLE_WRITE".into()).is_err());
     }
     #[test]
     fn cancel_supersedes_queued_confirmation_without_claiming_completion() {
         let job = pending();
-        job.confirm("a".repeat(64), "WIPE Serial-AbC".into())
-            .unwrap();
+        job.confirm("a".repeat(64), "ENABLE_WRITE".into()).unwrap();
         job.cancel().unwrap();
         assert!(job.state.lock().unwrap().confirmation.is_none());
         assert!(job.snapshot().unwrap().active);
         assert!(job.snapshot().unwrap().cancel_requested);
-        assert!(
-            job.confirm("a".repeat(64), "WIPE Serial-AbC".into())
-                .is_err()
-        );
+        assert!(job.confirm("a".repeat(64), "ENABLE_WRITE".into()).is_err());
     }
 }

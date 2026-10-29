@@ -196,54 +196,52 @@ fn rejects_missing_oversized_ambiguous_or_malformed_boot_provenance() {
 #[test]
 fn failed_confirmation_preserves_pending_and_success_consumes_it_once() {
     let prepared = PreparedRawImage::new(description()).unwrap();
+    assert_eq!(prepared.challenge(), "ENABLE_WRITE");
     let digest = prepared.digest();
     let target = prepared.target().clone();
     let mut pending = prepared.into_confirmation();
     let mut wrong_digest = digest;
     wrong_digest[0] ^= 1;
     assert!(matches!(
-        pending.confirm(&wrong_digest, &target, "WIPE USB-TEST-0001"),
+        pending.confirm(&wrong_digest, &target, "ENABLE_WRITE"),
         Err(RawImageError::DigestMismatch)
     ));
     let mut wrong_target = target.clone();
     wrong_target.geometry.physical_sector_size *= 2;
     assert!(matches!(
-        pending.confirm(&digest, &wrong_target, "WIPE USB-TEST-0001"),
+        pending.confirm(&digest, &wrong_target, "ENABLE_WRITE"),
         Err(RawImageError::TargetMismatch)
     ));
     for challenge in [
         "",
         "USB-TEST-0001",
-        "WIPE usb-test-0001",
-        "WIPE USB-TEST-0001 ",
+        "WIPE USB-TEST-0001",
+        "enable_write",
+        "ENABLE_WRITE ",
+        " ENABLE_WRITE",
     ] {
         assert!(matches!(
             pending.confirm(&digest, &target, challenge),
             Err(RawImageError::ChallengeMismatch)
         ));
     }
-    let receipt = pending
-        .confirm(&digest, &target, "WIPE USB-TEST-0001")
-        .unwrap();
+    let receipt = pending.confirm(&digest, &target, "ENABLE_WRITE").unwrap();
     assert_eq!(receipt.description().digest(), digest);
     assert_eq!(receipt.description().image(), &description().image);
     assert!(matches!(
-        pending.confirm(&digest, &target, "WIPE USB-TEST-0001"),
+        pending.confirm(&digest, &target, "ENABLE_WRITE"),
         Err(RawImageError::AlreadyConfirmed)
     ));
 }
 
 #[test]
-fn challenge_uses_full_identity_and_confirmation_is_only_per_instance() {
+fn fixed_phrase_keeps_device_binding_and_confirmation_is_only_per_instance() {
     let mut input = description();
     input.target.serial.clear();
     input.target.device_id = Some(StableDeviceId::from_naa128([0x60; 16]).unwrap());
     for _ in 0..2 {
         let prepared = PreparedRawImage::new(input.clone()).unwrap();
-        assert_eq!(
-            prepared.challenge(),
-            "WIPE NAA:60606060606060606060606060606060"
-        );
+        assert_eq!(prepared.challenge(), "ENABLE_WRITE");
         let digest = prepared.digest();
         let target = prepared.target().clone();
         let challenge = prepared.challenge().to_owned();

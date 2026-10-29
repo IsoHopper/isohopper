@@ -354,15 +354,33 @@ impl Connection {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<std::fs::File, PipeError> {
+        let result = self
+            .receive_source_file_checked(remote, deadline, cancel)
+            .and_then(|received| received.map_err(PipeError::from));
+        if result.is_err() {
+            self.handle = None;
+        }
+        result
+    }
+
+    /// A rejected file may be reported once by the preparation coordinator.
+    /// Peer, pipe and deadline failures still poison the connection. Reporting
+    /// does not return a file, and each subsequent frame rechecks the peer.
+    pub(crate) fn receive_source_file_checked(
+        &mut self,
+        remote: u64,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<Result<std::fs::File, crate::windows_peer::PeerError>, PipeError> {
         let result = (|| {
             check_deadline(deadline, cancel)?;
             self.check_peer()?;
             check_deadline(deadline, cancel)?;
-            let received = self.expected.receive_source_file(remote);
+            let received = self.expected.receive_source_file_checked(remote)?;
             check_deadline(deadline, cancel)?;
             self.check_peer()?;
             check_deadline(deadline, cancel)?;
-            received.map_err(PipeError::from)
+            Ok(received)
         })();
         if result.is_err() {
             self.handle = None;

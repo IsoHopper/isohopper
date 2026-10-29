@@ -38,6 +38,23 @@ impl ClientSession {
             committed: false,
         }
     }
+    pub fn closed_error(&self) -> String {
+        let expected = match self.next {
+            Next::Hello => "greeting",
+            Next::Archive => "engine request",
+            Next::Source(_) => "source request",
+            Next::Inputs => "input acknowledgement",
+            Next::Working => "image preparation",
+            Next::Confirmation => "confirmation request",
+            Next::Committed => "device write result",
+            Next::Terminal => "cancellation result",
+            Next::Closed => "connection close",
+        };
+        format!(
+            "Helper closed before a terminal response (waiting for {expected}; message {})",
+            self.sequence
+        )
+    }
     pub fn accept(&mut self, frame: &ServerFrame) -> Result<(), String> {
         frame.validate().map_err(|e| e.to_string())?;
         if self.pending
@@ -172,6 +189,10 @@ mod tests {
     #[test]
     fn empty_media_transfers_engine_then_requires_inputs_ready_without_source_requests() {
         let mut session = ClientSession::new(0);
+        assert_eq!(
+            session.closed_error(),
+            "Helper closed before a terminal response (waiting for greeting; message 0)"
+        );
         let hello = frame(0, ServerMessage::Hello);
         session.accept(&hello).unwrap();
         session
@@ -183,6 +204,7 @@ mod tests {
                 },
             )
             .unwrap();
+        assert!(session.closed_error().contains("engine request; message 1"));
         let archive = frame(1, ServerMessage::NeedArchive);
         session.accept(&archive).unwrap();
         session
@@ -195,6 +217,11 @@ mod tests {
                 },
             )
             .unwrap();
+        assert!(
+            session
+                .closed_error()
+                .contains("input acknowledgement; message 2")
+        );
         assert!(
             session
                 .accept(&frame(2, ServerMessage::NeedSource { index: 0 }))
@@ -272,7 +299,7 @@ mod tests {
                 image_bytes: bytes,
                 image_sha256: "c".repeat(64),
                 description_digest: "d".repeat(64),
-                challenge: "WIPE serial".into(),
+                challenge: "ENABLE_WRITE".into(),
                 source_count: 1,
                 original_handles_closed: true,
             },
@@ -284,7 +311,7 @@ mod tests {
                     &prepared,
                     ClientMessage::Confirm {
                         description_digest: "d".repeat(64),
-                        challenge: "WIPE serial".into()
+                        challenge: "ENABLE_WRITE".into()
                     }
                 )
                 .is_err()
@@ -300,7 +327,7 @@ mod tests {
                 &confirm,
                 ClientMessage::Confirm {
                     description_digest: "d".repeat(64),
-                    challenge: "WIPE serial".into(),
+                    challenge: "ENABLE_WRITE".into(),
                 },
             )
             .unwrap();

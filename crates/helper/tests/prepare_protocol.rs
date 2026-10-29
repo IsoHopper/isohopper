@@ -102,7 +102,7 @@ fn exchange_checks_nonce_sequence_and_exact_reply_kind() {
     assert!(request.validate_reply(&reply).is_err());
     reply.body = ClientMessage::Confirm {
         description_digest: "cd".repeat(32),
-        challenge: "WIPE serial".into(),
+        challenge: "ENABLE_WRITE".into(),
     };
     assert!(request.validate_reply(&reply).is_err());
     reply.body = ClientMessage::Cancel;
@@ -157,7 +157,7 @@ fn prepared_requires_closed_sources_and_complete_target_facts() {
             image_bytes: 1024 * 1024 * 1024,
             image_sha256: "cd".repeat(32),
             description_digest: "ef".repeat(32),
-            challenge: "WIPE USB123".into(),
+            challenge: "ENABLE_WRITE".into(),
             source_count: 2,
             original_handles_closed: true,
         },

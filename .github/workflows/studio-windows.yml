@@ -89,6 +89,18 @@ jobs:
           python3 scripts/stage-windows-helper.py --source target/debug/isohopper-helper.exe
           npm --prefix studio/frontend ci --no-audit --no-fund
           npm --prefix studio/frontend run build
+      - name: Test empty preparation over the native pipe using temporary files
+        run: |
+          if cargo test --locked -p isohopper-helper --lib native_empty_preparation_ -- --ignored --nocapture > preparation-pipe.log 2>&1; then
+            cat preparation-pipe.log
+          else
+            python - <<'PYERR'
+          from pathlib import Path
+          detail = Path('preparation-pipe.log').read_text(errors='replace')[-3000:]
+          print('::error title=Empty preparation pipe failed::' + detail.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A'))
+          PYERR
+            exit 1
+          fi
       - name: Check native backend without requesting UAC
         run: |
           if {
