@@ -22,6 +22,8 @@ The separate Rust UEFI launcher supports EFI handoff and confirmed power actions
 
 Read the [Windows preparation guide](docs/usb-preparation.md) for engine setup, installation, staging space and first human test. Download an experimental build from [Releases](https://github.com/IsoHopper/isohopper/releases). Windows prepares media; macOS and Linux currently inspect and hash. Engine download and session restore are included from `v0.1.0-experimental.3`; earlier builds use manual archive selection.
 
+Prebuilt releases target Windows x64, Linux x64 and Apple silicon macOS. Intel Mac users can [build from source](CONTRIBUTING.md#intel-mac-source-build).
+
 For source builds, use the pinned Rust toolchain, Node.js 22.12+ and [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/). Windows also requires [building and staging the matching helper](CONTRIBUTING.md#development) before Studio.
 
 ```sh
@@ -42,7 +44,7 @@ Observed on 28 October 2026:
 | Rust | 485 workspace tests passed; 4 explicit fixtures skipped. Strict Clippy passed. |
 | Studio | 86 native tests passed, 2 opt-in fixtures skipped; 51 frontend tests and 112 Chromium cases passed. Browser bridge/device cases use mocks. Native file tests use real temporary files. |
 | Engine | Official pinned archive downloaded, hashed and reused from cache in a separate live test. Stream failures and cancellation use mocks. |
-| Packaging | 36 release-script tests passed. Publication requires all four native packages, exact-revision Windows checks and verified asset checksums. |
+| Packaging | 38 release-script tests passed (29 October). Publication requires all three release platforms, exact-revision Windows checks and verified asset checksums. |
 | Windows | Previous release: [installed Studio integration passed](https://github.com/IsoHopper/isohopper/actions/runs/40755258703). [Production staging and disposable-disk validation passed](https://github.com/IsoHopper/isohopper/actions/runs/40755258573), including nested copies, confirmation, write/readback and locks. Every release repeats these gates at its exact revision. No physical USB tested. |
 | Boot | Rust-built GPT booted Alpine 3.24.3 in QEMU; mounted ISO hash matched. Windows Setup read its WIM in an adjusted GPT fixture, not an unchanged Studio-to-USB test. |
 

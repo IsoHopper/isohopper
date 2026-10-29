@@ -16,7 +16,6 @@ PLATFORMS = {
     "linux-x64": (".deb", ".AppImage"),
     "windows-x64": ("-setup.exe",),
     "macos-arm64": (".dmg",),
-    "macos-x64": (".dmg",),
 }
 MAX_ASSET = 2 * 1024 * 1024 * 1024
 
@@ -146,16 +145,18 @@ This build fixes Windows installation and upgrades: run setup over an existing r
 | Download | Scope |
 | --- | --- |
 | `windows-x64-setup.exe` | Windows x64; installs, upgrades or repairs the protected Program Files installation. WebView2 may download during setup. |
-| `macos-arm64.dmg` / `macos-x64.dmg` | Apple Silicon / Intel Mac inspection and local hashing. |
+| `macos-arm64.dmg` | Apple Silicon Mac inspection and local hashing. |
 | `linux-x64.AppImage` / `.deb` | Linux x64 inspection and local hashing; built on Ubuntu 22.04. |
 | `isohopper-cli-*` | Standalone CLI, license and build information. |
 | `isohopper-source-*` | Project source at the exact revision below, including build scripts and dependency lockfiles. |
+
+Intel Macs can be built locally using the [source-build instructions](https://github.com/IsoHopper/isohopper/blob/{revision}/CONTRIBUTING.md#intel-mac-source-build). Intel macOS packages are not included in this release.
 
 No upstream boot-engine binaries, engine archives or OS images are included. Follow the [Windows preparation guide](https://github.com/IsoHopper/isohopper/blob/{revision}/docs/usb-preparation.md) for the pinned engine archive, staging-space requirements and first boot test. Launcher configuration and power-action previews are not applied to the engine USB menu.
 
 **Signing:** Windows packages are not Authenticode-signed. macOS apps are ad-hoc signed, not Developer ID signed or notarized. SHA-256 checks integrity, not publisher identity. Linux graphics/WebKit compatibility and the oldest advertised macOS version remain untested.
 
-**Build checks:** all four packages require native backend tests and CLI smoke checks. Host-neutral workspace and frontend tests run once on Linux. Publication additionally requires successful Windows Studio and disposable-VHD workflow runs for this exact source revision. Those checks do not establish interactive UAC behavior or real USB boot compatibility.
+**Build checks:** all three platforms require native backend tests and CLI smoke checks. Host-neutral workspace and frontend tests run once on Linux. Publication additionally requires successful Windows Studio and disposable-VHD workflow runs for this exact source revision. Those checks do not establish interactive UAC behavior or real USB boot compatibility.
 
 [Build logs]({run_url}) · [Exact source](https://github.com/IsoHopper/isohopper/tree/{revision}) · [GPL-3.0-or-later](https://github.com/IsoHopper/isohopper/blob/{revision}/LICENSE)
 
@@ -175,7 +176,7 @@ def main():
     run_url = "https://github.com/IsoHopper/isohopper/actions/runs/" + os.environ["GITHUB_RUN_ID"]
     (args.directory.parent / "release-notes.md").write_text(
         notes(args.tag, args.source_revision, run_url, report["capabilities"]), encoding="utf-8")
-    print("Verified all four platforms, project source and SHA-256 checksums.")
+    print("Verified all three platforms, project source and SHA-256 checksums.")
 
 
 if __name__ == "__main__":

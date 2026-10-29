@@ -78,7 +78,7 @@ class FakeApi:
 class PublishReleaseTests(unittest.TestCase):
     def setUp(self):
         # Share only the fixture, not its test methods.
-        self.fixture = verification_tests.VerifyReleaseTests(methodName='test_complete_release_writes_fifteen_checksums')
+        self.fixture = verification_tests.VerifyReleaseTests(methodName='test_complete_three_target_release_needs_no_intel_mac_assets')
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         self.native = self.fixture.source / 'studio/src-tauri/src/main.rs'
@@ -99,7 +99,8 @@ class PublishReleaseTests(unittest.TestCase):
 
     def test_publish_last_only_after_every_remote_digest_matches(self):
         self.run_publish()
-        self.assertEqual(len(self.api.assets), 16)
+        self.assertEqual(len(self.api.assets), 13)
+        self.assertFalse(any('macos-x64' in asset['name'] for asset in self.api.assets))
         self.assertEqual(self.api.calls[-1], ('PATCH', '/repos/IsoHopper/isohopper/releases/42',
             {'draft': False, 'prerelease': True, 'make_latest': 'false'}))
         create = next(body for method, path, body in self.api.calls if method == 'POST' and path.endswith('/releases'))

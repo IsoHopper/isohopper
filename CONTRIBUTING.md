@@ -30,6 +30,20 @@ python scripts/stage-windows-helper.py --source target/debug/isohopper-helper.ex
 
 Stage the release helper instead when packaging a release build. Studio embeds its checksum. The experimental elevation check requires the protected machine-wide NSIS installation in `Program Files\IsoHopper` on the Windows system drive; portable builds cannot run it. The installer supports upgrades and repair without removing user settings. It stages the new executables before replacing installed files and refuses replacement while Studio or its helper retains them. The elevation check tests the connection without accessing disks. Interactive UAC remains unvalidated. Windows Studio CI tests fresh installation, upgrading the pinned previous release, repeated silent/passive repair, preserved user data, and busy-file refusal on a disposable runner.
 
+## Intel Mac source build
+
+Prebuilt macOS releases target Apple silicon. To build on an Intel Mac, install the [macOS prerequisites](https://v2.tauri.app/start/prerequisites/#macos): Xcode Command Line Tools (`xcode-select --install`), Rust through rustup, and Node.js 22.12+. From the repository root:
+
+```sh
+rustup target add x86_64-apple-darwin
+npm --prefix studio/frontend ci
+(cd studio/src-tauri && npx --yes @tauri-apps/cli@2.12.4 build --target x86_64-apple-darwin --bundles dmg -- --locked)
+```
+
+The repository selects its pinned Rust toolchain. By default, the DMG is written under `studio/src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/`. For the CLI, run `cargo build --release --locked -p isohopper-cli --target x86_64-apple-darwin`; its executable is `target/x86_64-apple-darwin/release/isohopper`.
+
+macOS supports inspection and image hashing, not USB preparation. The app uses ad-hoc signing and is not notarized. Intel builds are not part of the release build matrix.
+
 ## Firmware tests
 
 These optional commands create a new regular-file image and test firmware entry in QEMU. They require the pinned Rust UEFI target, QEMU, and matching x64 OVMF/EDK2 code and variable-template files. Replace the firmware paths below with your installed files; choose a new output-image path on each run.

@@ -10,6 +10,12 @@ spec = importlib.util.spec_from_file_location("verify_release", Path(__file__).w
 release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
 
+RELEASE_PLATFORMS = {
+    "linux-x64": (".deb", ".AppImage"),
+    "windows-x64": ("-setup.exe",),
+    "macos-arm64": (".dmg",),
+}
+
 
 class VerifyReleaseTests(unittest.TestCase):
     def setUp(self):
@@ -23,7 +29,7 @@ class VerifyReleaseTests(unittest.TestCase):
         self.root.mkdir()
         self.tag = "v0.1.0-experimental.1"
         self.revision = "a" * 40
-        for platform, suffixes in release.PLATFORMS.items():
+        for platform, suffixes in RELEASE_PLATFORMS.items():
             names = [f"IsoHopper-{self.tag}-{platform}{suffix}" for suffix in suffixes]
             archive = ".zip" if platform == "windows-x64" else ".tar.gz"
             names.append(f"isohopper-cli-{self.tag}-{platform}{archive}")
@@ -48,9 +54,20 @@ class VerifyReleaseTests(unittest.TestCase):
     def verify(self):
         return release.verify(self.root, self.tag, self.revision, source_root=self.source)
 
-    def test_complete_release_writes_fifteen_checksums(self):
-        self.verify()
-        self.assertEqual(len((self.root / "SHA256SUMS.txt").read_text().splitlines()), 15)
+    def test_complete_three_target_release_needs_no_intel_mac_assets(self):
+        report = self.verify()
+        self.assertEqual(set(report['capabilities']), set(RELEASE_PLATFORMS))
+        self.assertEqual(len(report['assets']), 13)
+        self.assertFalse(any('macos-x64' in name for name in report['assets']))
+        self.assertEqual(len((self.root / "SHA256SUMS.txt").read_text().splitlines()), 12)
+
+    def test_release_notes_distinguish_downloads_from_local_intel_builds(self):
+        report = self.verify()
+        notes = release.notes(self.tag, self.revision, 'https://example.test/run', report['capabilities'])
+        self.assertIn('macos-arm64.dmg', notes)
+        self.assertNotIn('macos-x64.dmg', notes)
+        self.assertIn('Intel Macs can be built locally', notes)
+        self.assertIn('all three platforms', notes)
 
     def test_existing_checksums_are_verified_not_replaced(self):
         self.verify()
@@ -80,7 +97,7 @@ class VerifyReleaseTests(unittest.TestCase):
             path.write_text(original)
 
     def test_duplicate_manifest_keys_and_boolean_size_are_rejected(self):
-        path = self.root / 'manifest-macos-x64.json'
+        path = self.root / 'manifest-macos-arm64.json'
         original = path.read_text()
         path.write_text(original.replace('"schema_version": 2', '"schema_version": 2, "schema_version": 2'))
         with self.assertRaisesRegex(ValueError, 'Duplicate'):
@@ -91,10 +108,14 @@ class VerifyReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'metadata'):
             self.verify()
 
-    def test_rejects_missing_platform(self):
-        (self.root / "manifest-windows-x64.json").unlink()
-        with self.assertRaisesRegex(ValueError, "manifest"):
-            self.verify()
+    def test_rejects_each_missing_release_platform(self):
+        for platform in RELEASE_PLATFORMS:
+            path = self.root / f'manifest-{platform}.json'
+            original = path.read_bytes()
+            path.unlink()
+            with self.subTest(platform=platform), self.assertRaisesRegex(ValueError, "manifest"):
+                self.verify()
+            path.write_bytes(original)
 
     def test_rejects_tampered_package(self):
         next(self.root.glob("*.deb")).write_bytes(b"bad content!")
@@ -102,7 +123,7 @@ class VerifyReleaseTests(unittest.TestCase):
             self.verify()
 
     def test_rejects_mixed_source_revisions(self):
-        path = self.root / "manifest-macos-x64.json"
+        path = self.root / "manifest-macos-arm64.json"
         data = json.loads(path.read_text())
         data["source_revision"] = "b" * 40
         path.write_text(json.dumps(data))
@@ -114,8 +135,13 @@ class VerifyReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unexpected files"):
             self.verify()
 
+    def test_local_intel_manifest_is_not_in_the_published_asset_set(self):
+        (self.root / 'manifest-macos-x64.json').write_text('{}')
+        with self.assertRaisesRegex(ValueError, 'Unexpected files'):
+            self.verify()
+
     def test_rejects_path_traversal(self):
-        path = self.root / "manifest-macos-x64.json"
+        path = self.root / "manifest-macos-arm64.json"
         data = json.loads(path.read_text())
         data["artifacts"][0]["name"] = "../outside"
         path.write_text(json.dumps(data))

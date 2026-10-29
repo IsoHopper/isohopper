@@ -66,7 +66,7 @@ jobs:
     needs: validate
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.platform == 'macos-x64' && 60 || 40 }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -80,16 +80,13 @@ jobs:
           - platform: macos-arm64
             os: macos-15
             bundles: dmg
-          - platform: macos-x64
-            os: macos-15-intel
-            bundles: dmg
     defaults:
       run:
         shell: bash
     env:
       CI: true
       CARGO_TERM_COLOR: always
-      CARGO_BUILD_JOBS: ${{ matrix.platform == 'macos-x64' && 4 || 2 }}
+      CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       RELEASE_TAG: ${{ needs.validate.outputs.tag }}

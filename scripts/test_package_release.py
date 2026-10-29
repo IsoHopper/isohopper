@@ -47,7 +47,7 @@ class PackageReleaseTests(unittest.TestCase):
             path.write_bytes(f'installer {folder}'.encode())
         return binary
 
-    def test_all_platforms_package_expected_files_and_verified_manifests(self):
+    def test_release_platforms_and_local_intel_mac_package_verified_manifests(self):
         for platform in ['linux-x64', 'windows-x64', 'macos-arm64', 'macos-x64']:
             with self.subTest(platform=platform), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
