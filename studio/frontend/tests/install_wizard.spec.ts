@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { expect, test, type Page } from '@playwright/test';
 
-async function installMock(page: Page, mode: 'selected' | 'download' | 'library-error' | 'empty' | 'targets-error' | 'archive-error' = 'selected') {
+async function installMock(page: Page, mode: 'selected' | 'download' | 'library-error' | 'empty' | 'targets-error' | 'archive-error' | 'restored' | 'preflight' = 'selected') {
   await page.addInitScript(mode => {
-    const host = window as unknown as { __TAURI__: unknown; calls: { command: string; args: unknown }[]; finishDownload: () => void; finishInstall: () => void; failLoadingAgain: () => void };
+    const host = window as unknown as { __TAURI__: unknown; calls: { command: string; args: unknown }[]; finishDownload: () => void; finishInstall: () => void; failInstall: () => void; failLoadingAgain: () => void; advanceWritePhase: (phase: string) => void };
     host.calls = [];
     const archive = { archive_id: `src_${'b'.repeat(64)}`, name: 'ventoy-1.1.18-linux.tar.gz', bytes: 20320548, sha256: 'd86ff9de63d94c8b8f1f6b14d23c55af4b88e8207bf2893890892a6a97b1ad54', version: '1.1.18' };
+    let selectedArchive = archive;
     let selected = mode !== 'download';
     let failedLoading = false;
     host.failLoadingAgain = () => { failedLoading = false; };
     let download: Record<string, unknown> | null = null;
-    let job: Record<string, unknown> | null = null;
+    const newJob = () => ({ job_id: 'e'.repeat(64), phase: 'await_confirmation', message: 'Mock target bound and image staged.', active: true, cancel_requested: false, completed_bytes: 8000000000, total_bytes: 8000000000, bytes_written: 0, bytes_verified: 0, target_may_be_incomplete: false, sources_released: true, source_manifest: [], target: { device_number: 7, serial: 'Usb-AbC', device_id: 'f'.repeat(32), bus_type: 7, size_bytes: 8000000000, logical_sector_size: 512, physical_sector_size: 4096 }, image_sha256: '1'.repeat(64), description_digest: '2'.repeat(64), challenge: 'ENABLE_WRITE' });
+    let job: Record<string, unknown> | null = mode === 'restored' ? { ...newJob(), phase: 'succeeded', active: false, bytes_written: 8000000000, bytes_verified: 8000000000 } : null;
     host.finishDownload = () => { selected = true; download = { ...download, phase: 'ready', active: false, cancel_requested: false, completed_bytes: 20320548 }; };
     host.finishInstall = () => { job = { ...job, phase: 'succeeded', active: false, completed_bytes: 8000000000, bytes_written: 8000000000, bytes_verified: 8000000000, target_may_be_incomplete: false }; };
+    host.advanceWritePhase = phase => { job = { ...job, phase, active: true, completed_bytes: 0, bytes_written: 0, bytes_verified: 0, target_may_be_incomplete: false }; };
+    host.failInstall = () => { job = { ...job, phase: 'failed', active: false, target_may_be_incomplete: true, message: 'Mock write failed.' }; };
     host.__TAURI__ = { core: { invoke: async (command: string, args: unknown) => {
       host.calls.push({ command, args });
       if (!failedLoading && ((mode === 'targets-error' && command === 'list_preparation_targets') || (mode === 'archive-error' && command === 'selected_engine_archive'))) {
@@ -25,15 +29,16 @@ async function installMock(page: Page, mode: 'selected' | 'download' | 'library-
         if (mode === 'empty') return [];
         return [{ source_id: `src_${'a'.repeat(64)}`, name: 'library.iso', bytes: 3, verification: { algorithm: 'sha256', digest: 'a'.repeat(64), bytes: 3, status: 'hash-only', publisher_verified: false } }];
       }
-      if (command === 'selected_engine_archive') return selected ? archive : null;
+      if (command === 'selected_engine_archive') return selected ? selectedArchive : null;
+      if (command === 'pick_engine_archive') return selectedArchive = { ...archive, name: 'renamed-verified-engine.tar.gz' };
       if (command === 'engine_download_status') return download;
       if (command === 'start_engine_download') return download = { job_id: 'd'.repeat(64), phase: 'downloading', active: true, cancel_requested: false, completed_bytes: 4096, total_bytes: 20320548, expected_sha256: archive.sha256, version: '1.1.18', cache_hit: false, message: 'Mock engine download' };
       if (command === 'cancel_engine_download') { download = { ...download, phase: 'cancelled', active: false, cancel_requested: true }; return null; }
       if (command === 'inspect_devices') return { source: 'mock', disks: [], warnings: [] };
       if (command === 'list_preparation_targets') return [{ selection_token: 'c'.repeat(64), display_id: '\\\\.\\PhysicalDrive7', volume_labels: ['ISOHopper'], disk: { number: 7, friendly_name: 'Test USB', serial_number: 'Usb-AbC', size: 8000000000, logical_sector_size: 512, physical_sector_size: 4096, bus_type: 7, is_boot: false, is_system: false, is_read_only: false, is_offline: false, is_clustered: false } }];
       if (command === 'preparation_status') return job;
-      if (command === 'start_preparation') return job = { job_id: 'e'.repeat(64), phase: 'await_confirmation', message: 'Mock target bound and image staged.', active: true, cancel_requested: false, completed_bytes: 8000000000, total_bytes: 8000000000, bytes_written: 0, bytes_verified: 0, target_may_be_incomplete: false, sources_released: true, source_manifest: [], target: { device_number: 7, serial: 'Usb-AbC', device_id: 'f'.repeat(32), bus_type: 7, size_bytes: 8000000000, logical_sector_size: 512, physical_sector_size: 4096 }, image_sha256: '1'.repeat(64), description_digest: '2'.repeat(64), challenge: 'ENABLE_WRITE' };
-      if (command === 'confirm_preparation') { job = { ...job, phase: 'writing_target', completed_bytes: 4096, bytes_written: 4096, target_may_be_incomplete: true }; return null; }
+      if (command === 'start_preparation') return job = newJob();
+      if (command === 'confirm_preparation') { if (mode === 'preflight') { host.advanceWritePhase('checking_readiness'); return null; } job = { ...job, phase: 'writing_target', completed_bytes: 4096, bytes_written: 4096, target_may_be_incomplete: true }; return null; }
       throw new Error(`Unexpected command ${command}`);
     } } };
   }, mode);
@@ -64,10 +69,14 @@ for (const mode of ['selected', 'library-error'] as const) {
     expect(await commands(page, 'confirm_preparation')).toEqual([]);
     await install.click();
     await expect(page.locator('.wizard-steps [aria-current="step"]')).toContainText('Install');
+    await expect(page.locator('.installation-phases .current')).toContainText('writing_target');
+    await expect(page.locator('.installation-phases li').filter({ hasText: 'verifying_target' })).toContainText('Pending');
     if (mode === 'selected') await page.screenshot({ path: `../../.local/release-work/studio-redesign-install-${testInfo.project.name}.png`, fullPage: true });
     await page.evaluate(() => (window as unknown as { finishInstall: () => void }).finishInstall());
     await expect(page.locator('.wizard-steps [aria-current="step"]')).toContainText('Done');
     await expect(page.getByText('ISOHopper is installed', { exact: true })).toBeVisible();
+    await expect(page.locator('.installation-phases .complete')).toHaveCount(6);
+    await expect(page.locator('.installation-phases .current')).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Prepare another drive' })).toBeVisible();
     if (mode === 'selected') await page.screenshot({ path: `../../.local/release-work/studio-redesign-done-${testInfo.project.name}.png`, fullPage: true });
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
@@ -177,6 +186,7 @@ test('copy controls preserve full values and report clipboard failures accuratel
   expect((await copied()).at(-1)).toBe('d86ff9de63d94c8b8f1f6b14d23c55af4b88e8207bf2893890892a6a97b1ad54');
   await expect(page.locator('#toast')).toContainText('Copied engine SHA-256');
   await page.getByRole('button', { name: 'Install ISOHopper', exact: true }).click();
+  await page.getByText('Installation details and checksums', { exact: true }).click();
   for (const [label, value] of [['target serial', 'Usb-AbC'], ['target device ID', 'f'.repeat(32)], ['preparation job ID', 'e'.repeat(64)], ['image SHA-256', '1'.repeat(64)], ['description digest', '2'.repeat(64)], ['confirmation text', 'ENABLE_WRITE']]) {
     await page.getByRole('button', { name: `Copy ${label}`, exact: true }).click();
     expect((await copied()).at(-1)).toBe(value);
@@ -207,4 +217,70 @@ test('native oversized drops retain the preview guard and direct users to stream
   await expect(page.locator('#toast')).toContainText('Use Add images or Import folder');
   await expect(page.locator('.image-row')).toHaveCount(1);
   await expect(page.locator('body')).not.toContainText('512 MiB');
+});
+
+
+test('failed installation never shows completed phases or an installed drive', async ({ page }) => {
+  await installMock(page);
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Install ISOHopper', exact: true }).click();
+  await page.getByRole('textbox', { name: 'Write confirmation' }).fill('ENABLE_WRITE');
+  await page.getByRole('button', { name: 'Install ISOHopper', exact: true }).click();
+  await expect(page.locator('.installation-phases .current')).toContainText('writing_target');
+  await page.evaluate(() => (window as unknown as { failInstall: () => void }).failInstall());
+  await expect(page.getByRole('heading', { name: 'Installation stopped' })).toBeVisible();
+  await expect(page.locator('.installation-phases')).toHaveCount(0);
+  await expect(page.locator('.success-banner')).toHaveCount(0);
+  await expect(page.getByText('The target may be incomplete.', { exact: false })).toBeVisible();
+});
+
+
+test('completed job keeps its original engine metadata when the current selection changes', async ({ page }) => {
+  await installMock(page);
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Install ISOHopper', exact: true }).click();
+  await expect(page.locator('.setup-details')).not.toHaveAttribute('open', '');
+  await expect(page.locator('.wizard-summary')).toBeHidden();
+  await expect(page.locator('.verification-summary')).toContainText('ventoy-1.1.18-linux.tar.gz');
+  await page.getByRole('textbox', { name: 'Write confirmation' }).fill('ENABLE_WRITE');
+  await page.getByRole('button', { name: 'Install ISOHopper', exact: true }).click();
+  await expect(page.locator('.installation-phases .current')).toContainText('writing_target');
+  await page.evaluate(() => (window as unknown as { finishInstall: () => void }).finishInstall());
+  await expect(page.getByRole('heading', { name: 'ISOHopper is installed', exact: true })).toBeVisible();
+  await page.getByText('Setup details', { exact: true }).click();
+  await page.getByText('Advanced', { exact: true }).click();
+  await page.getByRole('button', { name: 'Choose engine archive', exact: true }).click();
+  await expect(page.locator('.wizard-summary')).toContainText('renamed-verified-engine.tar.gz');
+  await expect(page.locator('.setup-details')).toHaveAttribute('open', '');
+  await expect(page.locator('.verification-summary')).toContainText('ventoy-1.1.18-linux.tar.gz');
+  await expect(page.locator('.verification-summary')).not.toContainText('renamed-verified-engine.tar.gz');
+  await expect(page.locator('.verification-summary')).toContainText('d86ff9de63d94c8b8f1f6b14d23c55af4b88e8207bf2893890892a6a97b1ad54');
+});
+
+test('restored job does not claim the current engine selection belongs to its receipt', async ({ page }) => {
+  await installMock(page, 'restored');
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'ISOHopper is installed', exact: true })).toBeVisible();
+  await expect(page.locator('.verification-summary')).toContainText('Engine metadata is unavailable for this restored job.');
+  await expect(page.locator('.verification-summary .verified-engine')).toHaveCount(0);
+  await expect(page.locator('.verification-summary')).toContainText('1'.repeat(64));
+  expect(await commands(page, 'start_preparation')).toEqual([]);
+  await page.getByText('Setup details', { exact: true }).click();
+  await expect(page.locator('.wizard-summary')).toContainText('ventoy-1.1.18-linux.tar.gz');
+});
+
+
+test('all post-confirmation write phases keep the wizard in Install', async ({ page }) => {
+  await installMock(page, 'preflight');
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Install ISOHopper', exact: true }).click();
+  await page.getByRole('textbox', { name: 'Write confirmation' }).fill('ENABLE_WRITE');
+  await page.getByRole('button', { name: 'Install ISOHopper', exact: true }).click();
+  for (const phase of ['checking_readiness', 'locking_target', 'writing_target', 'flushing_target', 'verifying_target']) {
+    if (phase !== 'checking_readiness') await page.evaluate(phase => (window as unknown as { advanceWritePhase: (phase: string) => void }).advanceWritePhase(phase), phase);
+    await expect(page.locator('.installation-phases .current')).toContainText(phase);
+    await expect(page.locator('.wizard-steps [aria-current="step"]')).toHaveText('3Install');
+    await expect(page.getByRole('heading', { name: 'Installing ISOHopper', exact: true })).toBeVisible();
+    await expect(page.getByText('Preparing empty bootable image', { exact: true })).toHaveCount(0);
+  }
 });

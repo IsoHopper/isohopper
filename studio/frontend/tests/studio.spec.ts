@@ -254,8 +254,8 @@ test('completes a simulation and records what did and did not happen', async ({ 
   await expect(page.getByRole('button', { name: 'Simulation in progress' })).toBeDisabled();
   await expect(page.getByText('No disk was opened or modified.')).toBeVisible();
   await page.locator('nav').getByRole('button', { name: 'Activity' }).click();
-  await expect(page.getByText('Preparation simulation complete')).toBeVisible();
-  await expect(page.getByText(/No files copied, disk writes, boot verification, or ejection performed/)).toBeVisible();
+  await expect(page.locator('.activity-panel').getByText('Preparation simulation complete')).toBeVisible();
+  await expect(page.locator('.activity-panel').getByText(/No files copied, disk writes, boot verification, or ejection performed/)).toBeVisible();
 });
 
 test('settings change the launcher preview and config can be exported', async ({ page }) => {
@@ -344,8 +344,8 @@ test('directory import preserves nested names and reports conflicting destinatio
   await expect(page.locator('.image-row')).toHaveCount(2);
   await expect(page.getByRole('status')).toContainText('Skipped symbolic link: external');
   await page.locator('nav').getByRole('button', { name: 'Activity' }).click();
-  await expect(page.getByText('Directory import warning')).toBeVisible();
-  await expect(page.getByText('Destination skipped')).toBeVisible();
+  await expect(page.locator('.activity-panel').getByText('Directory import warning', { exact: true })).toBeVisible();
+  await expect(page.locator('.activity-panel').getByText('Destination skipped', { exact: true })).toBeVisible();
   expect(await nativeCommands(page)).toEqual(['capabilities', 'list_sources', 'inspect_devices', 'pick_directory', 'release_sources']);
 });
 
@@ -522,4 +522,65 @@ test('pending source refresh blocks Remove and Clear until its snapshot resolves
   await expect(clear).toBeEnabled();
   await expect(page.locator('.image-row')).toHaveCount(1);
   expect(await page.evaluate(() => (window as unknown as { releasedSourceIds: string[][] }).releasedSourceIds)).toEqual([]);
+});
+
+test('library folder, status and filename filters work together without changing native sources', async ({ page }, testInfo) => {
+  await installNativeBridge(page);
+  await page.goto('/');
+  await openLibrary(page);
+  await page.getByRole('button', { name: 'Import folder', exact: true }).click();
+  await expect(page.locator('.image-row')).toHaveCount(2);
+  await page.locator('[data-library-folder="Windows"]').click();
+  await expect(page.locator('.image-row')).toHaveCount(1);
+  await expect(page.locator('.image-row')).toContainText('Windows/boot.iso');
+  await page.locator('[data-library-status="hashed"]').click();
+  await page.getByRole('searchbox', { name: 'Search images' }).fill('BOOT');
+  await expect(page.locator('.image-row')).toHaveCount(1);
+  await page.getByRole('searchbox', { name: 'Search images' }).fill('missing');
+  await expect(page.getByText('No matching images.')).toBeVisible();
+  await page.getByRole('searchbox', { name: 'Search images' }).fill('');
+  await page.locator('[data-library-status="error"]').click();
+  await expect(page.locator('.image-row')).toHaveCount(0);
+  await page.locator('[data-library-status="all"]').click();
+  await page.locator('[data-library-folder=""]').click();
+  await expect(page.locator('.image-row')).toHaveCount(2);
+  expect((await nativeCommands(page)).filter(command => command === 'release_sources')).toHaveLength(1);
+  await page.screenshot({ path: `../../.local/release-work/studio-redesign-library-${testInfo.project.name}.png`, fullPage: true });
+  await page.locator('nav').getByRole('button', { name: 'Launcher preview', exact: true }).click();
+  await page.screenshot({ path: `../../.local/release-work/studio-redesign-launcher-populated-${testInfo.project.name}.png`, fullPage: true });
+});
+
+test('activity receipt preview and export share the same payload', async ({ page }) => {
+  await installNativeBridge(page);
+  await page.goto('/');
+  await expect(page.locator('.target-panel')).toContainText('host-system-unique-id');
+  await page.locator('nav').getByRole('button', { name: 'Activity', exact: true }).click();
+  const preview = JSON.parse((await page.locator('#activity-receipt').textContent())!);
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export activity', exact: true }).click();
+  const stream = await (await downloadPromise).createReadStream();
+  const chunks = [];
+  for await (const chunk of stream!) chunks.push(chunk);
+  const exported = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  expect(exported.exported_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  expect({ ...exported, exported_at: preview.exported_at }).toEqual(preview);
+  await page.getByRole('button', { name: 'Clear activity', exact: true }).click();
+  expect(JSON.parse((await page.locator('#activity-receipt').textContent())!).events).toEqual([]);
+});
+
+test('launcher keyboard selection and unique power shortcuts remain inert', async ({ page }) => {
+  await installNativeBridge(page);
+  await page.goto('/');
+  await expect(page.locator('.target-panel')).toContainText('host-system-unique-id');
+  await page.locator('nav').getByRole('button', { name: 'Launcher preview', exact: true }).click();
+  await page.keyboard.press('ArrowDown');
+  await expect(page.locator('[data-boot="1"]')).toBeFocused();
+  await expect(page.locator('[data-boot="1"]')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('[data-boot="1"] .boot-marker')).toHaveText('›');
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.launcher-selection')).toContainText('Memory diagnostics');
+  await expect(page.locator('kbd').filter({ hasText: /^R$/ })).toHaveCount(1);
+  await page.keyboard.press('r');
+  await expect(page.locator('#toast')).toContainText('Reboot: preview only. No host action performed.');
+  expect(await nativeCommands(page)).toEqual(['capabilities', 'list_sources', 'inspect_devices']);
 });

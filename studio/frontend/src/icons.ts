@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 S33G
 // SPDX-License-Identifier: GPL-3.0-or-later
 const paths: Record<string, string> = {
+  folder: '<path d="M3 6h7l2 2h9v12H3V6Z"/>',
   copy: '<rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V3H3v13h5"/>',
   layers: '<path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5M3 16l9 5 9-5"/>',
   drive: '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M3 14h18M16 17h2"/><path d="M6 17h.01"/>',

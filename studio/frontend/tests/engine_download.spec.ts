@@ -216,6 +216,7 @@ test('start failure displays an actionable error without losing offline selectio
 test('preparation confirmation blocks download starts and status polling leaves typed challenge intact', async ({ page }) => {
   await mockNative(page, { preparation: true });
   await page.goto('/');
+  await page.locator('.setup-details > summary').click();
   await page.locator('.engine-advanced > summary').click();
   const phrase = page.getByRole('textbox', { name: 'Write confirmation', exact: true });
   await expect(phrase).toBeEnabled();
@@ -345,6 +346,7 @@ test('native session restore shows retained images and skipped-file warnings wit
 test('a sealed empty preparation still requires the exact explicit write challenge', async ({ page }) => {
   await mockNative(page, { preparation: true, emptyImages: true });
   await page.goto('/');
+  await page.locator('.setup-details > summary').click();
   await page.locator('.engine-advanced > summary').click();
   await expect(page.locator('.job-source-manifest')).toHaveCount(0);
   const write = page.getByRole('button', { name: 'Install ISOHopper', exact: true });
