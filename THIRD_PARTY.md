@@ -18,6 +18,10 @@ Ventoy and its dependencies have separate component licenses. Consult the [match
 
 Exact Rust and JavaScript dependency versions are recorded in the Cargo and npm lockfiles. Archive decoding uses flate2 (MIT/Apache-2.0), tar (MIT/Apache-2.0) and lzma-rust2 (Apache-2.0).
 
+## Bundled fonts
+
+Studio bundles Inter and JetBrains Mono for offline use, both under the SIL Open Font License 1.1. Unmodified variable fonts come from Google Fonts revision [`9862abc`](https://github.com/google/fonts/tree/9862abc066c9b83bf84c3e8ed1fc2d8d48f9bbf0): [Inter](https://github.com/google/fonts/tree/9862abc066c9b83bf84c3e8ed1fc2d8d48f9bbf0/ofl/inter) and [JetBrains Mono](https://github.com/google/fonts/tree/9862abc066c9b83bf84c3e8ed1fc2d8d48f9bbf0/ofl/jetbrainsmono). Their copyright notices and licenses are retained in [`studio/frontend/public/fonts/`](studio/frontend/public/fonts/).
+
 ## Windows installer template
 
 The custom NSIS template is adapted from Tauri CLI 2.12.4 under the MIT license. Its attribution and [license text](studio/src-tauri/windows/LICENSE-TAURI) are retained alongside the [template](studio/src-tauri/windows/installer.nsi). IsoHopper replaces the upgrade flow with its protected installation transaction.
