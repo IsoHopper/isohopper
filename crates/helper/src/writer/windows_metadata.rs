@@ -5,6 +5,20 @@ use std::io;
 pub(super) const MAX_DESCRIPTOR: usize = 65_536;
 const DESCRIPTOR_PREFIX: usize = 36;
 
+#[derive(Debug, thiserror::Error)]
+#[error("{query}: {source}")]
+struct QueryError {
+    query: &'static str,
+    #[source]
+    source: io::Error,
+}
+
+/// Add the failed request without discarding its native error or error kind.
+/// Call after any operation-specific unsupported-status handling.
+pub(super) fn query_error(query: &'static str, source: io::Error) -> io::Error {
+    io::Error::new(source.kind(), QueryError { query, source })
+}
+
 fn invalid() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -155,6 +169,23 @@ pub(super) fn parse_device_ids(bytes: &[u8]) -> io::Result<Option<StableDeviceId
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_error_identifies_the_failed_request_and_retains_the_os_error() {
+        let source = io::Error::from_raw_os_error(87);
+        let message = source.to_string();
+        let kind = source.kind();
+        let error = query_error("StorageDeviceIdProperty/header", source);
+        assert!(error.to_string().contains("StorageDeviceIdProperty/header"));
+        assert!(error.to_string().contains(&message));
+        assert_eq!(error.kind(), kind);
+        let original = error
+            .get_ref()
+            .and_then(std::error::Error::source)
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .expect("the original OS error remains in the source chain");
+        assert_eq!(original.raw_os_error(), Some(87));
+    }
 
     fn descriptor() -> Vec<u8> {
         let mut bytes = vec![0; 48];

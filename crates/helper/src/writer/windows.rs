@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Synchronous raw I/O through one caller-owned, already authorized handle.
 use super::{DeviceSnapshot, Geometry, RetainedDevice, StableDeviceId, windows_metadata};
+use windows_metadata::query_error;
 #[path = "windows_readiness.rs"]
 mod readiness;
 use std::{
@@ -297,20 +298,23 @@ fn value<T: Default>(
 /// # Safety
 /// The handle must remain live and synchronous (no FILE_FLAG_OVERLAPPED).
 pub(crate) unsafe fn inspect(handle: &OwnedHandle) -> io::Result<DeviceSnapshot> {
-    let number: STORAGE_DEVICE_NUMBER = value(handle, IOCTL_STORAGE_GET_DEVICE_NUMBER, None)?;
+    let number: STORAGE_DEVICE_NUMBER = value(handle, IOCTL_STORAGE_GET_DEVICE_NUMBER, None)
+        .map_err(|error| query_error("IOCTL_STORAGE_GET_DEVICE_NUMBER", error))?;
     if number.DeviceType != FILE_DEVICE_DISK || number.PartitionNumber != 0 {
         return Err(invalid(
             "handle must address a whole physical disk, not a partition",
         ));
     }
-    let length: GET_LENGTH_INFORMATION = value(handle, IOCTL_DISK_GET_LENGTH_INFO, None)?;
+    let length: GET_LENGTH_INFORMATION = value(handle, IOCTL_DISK_GET_LENGTH_INFO, None)
+        .map_err(|error| query_error("IOCTL_DISK_GET_LENGTH_INFO", error))?;
     let mut query = STORAGE_PROPERTY_QUERY {
         PropertyId: StorageAccessAlignmentProperty,
         QueryType: PropertyStandardQuery,
         ..Default::default()
     };
     let alignment: STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR =
-        value(handle, IOCTL_STORAGE_QUERY_PROPERTY, Some(&query))?;
+        value(handle, IOCTL_STORAGE_QUERY_PROPERTY, Some(&query))
+            .map_err(|error| query_error("StorageAccessAlignmentProperty", error))?;
     if alignment.Version as usize != size_of::<STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR>()
         || alignment.Size as usize != size_of::<STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR>()
         || alignment.BytesOffsetForSectorAlignment != 0
@@ -334,7 +338,9 @@ pub(crate) unsafe fn inspect(handle: &OwnedHandle) -> io::Result<DeviceSnapshot>
         Some(&query),
         header.as_mut_ptr().cast(),
         header.len(),
-    )? != header.len()
+    )
+    .map_err(|error| query_error("StorageDeviceProperty/header", error))?
+        != header.len()
     {
         return Err(invalid("truncated storage descriptor header"));
     }
@@ -345,7 +351,8 @@ pub(crate) unsafe fn inspect(handle: &OwnedHandle) -> io::Result<DeviceSnapshot>
         Some(&query),
         descriptor.as_mut_ptr().cast(),
         descriptor.len(),
-    )?;
+    )
+    .map_err(|error| query_error("StorageDeviceProperty/body", error))?;
     let (serial, bus_type) = windows_metadata::parse_descriptor(&descriptor[..returned])?;
     let device_id = inspect_device_id(handle)?;
     Ok(DeviceSnapshot {
@@ -381,7 +388,7 @@ fn inspect_device_id(handle: &OwnedHandle) -> io::Result<Option<StableDeviceId>>
         {
             return Ok(None);
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(query_error("StorageDeviceIdProperty/header", error)),
         Ok(count) if count != header.len() => {
             return Err(invalid("truncated storage device ID descriptor header"));
         }
@@ -394,6 +401,7 @@ fn inspect_device_id(handle: &OwnedHandle) -> io::Result<Option<StableDeviceId>>
         Some(&query),
         descriptor.as_mut_ptr().cast(),
         descriptor.len(),
-    )?;
+    )
+    .map_err(|error| query_error("StorageDeviceIdProperty/body", error))?;
     windows_metadata::parse_device_ids(&descriptor[..returned])
 }
