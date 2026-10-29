@@ -47,6 +47,8 @@ mod blank;
 mod build_policy;
 #[cfg(any(windows, test))]
 mod host_policy;
+#[cfg(any(windows, test))]
+mod theme;
 
 /// One backend-owned source, including optional generated config.
 /// Construction does not authenticate its origin; the caller supplies that boundary.

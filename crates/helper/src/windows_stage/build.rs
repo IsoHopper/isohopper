@@ -2,7 +2,7 @@
 use super::super::{
     StageInput, StageProgress,
     build_policy::{self, SelectedVolume},
-    format,
+    format, theme,
 };
 use super::device::{self, View, context};
 use super::*;
@@ -299,8 +299,10 @@ fn build_under(
     cancel: &AtomicBool,
     mut progress: impl FnMut(StageProgress),
 ) -> Result<SealedStage, StageError> {
-    let entries: Vec<_> = inputs.iter().map(|v| v.entry.clone()).collect();
-    build_policy::admit(plan, &geometry, &entries)?;
+    let source_entries: Vec<_> = inputs.iter().map(|v| v.entry.clone()).collect();
+    build_policy::admit(plan, &geometry, &source_entries)?;
+    let mut entries = theme::entries();
+    entries.extend(source_entries);
     cancelled(cancel)?;
     for item in &inputs {
         let meta = item
@@ -321,6 +323,7 @@ fn build_under(
         return Err(StageError::Invalid("insufficient private staging space"));
     }
     let mut owner = OwnedStageDisk::create_under(root, geometry.clone())?;
+    let mut theme_sources = theme::sources(|name| create_file(&mut owner, name), cancel)?;
     let seed_path = owner.directory.join(SEED);
     progress(StageProgress {
         phase: "building_seed",
@@ -388,6 +391,15 @@ fn build_under(
     let (available, unit) = device::data_space(&data)?;
     validate_manifest(&entries, available.saturating_sub(1024 * 1024), unit)
         .map_err(|e| context("formatted data capacity", e))?;
+    view.check()?;
+    theme::copy_to(&destination, &mut theme_sources, cancel, |v| {
+        progress(StageProgress {
+            phase: "copying_data",
+            completed_bytes: v.completed_bytes,
+            total_bytes: v.total_bytes,
+            file_index: None,
+        })
+    })?;
     for (index, input) in inputs.iter_mut().enumerate() {
         view.check()?;
         copy_one(&destination, &mut input.file, &input.entry, cancel, |v| {
@@ -412,6 +424,7 @@ fn build_under(
     view.check()?;
     drop(view);
     drop(inputs);
+    drop(theme_sources);
     owner.detach()?;
     owner.attach(true)?;
     let view = View::open(&owner)?;
@@ -519,7 +532,7 @@ mod tests {
             "Windows/Win11.iso",
             "Mac/MacOS.img",
             "Linux tools/日本語.img",
-            "ventoy/ventoy.json",
+            "notes/fixture.json",
         ]
         .iter()
         .enumerate()

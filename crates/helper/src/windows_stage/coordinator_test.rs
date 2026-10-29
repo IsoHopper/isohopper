@@ -193,6 +193,12 @@ impl Executor for Fixture {
         let data = select(&view, stage.engine(), cancel).unwrap();
         let root = device::root(&data).unwrap();
         verify_files(&root, &entries, cancel).unwrap();
+        // Explicit expectation independent of build_under's verification list:
+        // the exported image must carry the application's real boot theme.
+        verify_files(&root, &theme::entries(), cancel).unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&root.read("ventoy/ventoy.json").unwrap()).unwrap();
+        assert_eq!(config["theme"]["file"], "/ventoy/isohopper/theme.txt");
         drop(root);
         drop(view);
         owner.close().unwrap();
@@ -339,4 +345,5 @@ pub(super) fn exercise(sealed: SealedStage, root: Root, entries: Vec<CopyEntry>)
     println!(
         "OWNED_COORDINATOR_OK stage_host_bound=true confirmation=true cm_write_handoff=true persisted_raw_sha256=true nested_files=true physical_target=false"
     );
+    println!("OWNED_THEME_STAGE_OK theme=true persisted=true physical_target=false");
 }

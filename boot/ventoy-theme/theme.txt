@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Ventoy 1.1.18 / GRUB theme. All menu entries and tool tips come from Ventoy.
+desktop-color: "#10151b"
+desktop-image: "background.png"
+title-text: ""
+message-color: "#e6edf3"
+message-bg-color: "#10151b"
+terminal-font: "Unknown Regular 16"
+
++ image {
+  left = 8%
+  top = 6%
+  file = "logo.png"
+}
++ label {
+  left = 8%+48
+  top = 6%+8
+  width = 70%
+  text = "ISOHOPPER"
+  color = "#8ebcff"
+}
++ label {
+  left = 8%
+  top = 14%
+  width = 84%
+  text = "BOOT MENU"
+  color = "#ffffff"
+}
++ label {
+  left = 8%
+  top = 18%
+  width = 84%
+  text = "Choose an image to start"
+  color = "#9ba9ba"
+}
++ label {
+  left = 8%
+  top = 27%
+  width = 84%
+  text = "Boot entries"
+  color = "#e6edf3"
+}
++ boot_menu {
+  left = 8%
+  top = 33%
+  width = 84%
+  height = 40%
+  item_color = "#c7d2e0"
+  selected_item_color = "#ffffff"
+  selected_item_pixmap_style = "select_*.png"
+  item_height = 44
+  item_padding = 12
+  item_spacing = 6
+  item_icon_space = 0
+  scrollbar = true
+  scrollbar_width = 6
+}
++ progress_bar {
+  id = "__timeout__"
+  left = 8%
+  top = 76%
+  width = 84%
+  height = 20
+  text = "@TIMEOUT_NOTIFICATION_SHORT@"
+  text_color = "#e6edf3"
+  fg_color = "#5c9fea"
+  bg_color = "#172433"
+  border_color = "#5c9fea"
+}
++ label {
+  left = 8%
+  top = 83%
+  width = 84%
+  text = "Keyboard controls"
+  color = "#e6edf3"
+}
++ label {
+  left = 8%
+  top = 87%
+  width = 84%
+  text = "Up / Down: navigate     Enter: select     F7: text mode"
+  color = "#9ba9ba"
+}
++ label {
+  left = 8%
+  top = 91%
+  width = 84%
+  text = "@VTOY_HOTKEY_TIP@"
+  color = "#c7d2e0"
+}

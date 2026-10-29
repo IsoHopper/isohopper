@@ -1,0 +1,10 @@
+{
+  "theme": {
+    "file": "/ventoy/isohopper/theme.txt",
+    "gfxmode": "1024x768",
+    "display_mode": "GUI",
+    "ventoy_left": "8%",
+    "ventoy_top": "96%",
+    "ventoy_color": "#9ba9ba"
+  }
+}

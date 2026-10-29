@@ -44,7 +44,9 @@ pub(super) fn admit(
         .ok_or(StageError::Invalid(
             "data partition has no metadata reserve",
         ))?;
-    validate_manifest(entries, available, u64::from(allocation_unit(plan)))
+    let mut all_entries = super::theme::entries();
+    all_entries.extend_from_slice(entries);
+    validate_manifest(&all_entries, available, u64::from(allocation_unit(plan)))
         .map_err(|_| StageError::Invalid("stage manifest or data capacity"))?;
     Ok(())
 }
@@ -265,6 +267,42 @@ mod tests {
         admit(&plan, &geometry, &[]).unwrap();
         geometry.size_bytes += 512;
         assert!(admit(&plan, &geometry, &[]).is_err());
+    }
+    #[test]
+    fn application_theme_paths_are_reserved_before_storage_mutation() {
+        let (plan, _, coverage) = fixture();
+        for path in [
+            "ventoy/ventoy.json",
+            "VENTOY/VENTOY.JSON",
+            "ventoy",
+            "ventoy/isohopper/theme.txt",
+            "ventoy/isohopper/theme.txt/child.iso",
+        ] {
+            let entry = CopyEntry {
+                relative_path: path.into(),
+                bytes: 1024,
+                sha256: [1; 32],
+            };
+            assert!(
+                admit(&plan, &coverage.device.geometry, &[entry]).is_err(),
+                "{path}"
+            );
+        }
+    }
+    #[test]
+    fn admission_includes_theme_allocation_in_capacity() {
+        let (plan, _, coverage) = fixture();
+        let data = &plan.layout().partitions[0];
+        let available = (data.end_lba - data.start_lba + 1) * 512 - 1024 * 1024;
+        let unit = u64::from(allocation_unit(&plan));
+        let entry = CopyEntry {
+            relative_path: "large.iso".into(),
+            bytes: available / unit * unit,
+            sha256: [1; 32],
+        };
+        // The user image alone fits; the complete filesystem contents do not.
+        validate_manifest(std::slice::from_ref(&entry), available, unit).unwrap();
+        assert!(admit(&plan, &coverage.device.geometry, &[entry]).is_err());
     }
     #[test]
     fn formatter_requires_bounded_exact_typed_success() {
