@@ -140,7 +140,9 @@ def notes(tag, revision, run_url, scopes):
 {windows}
 macOS and Linux provide local image imports, streaming SHA-256 and read-only device inspection. They cannot prepare physical USB devices. Nested image paths are retained.
 
-This build fixes Windows installation and upgrades: run setup over an existing release to upgrade or repair it while preserving user settings and the engine cache. Setup refuses to replace files used by an active app/helper. Verified engine download, session restore, empty image libraries and conservative USB/SD suggestions remain available.
+Studio now installs an empty bootable drive through a simple wizard. Select the device, review its identity, enter or paste `ENABLE_WRITE`, and confirm. No ISO selection is required; copy images onto the USB afterwards. The pinned engine downloads automatically when needed. The interface uses flat grey panels, compact Windows-style controls, monospace diagnostics and the supplied logo. Copy buttons preserve full checksums and device identifiers.
+
+Windows source-file rejections now report their cause instead of ending with a generic helper disconnect. Other disconnects include the expected protocol step and helper exit status when available. The reported physical-device failure still needs human retesting. Existing Windows installs can be upgraded or repaired while preserving settings and the engine cache.
 
 | Download | Scope |
 | --- | --- |
