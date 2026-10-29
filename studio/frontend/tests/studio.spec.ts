@@ -69,6 +69,10 @@ async function installNativeBridge(page: Page, scenario: NativeScenario = {}) {
   }, scenario);
 }
 
+async function openLibrary(page: Page) {
+  await page.locator('nav').getByRole('button', { name: 'Image library', exact: true }).click();
+}
+
 async function nativeCommands(page: Page) {
   return page.evaluate(() => (window as unknown as { nativeCommands: string[] }).nativeCommands);
 }
@@ -148,7 +152,7 @@ test('explicit browser demo shows mock devices and has no horizontal overflow', 
   await expect(page.locator('header')).toHaveCount(0);
   await expect(page.locator('.experimental')).toContainText('Browser file I/O · demo hardware inventory');
   await expect(page.getByRole('button', { name: 'Simulate preparation' })).toBeEnabled();
-  await expect(page.getByText('Sample entries are labels only. No sample files are loaded.')).toBeVisible();
+  await expect(page.locator('.image-row')).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
 
@@ -189,6 +193,7 @@ test('paste into the risky confirmation field is rejected', async ({ page }) => 
 
 test('hashes actual local data without treating it as publisher verification', async ({ page }) => {
   await page.goto('/?demo=1');
+  await openLibrary(page);
   await page.locator('#file-input').setInputFiles({ name: 'tiny.iso', mimeType: 'application/octet-stream', buffer: Buffer.from('abc') });
   const row = page.locator('.image-row').filter({ hasText: 'tiny.iso' });
   await expect(row.getByText('Hash only')).toBeVisible();
@@ -202,6 +207,7 @@ test('hashes actual local data without treating it as publisher verification', a
 test('populated checksums and nested paths scroll inside the table without widening the page', async ({ page }) => {
   await page.goto('/?demo=1');
   await expect(page.getByRole('button', { name: 'Simulate preparation' })).toBeEnabled();
+  await openLibrary(page);
   await page.locator('#folder-input').evaluate(input => {
     const transfer = new DataTransfer();
     for (const [path, data] of [['tiny.iso', 'abc'], ['Windows/boot.iso', 'windows'], ['Mac/boot.img', 'mac']]) {
@@ -215,7 +221,7 @@ test('populated checksums and nested paths scroll inside the table without widen
   await expect(page.locator('.hash-cell code')).toHaveCount(3);
   await expect(page.getByText('Windows/boot.iso', { exact: true })).toBeVisible();
   await expect(page.getByText('Mac/boot.img', { exact: true })).toBeVisible();
-  for (const view of ['Prepare drive', 'Image library']) {
+  for (const view of ['Image library']) {
     await page.locator('nav').getByRole('button', { name: view }).click();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
     if (page.viewportSize()!.width <= 640) {
@@ -232,9 +238,11 @@ test('populated checksums and nested paths scroll inside the table without widen
 
 test('rejects unsupported intake and displays safe filenames', async ({ page }) => {
   await page.goto('/?demo=1');
+  await openLibrary(page);
   await page.locator('#file-input').setInputFiles({ name: 'program.exe', mimeType: 'application/octet-stream', buffer: Buffer.from('abc') });
   await expect(page.getByRole('status')).toContainText('Unsupported format');
   await expect(page.locator('.image-row').filter({ hasText: 'program.exe' })).toHaveCount(0);
+  await openLibrary(page);
   await page.locator('#file-input').setInputFiles({ name: '<svg onload=alert(1)>.iso', mimeType: 'application/octet-stream', buffer: Buffer.from('abc') });
   await expect(page.getByText('<svg onload=alert(1)>.iso', { exact: true })).toBeVisible();
   await expect(page.locator('[onload]')).toHaveCount(0);
@@ -308,7 +316,8 @@ for (const outcome of ['image', 'cancel', 'error'] as const) {
     await page.goto('/');
     await expect(page.locator('.target-panel')).toContainText('host-system-unique-id');
     await expect(page.locator('.image-row')).toHaveCount(0);
-    await page.getByRole('button', { name: 'Add images', exact: true }).click();
+    await openLibrary(page);
+  await page.getByRole('button', { name: 'Add images', exact: true }).click();
     if (outcome === 'image') {
       const row = page.locator('.image-row').filter({ hasText: 'native-large.iso' });
       await expect(row).toContainText('6 GB');
@@ -328,6 +337,7 @@ test('directory import preserves nested names and reports conflicting destinatio
   await installNativeBridge(page);
   await page.goto('/');
   await expect(page.locator('.target-panel')).toContainText('host-system-unique-id');
+  await openLibrary(page);
   await page.getByRole('button', { name: 'Import folder', exact: true }).click();
   await expect(page.getByText('Mac/boot.iso', { exact: true })).toBeVisible();
   await expect(page.getByText('Windows/boot.iso', { exact: true })).toBeVisible();
@@ -352,6 +362,10 @@ test('host inventory stays read only and can be inspected and exported', async (
   await expect(dialog).toContainText('Safety metadata is not complete.');
   await dialog.getByRole('button', { name: 'Export JSON' }).focus();
   await page.keyboard.press('Tab');
+  await expect(dialog.getByRole('button', { name: 'Copy device ID for Host system storage', exact: true })).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(dialog.getByRole('button', { name: 'Copy serial for host-system-unique-id', exact: true })).toBeFocused();
+  await page.keyboard.press('Tab');
   await expect(dialog.locator('summary')).toBeFocused();
   await page.keyboard.press('Enter');
   await expect(dialog.locator('pre')).toContainText('"safety_checks_complete": false');
@@ -371,7 +385,8 @@ for (const failOnce of [false, true]) {
   test(`native removal ${failOnce ? 'retains state after failure and retries' : 'releases its opaque source ID'}`, async ({ page }) => {
     await installNativeBridge(page, { releaseFailures: failOnce ? 1 : 0 });
     await page.goto('/');
-    await page.getByRole('button', { name: 'Add images', exact: true }).click();
+    await openLibrary(page);
+  await page.getByRole('button', { name: 'Add images', exact: true }).click();
     const row = page.locator('.image-row').filter({ hasText: 'native-large.iso' });
     await expect(row).toContainText(`src_${'a'.repeat(64)}`);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
@@ -391,6 +406,7 @@ for (const failOnce of [false, true]) {
 test('clear library releases remaining native sources in one batch after duplicate cleanup', async ({ page }) => {
   await installNativeBridge(page);
   await page.goto('/');
+  await openLibrary(page);
   await page.getByRole('button', { name: 'Import folder', exact: true }).click();
   await expect(page.locator('.image-row')).toHaveCount(2);
   await page.locator('nav').getByRole('button', { name: 'Image library' }).click();
@@ -404,6 +420,7 @@ test('clear library releases remaining native sources in one batch after duplica
 test('failed duplicate cleanup keeps an error row that can release its source on removal', async ({ page }) => {
   await installNativeBridge(page, { releaseFailures: 1 });
   await page.goto('/');
+  await openLibrary(page);
   await page.getByRole('button', { name: 'Import folder', exact: true }).click();
   await expect(page.locator('.image-row')).toHaveCount(3);
   const row = page.locator('.image-row').filter({ has: page.locator('.source-id').getByText(`src_${'d'.repeat(64)}`, { exact: true }) });
@@ -419,9 +436,11 @@ test('failed duplicate cleanup keeps an error row that can release its source on
 test('native reload restores retained source IDs and removed sources stay absent', async ({ page }) => {
   await installNativeBridge(page);
   await page.goto('/');
+  await openLibrary(page);
   await page.getByRole('button', { name: 'Add images', exact: true }).click();
   await expect(page.locator('.image-row')).toHaveCount(1);
   await page.reload();
+  await openLibrary(page);
   const row = page.locator('.image-row').filter({ hasText: 'native-large.iso' });
   await expect(row).toContainText(`src_${'a'.repeat(64)}`);
   expect(await nativeCommands(page)).toEqual(['capabilities', 'list_sources', 'inspect_devices']);
@@ -436,6 +455,7 @@ test('native reload restores retained source IDs and removed sources stay absent
 test('native source listing failure stays visible and disables new imports without loading fixtures', async ({ page }) => {
   await installNativeBridge(page, { sourceListError: 'Source catalogue unavailable' });
   await page.goto('/?demo=1');
+  await openLibrary(page);
   await expect(page.getByText(/Native source listing failed: Source catalogue unavailable/)).toBeVisible();
   await expect(page.getByRole('button', { name: 'Add images', exact: true })).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Import folder', exact: true })).toBeDisabled();
@@ -457,6 +477,7 @@ test('native Refresh recovers a source imported after the reload listing', async
     host.publishNativeSource({ source_id: `src_${'e'.repeat(64)}`, name: 'late.iso', relative_path: 'Windows/late.iso', bytes: 3, verification: { algorithm: 'sha256', digest: 'a'.repeat(64), bytes: 3, status: 'hash-only', publisher_verified: false } });
   });
   await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await openLibrary(page);
   const row = page.locator('.image-row').filter({ hasText: 'Windows/late.iso' });
   await expect(row).toContainText(`src_${'e'.repeat(64)}`);
   expect((await nativeCommands(page)).filter(command => command === 'list_sources')).toHaveLength(2);
@@ -466,6 +487,7 @@ test('native Refresh recovers a source imported after the reload listing', async
 test('failed native Refresh preserves the existing source rows', async ({ page }) => {
   await installNativeBridge(page);
   await page.goto('/');
+  await openLibrary(page);
   await page.getByRole('button', { name: 'Add images', exact: true }).click();
   const row = page.locator('.image-row').filter({ hasText: 'native-large.iso' });
   await expect(row).toContainText(`src_${'a'.repeat(64)}`);
@@ -481,6 +503,7 @@ test('failed native Refresh preserves the existing source rows', async ({ page }
 test('pending source refresh blocks Remove and Clear until its snapshot resolves', async ({ page }) => {
   await installNativeBridge(page);
   await page.goto('/');
+  await openLibrary(page);
   await page.getByRole('button', { name: 'Add images', exact: true }).click();
   await expect(page.locator('.image-row')).toHaveCount(1);
   await page.evaluate(() => (window as unknown as { pauseSourceListing: () => void }).pauseSourceListing());

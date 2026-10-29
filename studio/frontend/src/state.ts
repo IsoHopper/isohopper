@@ -21,7 +21,7 @@ export function canSimulate(disk: DiskRecord | undefined, input: string, bytes: 
 export function fileProblem(file: { name: string; size: number }): string | null {
   if (!/\.(iso|img|wim|vhd|vhdx|efi)$/i.test(file.name)) return 'Unsupported format. Use ISO, IMG, WIM, VHD, VHDX or EFI.';
   if (file.size <= 0) return 'This file is empty.';
-  if (file.size > 512 * 1024 * 1024) return 'This preview hashes files up to 512 MiB. Streaming large images requires native file access.';
+  if (file.size > 512 * 1024 * 1024) return 'Use Add images or Import folder in the desktop application to import this large file.';
   return null;
 }
 export function safeFileName(name: string): string { return (name.split(/[\\/]/).pop() || 'Untitled image').replace(/[\u0000-\u001f\u007f]/g, ''); }

@@ -32,7 +32,8 @@ describe('local image intake', () => {
     expect(fileProblem({ name: 'tools/diagnostics.EFI', size: 8_000 })).toBeNull();
     expect(fileProblem({ name: 'archive.iso.exe', size: 8_000 })).toMatch(/format/i);
     expect(fileProblem({ name: 'empty.iso', size: 0 })).toMatch(/empty/i);
-    expect(fileProblem({ name: 'large.iso', size: 513 * 1024 * 1024 })).toMatch(/512 MiB/);
+    expect(fileProblem({ name: 'edge.iso', size: 512 * 1024 * 1024 })).toBeNull();
+    expect(fileProblem({ name: 'large.iso', size: 513 * 1024 * 1024 })).toMatch(/Add images or Import folder/);
   });
   it('never renders filenames as HTML or exposes path components', () => {
     expect(safeFileName('../../folder/my\u0000image.iso')).toBe('myimage.iso');

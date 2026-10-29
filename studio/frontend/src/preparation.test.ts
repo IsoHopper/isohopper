@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, expect, it } from 'vitest';
 import { preparationSnapshot, canConfirmPreparation, type PreparationSnapshot } from './preparation';
-const snapshot: PreparationSnapshot = { job_id: 'a'.repeat(64), phase: 'await_confirmation', message: 'Ready', active: true, cancel_requested: false, completed_bytes: 0, total_bytes: 100, bytes_written: 0, bytes_verified: 0, target_may_be_incomplete: false, sources_released: true, source_manifest: [{ relative_path: 'Windows/boot.iso', bytes: 3, sha256: 'd'.repeat(64) }], target: { device_number: 7, serial: 'Usb-AbC', device_id: null, bus_type: 7, size_bytes: 100, logical_sector_size: 512, physical_sector_size: 512 }, image_sha256: 'b'.repeat(64), description_digest: 'c'.repeat(64), challenge: 'WIPE Usb-AbC' };
+const snapshot: PreparationSnapshot = { job_id: 'a'.repeat(64), phase: 'await_confirmation', message: 'Ready', active: true, cancel_requested: false, completed_bytes: 0, total_bytes: 100, bytes_written: 0, bytes_verified: 0, target_may_be_incomplete: false, sources_released: true, source_manifest: [{ relative_path: 'Windows/boot.iso', bytes: 3, sha256: 'd'.repeat(64) }], target: { device_number: 7, serial: 'Usb-AbC', device_id: null, bus_type: 7, size_bytes: 100, logical_sector_size: 512, physical_sector_size: 512 }, image_sha256: 'b'.repeat(64), description_digest: 'c'.repeat(64), challenge: 'ENABLE_WRITE' };
 describe('native preparation boundary', () => {
   it('requires exact case, active sealed state and the independent physical capability', () => {
-    expect(canConfirmPreparation(snapshot, 'WIPE Usb-AbC', false)).toBe(false);
-    expect(canConfirmPreparation(snapshot, 'WIPE USB-ABC', true)).toBe(false);
-    expect(canConfirmPreparation(snapshot, 'WIPE Usb-AbC', true)).toBe(true);
+    expect(canConfirmPreparation(snapshot, 'ENABLE_WRITE', false)).toBe(false);
+    expect(canConfirmPreparation(snapshot, 'enable_write', true)).toBe(false);
+    expect(canConfirmPreparation(snapshot, 'ENABLE_WRITE', true)).toBe(true);
     expect(canConfirmPreparation({ ...snapshot, sources_released: false }, snapshot.challenge!, true)).toBe(false);
     expect(canConfirmPreparation({ ...snapshot, cancel_requested: true }, snapshot.challenge!, true)).toBe(false);
   });

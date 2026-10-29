@@ -17,7 +17,7 @@ test('native staging keeps physical writes gated and recovers its backend job af
       if (command === 'list_preparation_targets') return [target];
       if (command === 'preparation_status') return JSON.parse(sessionStorage.getItem('job') || 'null');
       if (command === 'start_preparation') {
-        const job = { job_id: 'd'.repeat(64), phase: 'await_confirmation', message: 'Staged image ready. Physical writing is disabled in this build; cancel to clean up.', active: true, cancel_requested: false, completed_bytes: 8000000000, total_bytes: 8000000000, bytes_written: 0, bytes_verified: 0, target_may_be_incomplete: false, sources_released: true, source_manifest: [{ relative_path: source.relative_path, bytes: source.bytes, sha256: source.verification.digest }], target: { device_number: 7, serial: 'USB-AbC', device_id: null, bus_type: 7, size_bytes: 8000000000, logical_sector_size: 512, physical_sector_size: 512 }, image_sha256: 'e'.repeat(64), description_digest: 'f'.repeat(64), challenge: 'WIPE USB-AbC' };
+        const job = { job_id: 'd'.repeat(64), phase: 'await_confirmation', message: 'Staged image ready. Physical writing is disabled in this build; cancel to clean up.', active: true, cancel_requested: false, completed_bytes: 8000000000, total_bytes: 8000000000, bytes_written: 0, bytes_verified: 0, target_may_be_incomplete: false, sources_released: true, source_manifest: [{ relative_path: source.relative_path, bytes: source.bytes, sha256: source.verification.digest }], target: { device_number: 7, serial: 'USB-AbC', device_id: null, bus_type: 7, size_bytes: 8000000000, logical_sector_size: 512, physical_sector_size: 512 }, image_sha256: 'e'.repeat(64), description_digest: 'f'.repeat(64), challenge: 'ENABLE_WRITE' };
         sessionStorage.setItem('job', JSON.stringify(job)); return job;
       }
       if (command === 'cancel_preparation') {
@@ -29,15 +29,15 @@ test('native staging keeps physical writes gated and recovers its backend job af
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Configuration preview', exact: true })).toHaveCount(0);
   await page.locator('#preparation-target').selectOption('c'.repeat(64));
-  await page.getByRole('button', { name: 'Build preparation image', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'Write device', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'Install ISOHopper', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Install ISOHopper', exact: true })).toBeDisabled();
   await expect(page.locator('#preparation-phrase')).toBeDisabled();
   await expect(page.locator('.preparation-status')).toContainText('e'.repeat(64));
   const start = await page.evaluate(() => (window as unknown as { preparationCalls: { command: string; args: unknown }[] }).preparationCalls.find(call => call.command === 'start_preparation'));
-  expect(start?.args).toEqual({ targetToken: 'c'.repeat(64), sourceIds: [`src_${'a'.repeat(64)}`], archiveToken: `src_${'b'.repeat(64)}` });
+  expect(start?.args).toEqual({ targetToken: 'c'.repeat(64), sourceIds: [], archiveToken: `src_${'b'.repeat(64)}` });
   await page.reload();
   await expect(page.locator('.preparation-status')).toContainText('d'.repeat(64));
-  await expect(page.getByRole('button', { name: 'Add images', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Add images', exact: true })).toHaveCount(0);
   await expect(page.locator('.image-row')).toHaveCount(0);
   await expect(page.locator('.job-source-manifest tbody tr')).toHaveCount(1);
   await expect(page.locator('.job-source-manifest')).toContainText('Windows/boot.iso');
@@ -66,7 +66,7 @@ test('enabled native preparation requires an exact explicit one-shot confirmatio
       bytes_written: 0, bytes_verified: 0, target_may_be_incomplete: false, sources_released: true,
       source_manifest: [{ relative_path: 'Windows/boot.iso', bytes: 3, sha256: 'a'.repeat(64) }, { relative_path: 'Mac/boot.iso', bytes: 5, sha256: 'b'.repeat(64) }],
       target: { device_number: 7, serial: 'USB-AbC', device_id: '2'.repeat(32), bus_type: 7, size_bytes: 8000000000, logical_sector_size: 512, physical_sector_size: 4096 },
-      image_sha256: '3'.repeat(64), description_digest: '4'.repeat(64), challenge: 'WIPE USB-AbC',
+      image_sha256: '3'.repeat(64), description_digest: '4'.repeat(64), challenge: 'ENABLE_WRITE',
     };
     const restored = sessionStorage.getItem('enabled-job');
     if (restored) job = JSON.parse(restored);
@@ -91,31 +91,25 @@ test('enabled native preparation requires an exact explicit one-shot confirmatio
   });
   const calls = () => page.evaluate(() => (window as unknown as { preparationCalls: { command: string; args: unknown }[] }).preparationCalls.filter(call => call.command === 'confirm_preparation'));
   await page.goto('/');
-  const phrase = page.getByRole('textbox', { name: 'Exact device write challenge', exact: true });
-  const write = page.getByRole('button', { name: 'Write device', exact: true });
+  const phrase = page.getByRole('textbox', { name: 'Write confirmation', exact: true });
+  const write = page.getByRole('button', { name: 'Install ISOHopper', exact: true });
   await expect(phrase).toBeEnabled();
   await expect(write).toBeDisabled();
-  await phrase.pressSequentially('WIPE USB-ABC');
+  await phrase.pressSequentially('enable_write');
   await expect(write).toBeDisabled();
   await phrase.press('Enter');
   expect(await calls()).toEqual([]);
   await phrase.fill('');
-  const prevented = await phrase.evaluate(input => {
-    const clipboardData = new DataTransfer();
-    clipboardData.setData('text/plain', 'WIPE USB-AbC');
-    const event = new ClipboardEvent('paste', { clipboardData, bubbles: true, cancelable: true });
-    input.dispatchEvent(event);
-    return event.defaultPrevented;
-  });
-  expect(prevented).toBe(true);
-  await expect(phrase).toHaveValue('');
-  await expect(write).toBeDisabled();
-  await phrase.pressSequentially('WIPE USB-AbC');
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+  await page.evaluate(() => navigator.clipboard.writeText('ENABLE_WRITE'));
+  await phrase.focus();
+  await phrase.press('ControlOrMeta+V');
+  await expect(phrase).toHaveValue('ENABLE_WRITE');
   await expect(write).toBeEnabled();
   await phrase.press('Enter');
   expect(await calls()).toEqual([]);
   await write.click();
-  const expectedCall = { command: 'confirm_preparation', args: { jobId: '1'.repeat(64), descriptionDigest: '4'.repeat(64), challenge: 'WIPE USB-AbC' } };
+  const expectedCall = { command: 'confirm_preparation', args: { jobId: '1'.repeat(64), descriptionDigest: '4'.repeat(64), challenge: 'ENABLE_WRITE' } };
   await expect.poll(calls).toEqual([expectedCall]);
   // Keep the native invoke unresolved: disabled state and handler re-entry must
   // both prevent duplicate requests while its result is pending.

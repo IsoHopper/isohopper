@@ -40,7 +40,7 @@ async function mockNative(page: Page, options: MockOptions = {}) {
       if (command === 'list_preparation_targets') return JSON.parse(sessionStorage.getItem('target-overrides') || 'null') || options.targets || [target];
       if (command === 'inspect_devices') return { source: 'mock-native', disks: [], warnings: [] };
       if (command === 'probe_helper') return { status: 'cancelled', physical_preparation: false };
-      if (command === 'preparation_status') return options.preparation ? { job_id: 'e'.repeat(64), phase: 'await_confirmation', message: 'Mock exact target ready.', active: true, cancel_requested: false, completed_bytes: 8000000000, total_bytes: 8000000000, bytes_written: 0, bytes_verified: 0, target_may_be_incomplete: false, sources_released: true, source_manifest: options.emptyImages ? [] : [{ relative_path: 'boot.iso', bytes: 3, sha256: 'a'.repeat(64) }], target: null, image_sha256: 'f'.repeat(64), description_digest: 'a'.repeat(64), challenge: 'WIPE USB-AbC' } : null;
+      if (command === 'preparation_status') return options.preparation ? { job_id: 'e'.repeat(64), phase: 'await_confirmation', message: 'Mock exact target ready.', active: true, cancel_requested: false, completed_bytes: 8000000000, total_bytes: 8000000000, bytes_written: 0, bytes_verified: 0, target_may_be_incomplete: false, sources_released: true, source_manifest: options.emptyImages ? [] : [{ relative_path: 'boot.iso', bytes: 3, sha256: 'a'.repeat(64) }], target: null, image_sha256: 'f'.repeat(64), description_digest: 'a'.repeat(64), challenge: 'ENABLE_WRITE' } : null;
       if (command === 'engine_download_status') { if (host.statusError) throw new Error('Status bridge unavailable.'); return structuredClone(job); }
       if (command === 'start_engine_download') {
         if (host.startError) throw new Error('Network unavailable.');
@@ -57,11 +57,12 @@ const calls = (page: Page, command: string) => page.evaluate(command => (window 
 const setDownload = (page: Page, phase: string, bytes = 0, cacheHit = false) => page.evaluate(({ phase, bytes, cacheHit }) => (window as unknown as MockHost).setDownload(phase, bytes, cacheHit), { phase, bytes, cacheHit });
 const start = (page: Page) => page.getByRole('button', { name: 'Download engine', exact: true });
 const status = (page: Page) => page.locator('.engine-download-status');
-const build = (page: Page) => page.getByRole('button', { name: 'Build preparation image', exact: true });
+const build = (page: Page) => page.getByRole('button', { name: 'Install ISOHopper', exact: true });
 
 test('download is explicit, shows exact progress, refreshes selection and preserves configuration editing', async ({ page }, testInfo) => {
   await mockNative(page);
   await page.goto('/');
+  await page.locator('.engine-advanced > summary').click();
   await expect(start(page)).toBeEnabled();
   expect(await calls(page, 'start_engine_download')).toEqual([]);
   await page.locator('#preparation-target').selectOption('c'.repeat(64));
@@ -72,10 +73,12 @@ test('download is explicit, shows exact progress, refreshes selection and preser
   await expect(status(page)).toContainText('d86ff9de63d94c8b8f1f6b14d23c55af4b88e8207bf2893890892a6a97b1ad54');
   await expect(page.getByRole('button', { name: 'Choose engine archive', exact: true })).toBeDisabled();
   await expect(build(page)).toBeDisabled();
+  await page.getByRole('button', { name: 'Image library', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Add images', exact: true })).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Remove boot.iso', exact: true })).toBeDisabled();
   await page.getByRole('button', { name: 'Remove boot.iso', exact: true }).dispatchEvent('click');
   expect(await calls(page, 'release_sources')).toEqual([]);
+  await page.getByRole('button', { name: 'Prepare drive', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Check elevated helper', exact: true })).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Inspect host devices (read only)', exact: true })).toBeDisabled();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
@@ -110,6 +113,7 @@ test('download is explicit, shows exact progress, refreshes selection and preser
 test('pending start blocks duplicate starts, archive replacement and staging handlers', async ({ page }) => {
   await mockNative(page, { selected: true, pendingStart: true });
   await page.goto('/');
+  await page.locator('.engine-advanced > summary').click();
   await expect(start(page)).toBeEnabled();
   await page.locator('#preparation-target').selectOption('c'.repeat(64));
   await start(page).click();
@@ -127,9 +131,11 @@ test('pending start blocks duplicate starts, archive replacement and staging han
 test('reload recovers an active download, cancel preserves old selection and stops polling', async ({ page }) => {
   await mockNative(page, { selected: true });
   await page.goto('/');
+  await page.locator('.engine-advanced > summary').click();
   await start(page).click();
   await setDownload(page, 'downloading', 8192);
   await page.reload();
+  await page.locator('.engine-advanced > summary').click();
   await expect(status(page)).toContainText('8,192 bytes');
   expect(await calls(page, 'start_engine_download')).toEqual([]);
   expect(await calls(page, 'list_preparation_targets')).toEqual([]);
@@ -147,6 +153,7 @@ test('reload recovers an active download, cancel preserves old selection and sto
 test('failed verification leaves no phantom selection and permits explicit retry', async ({ page }) => {
   await mockNative(page);
   await page.goto('/');
+  await page.locator('.engine-advanced > summary').click();
   await start(page).click();
   await setDownload(page, 'failed', 20320548);
   await expect(status(page)).toContainText('SHA-256 mismatch');
@@ -162,6 +169,7 @@ test('failed verification leaves no phantom selection and permits explicit retry
 test('failed new download preserves a valid manually selected archive', async ({ page }) => {
   await mockNative(page, { selected: true });
   await page.goto('/');
+  await page.locator('.engine-advanced > summary').click();
   await expect(start(page)).toBeEnabled();
   await page.locator('#preparation-target').selectOption('c'.repeat(64));
   await start(page).click();
@@ -174,6 +182,7 @@ test('failed new download preserves a valid manually selected archive', async ({
 test('unadvertised native versions retain offline selection without new IPC calls', async ({ page }) => {
   await mockNative(page, { advertised: false });
   await page.goto('/');
+  await page.locator('.engine-advanced > summary').click();
   await expect(page.getByRole('button', { name: 'Choose engine archive', exact: true })).toBeEnabled();
   await expect(start(page)).toHaveCount(0);
   expect(await calls(page, 'engine_download_status')).toEqual([]);
@@ -184,6 +193,7 @@ test('unadvertised native versions retain offline selection without new IPC call
 test('status failure keeps unknown operations gated until explicit read-only recovery', async ({ page }) => {
   await mockNative(page, { statusError: true });
   await page.goto('/');
+  await page.locator('.engine-advanced > summary').click();
   await expect(page.locator('#engine-selection')).toContainText('Status bridge unavailable');
   await expect(start(page)).toBeDisabled();
   await page.evaluate(() => { (window as unknown as MockHost).statusError = false; });
@@ -196,6 +206,7 @@ test('status failure keeps unknown operations gated until explicit read-only rec
 test('start failure displays an actionable error without losing offline selection', async ({ page }) => {
   await mockNative(page, { startError: true, selected: true });
   await page.goto('/');
+  await page.locator('.engine-advanced > summary').click();
   await start(page).click();
   await expect(page.locator('#engine-selection')).toContainText('Network unavailable');
   await expect(start(page)).toBeEnabled();
@@ -205,14 +216,15 @@ test('start failure displays an actionable error without losing offline selectio
 test('preparation confirmation blocks download starts and status polling leaves typed challenge intact', async ({ page }) => {
   await mockNative(page, { preparation: true });
   await page.goto('/');
-  const phrase = page.getByRole('textbox', { name: 'Exact device write challenge', exact: true });
+  await page.locator('.engine-advanced > summary').click();
+  const phrase = page.getByRole('textbox', { name: 'Write confirmation', exact: true });
   await expect(phrase).toBeEnabled();
-  await phrase.fill('WIPE USB-AbC');
+  await phrase.fill('ENABLE_WRITE');
   await expect(start(page)).toBeDisabled();
   await start(page).dispatchEvent('click');
   expect(await calls(page, 'start_engine_download')).toEqual([]);
   await page.waitForTimeout(1600);
-  await expect(phrase).toHaveValue('WIPE USB-AbC');
+  await expect(phrase).toHaveValue('ENABLE_WRITE');
   await expect(phrase).toBeFocused();
 });
 
@@ -220,6 +232,7 @@ test('preparation confirmation blocks download starts and status polling leaves 
 test('ready selection lookup failure retries the current catalogue before allowing preparation', async ({ page }) => {
   await mockNative(page);
   await page.goto('/');
+  await page.locator('.engine-advanced > summary').click();
   await start(page).click();
   await page.evaluate(() => { (window as unknown as MockHost).selectionError = true; });
   await setDownload(page, 'ready', 20320548);
@@ -234,6 +247,7 @@ test('ready selection lookup failure retries the current catalogue before allowi
 test('ready history without a current archive never restores an old capability', async ({ page }) => {
   await mockNative(page);
   await page.goto('/');
+  await page.locator('.engine-advanced > summary').click();
   await start(page).click();
   await setDownload(page, 'ready', 20320548);
   await page.evaluate(() => { (window as unknown as MockHost).clearSelection(); });
@@ -245,8 +259,9 @@ test('ready history without a current archive never restores an old capability',
 for (const platform of ['macos', 'linux']) test(`${platform} status initialization leaves native import and inventory available without preparation`, async ({ page }) => {
   await mockNative(page, { platform, preparationAvailable: false });
   await page.goto('/');
-  await expect(page.getByRole('button', { name: 'Add images', exact: true })).toBeEnabled();
   await expect(page.getByRole('button', { name: 'Inspect host devices (read only)', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Image library', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Add images', exact: true })).toBeEnabled();
   expect(await calls(page, 'engine_download_status')).toHaveLength(1);
   expect(await calls(page, 'inspect_devices')).toHaveLength(1);
   expect(await calls(page, 'start_engine_download')).toEqual([]);
@@ -281,12 +296,13 @@ const candidate = (token: string, name: string, size = 64 * 1024 ** 3) => ({ sel
 test('empty media can build after engine and conservative target defaults are ready', async ({ page }) => {
   await mockNative(page, { emptyImages: true, selected: true, targets: [candidate('a', 'Thumb drive'), { ...candidate('b', 'USB device'), volume_labels: ['IsoHopper'] }, candidate('c', 'Large backup', 1024 ** 4)] });
   await page.goto('/');
+  await page.locator('.engine-advanced > summary').click();
   await expect(page.locator('#preparation-target')).toHaveValue('b'.repeat(64));
   await expect(page.locator('#preparation-target option')).toHaveCount(3);
   await expect(page.locator('#preparation-target option:checked')).toContainText('IsoHopper');
   await expect(page.getByRole('checkbox', { name: /Show large drives/ })).not.toBeChecked();
-  await expect(page.locator('#preparation-prerequisites')).toContainText('0 images');
-  await expect(page.locator('#preparation-prerequisites')).toContainText('Ready to build');
+  await expect(page.locator('#preparation-prerequisites')).toContainText('Empty bootable drive');
+  await expect(page.locator('#preparation-prerequisites')).toContainText('Ready.');
   await expect(build(page)).toBeEnabled();
   await build(page).click();
   expect(await calls(page, 'start_preparation')).toEqual([{ command: 'start_preparation', args: { targetToken: 'b'.repeat(64), sourceIds: [], archiveToken: `src_${'b'.repeat(64)}` } }]);
@@ -296,12 +312,14 @@ test('explicit target preference resolves fresh native tokens and large-drive vi
   const targets = [candidate('a', 'Thumb drive'), candidate('b', 'IsoHopper'), candidate('c', 'Large backup', 1024 ** 4)];
   await mockNative(page, { targets, selected: true });
   await page.goto('/');
+  await page.locator('.engine-advanced > summary').click();
   await expect(page.locator('#preparation-target')).toHaveValue('b'.repeat(64));
   await page.locator('#preparation-target').selectOption('a'.repeat(64));
   await page.getByRole('checkbox', { name: /Show large drives/ }).check();
   await expect(page.locator('#preparation-target option')).toHaveCount(4);
   await page.evaluate(targets => sessionStorage.setItem('target-overrides', JSON.stringify(targets)), targets.map(target => ({ ...target, selection_token: target.selection_token === 'a'.repeat(64) ? 'd'.repeat(64) : target.selection_token })));
   await page.reload();
+  await page.locator('.engine-advanced > summary').click();
   await expect(page.locator('#preparation-target')).toHaveValue('d'.repeat(64));
   await expect(page.getByRole('checkbox', { name: /Show large drives/ })).toBeChecked();
   const saved = await page.evaluate(() => localStorage.getItem('isohopper-preferences-v1'));
@@ -314,6 +332,8 @@ test('explicit target preference resolves fresh native tokens and large-drive vi
 test('native session restore shows retained images and skipped-file warnings without frontend paths', async ({ page }) => {
   await mockNative(page, { sessionRestore: true });
   await page.goto('/');
+  await page.locator('.engine-advanced > summary').click();
+  await page.getByRole('button', { name: 'Image library', exact: true }).click();
   await expect(page.locator('.image-row')).toHaveCount(1);
   await expect(page.locator('.source-restore-warnings')).toContainText('Missing image skipped');
   expect(await calls(page, 'restore_session')).toEqual([{ command: 'restore_session', args: undefined }]);
@@ -325,10 +345,11 @@ test('native session restore shows retained images and skipped-file warnings wit
 test('a sealed empty preparation still requires the exact explicit write challenge', async ({ page }) => {
   await mockNative(page, { preparation: true, emptyImages: true });
   await page.goto('/');
-  await expect(page.locator('.job-source-manifest')).toContainText('No images in this preparation');
-  const write = page.getByRole('button', { name: 'Write device', exact: true });
+  await page.locator('.engine-advanced > summary').click();
+  await expect(page.locator('.job-source-manifest')).toHaveCount(0);
+  const write = page.getByRole('button', { name: 'Install ISOHopper', exact: true });
   await expect(write).toBeDisabled();
-  await page.getByRole('textbox', { name: 'Exact device write challenge' }).fill('WIPE USB-AbC');
+  await page.getByRole('textbox', { name: 'Write confirmation' }).fill('ENABLE_WRITE');
   await expect(write).toBeEnabled();
   expect(await calls(page, 'confirm_preparation')).toEqual([]);
 });
@@ -338,6 +359,7 @@ for (const phase of ['startup targets', 'startup inventory', 'helper probe', 'ho
     const command = phase === 'startup targets' ? 'list_preparation_targets' : phase === 'helper probe' ? 'probe_helper' : 'inspect_devices';
     await mockNative(page, { selected: true, sessionRestore: true, targets: [candidate('a', 'IsoHopper')], ...(phase.startsWith('startup') ? { pauseCommand: command } : {}) });
     await page.goto('/');
+  await page.locator('.engine-advanced > summary').click();
     if (!phase.startsWith('startup')) {
       await expect(start(page)).toBeEnabled();
       await page.evaluate(command => { (window as unknown as MockHost).pauseCommand = command; }, command);
@@ -346,11 +368,15 @@ for (const phase of ['startup targets', 'startup inventory', 'helper probe', 'ho
     }
     await expect.poll(() => page.evaluate(() => (window as unknown as MockHost).pendingCommand)).toBe(command);
     const before = await page.evaluate(() => (window as unknown as MockHost).engineCalls);
-    for (const selector of ['#dropzone', '#import-folder', '#pick-engine', '#download-engine', '#start-preparation', '#refresh-drives', '#probe-helper', '#inspect-host', '.remove-image']) {
+    for (const selector of ['#pick-engine', '#download-engine', '#start-preparation', '#refresh-drives', '#probe-helper', '#inspect-host']) {
       await expect(page.locator(selector)).toBeDisabled();
       await page.locator(selector).dispatchEvent('click');
     }
     await page.getByRole('button', { name: 'Image library', exact: true }).click();
+    for (const selector of ['#dropzone', '#import-folder', '.remove-image']) {
+      await expect(page.locator(selector)).toBeDisabled();
+      await page.locator(selector).dispatchEvent('click');
+    }
     await expect(page.locator('#clear-images')).toBeDisabled();
     await page.locator('#clear-images').dispatchEvent('click');
     await page.getByRole('button', { name: 'Configuration', exact: true }).click();
@@ -360,6 +386,7 @@ for (const phase of ['startup targets', 'startup inventory', 'helper probe', 'ho
     await page.getByRole('button', { name: 'Prepare drive', exact: true }).click();
     await expect(start(page)).toBeEnabled();
     await expect(build(page)).toBeEnabled();
+    await page.getByRole('button', { name: 'Image library', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Add images', exact: true })).toBeEnabled();
     await expect(page.locator('.image-row')).toHaveCount(1);
     await expect(page.locator('.source-restore-warnings')).toContainText('Missing image skipped');
