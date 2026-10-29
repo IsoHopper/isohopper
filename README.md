@@ -62,11 +62,11 @@ Local checks on 29 October 2026:
 
 | Check | Result and limit |
 | --- | --- |
-| Rust | 507 workspace tests and 4 firmware-policy tests passed; 4 fixtures skipped. Updated confirmation tests and strict Clippy passed. |
+| Rust | 511 workspace tests and 4 firmware-policy tests passed; 4 fixtures skipped. Updated confirmation tests and strict Clippy passed. |
 | Studio | 87 native tests passed, 2 opt-in fixtures skipped. 55 frontend unit tests and 146 Chromium cases passed. Browser checks use mocked IPC/devices; native file tests use temporary files. |
 | Engine | Official pinned archive downloaded, hashed and reused from cache in a separate live test. Stream failures and cancellation use mocks. |
 | Tooling | 70 Python tests passed. Release-note checks were repeated after edits. |
-| Windows | Release gates require installed Studio and disposable-VHD checks at the exact revision. Installed UAC-token coverage is explicitly unavailable on runners without a split token. No physical USB tested. |
+| Windows | Release gates require installed Studio and disposable-VHD checks at the exact revision. Installed UAC-token coverage is explicitly unavailable on runners without a split token. No physical USB write or boot test. |
 | Boot | Rust-built GPT booted Alpine 3.24.3 in QEMU; mounted ISO hash matched. Windows Setup read its WIM in an adjusted GPT fixture, not an unchanged Studio-to-USB test. |
 | USB theme | Bundled asset hashes verified in QEMU staging. Empty and populated menus, nested folders and text/graphical mode switching checked on x64 UEFI. |
 
@@ -79,7 +79,7 @@ Actual x64 UEFI guest. Diagnostic GPT geometry was adjusted to match a transplan
 
 </details>
 
-The reported Windows metadata error (`os error 87`) remains under investigation; current source identifies the failing query without weakening device checks. Helper-disconnect diagnostics also need human retesting. Interactive UAC, physical USB behavior, broad OS compatibility and Secure Boot signing remain unvalidated. Windows packages are unsigned; macOS packages are not notarized. [Current Actions](https://github.com/IsoHopper/isohopper/actions).
+The Windows metadata failure (`os error 87`) was reproduced when a USB driver rejected the optional device-ID query. Current source checks whether that property is supported before treating it as unavailable; required device identity and safety checks remain in place. Patched native read-only binding and revalidation passed on the same USB drive, with no writes, locks or dismounts. Other metadata errors are not claimed fixed. Helper-disconnect diagnostics still need human retesting. Interactive UAC, physical USB writes and booting, broad OS compatibility and Secure Boot signing remain unvalidated. Windows packages are unsigned; macOS packages are not notarized. [Current Actions](https://github.com/IsoHopper/isohopper/actions).
 
 ## Relation to Ventoy
 
