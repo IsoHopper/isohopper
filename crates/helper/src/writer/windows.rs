@@ -12,7 +12,7 @@ use std::{
     ptr,
 };
 use windows_sys::Win32::{
-    Foundation::{ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_WRITE_PROTECT},
+    Foundation::ERROR_WRITE_PROTECT,
     Storage::FileSystem::{
         FILE_BEGIN, FILE_DEVICE_DISK, FILE_TYPE_DISK, FlushFileBuffers, GetFileType, ReadFile,
         SetFilePointerEx, WriteFile,
@@ -23,9 +23,9 @@ use windows_sys::Win32::{
             DISK_ATTRIBUTE_OFFLINE, DISK_ATTRIBUTE_READ_ONLY, GET_DISK_ATTRIBUTES,
             GET_LENGTH_INFORMATION, IOCTL_DISK_GET_DISK_ATTRIBUTES, IOCTL_DISK_GET_LENGTH_INFO,
             IOCTL_DISK_IS_WRITABLE, IOCTL_STORAGE_GET_DEVICE_NUMBER, IOCTL_STORAGE_QUERY_PROPERTY,
-            PropertyStandardQuery, STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, STORAGE_DEVICE_NUMBER,
-            STORAGE_PROPERTY_QUERY, StorageAccessAlignmentProperty, StorageDeviceIdProperty,
-            StorageDeviceProperty,
+            PropertyExistsQuery, PropertyStandardQuery, STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR,
+            STORAGE_DEVICE_NUMBER, STORAGE_PROPERTY_QUERY, StorageAccessAlignmentProperty,
+            StorageDeviceIdProperty, StorageDeviceProperty,
         },
     },
 };
@@ -381,14 +381,12 @@ fn inspect_device_id(handle: &OwnedHandle) -> io::Result<Option<StableDeviceId>>
         // Some devices only expose a serial. Unsupported VPD83 is not a
         // substitute identity: the constructor still requires serial or ID,
         // and later snapshots compare any previously present ID as well.
-        Err(error)
-            if error.raw_os_error().is_some_and(|code| {
-                code == ERROR_INVALID_FUNCTION as i32 || code == ERROR_NOT_SUPPORTED as i32
-            }) =>
-        {
+        Err(error) => {
+            windows_metadata::device_id_header_failure(error, || {
+                device_id_property_exists(handle)
+            })?;
             return Ok(None);
         }
-        Err(error) => return Err(query_error("StorageDeviceIdProperty/header", error)),
         Ok(count) if count != header.len() => {
             return Err(invalid("truncated storage device ID descriptor header"));
         }
@@ -404,4 +402,33 @@ fn inspect_device_id(handle: &OwnedHandle) -> io::Result<Option<StableDeviceId>>
     )
     .map_err(|error| query_error("StorageDeviceIdProperty/body", error))?;
     windows_metadata::parse_device_ids(&descriptor[..returned])
+}
+
+fn device_id_property_exists(handle: &OwnedHandle) -> io::Result<()> {
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceIdProperty,
+        QueryType: PropertyExistsQuery,
+        ..Default::default()
+    };
+    let mut unused = 0;
+    // SAFETY: inspect retains this same synchronous handle and the initialized
+    // query lives through the call. PropertyExistsQuery has no output buffer;
+    // the success status, not lpBytesReturned, reports property support.
+    // https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ns-winioctl-storage_property_query
+    if unsafe {
+        DeviceIoControl(
+            handle.as_raw_handle(),
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            (&query as *const STORAGE_PROPERTY_QUERY).cast(),
+            size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            ptr::null_mut(),
+            0,
+            &mut unused,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }

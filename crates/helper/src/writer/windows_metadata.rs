@@ -19,6 +19,28 @@ pub(super) fn query_error(query: &'static str, source: io::Error) -> io::Error {
     io::Error::new(source.kind(), QueryError { query, source })
 }
 
+/// Resolve only a failed device-ID header query. Some USB storage drivers use
+/// ERROR_INVALID_PARAMETER for an unavailable optional ID property; require a
+/// separate PropertyExistsQuery to reject that property before accepting it as
+/// absent. Successful headers and all body/parse failures bypass this policy.
+pub(super) fn device_id_header_failure(
+    error: io::Error,
+    exists: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    match error.raw_os_error() {
+        // Win32 ERROR_INVALID_FUNCTION / ERROR_NOT_SUPPORTED: existing policy.
+        Some(1 | 50) => Ok(()),
+        // Win32 ERROR_INVALID_PARAMETER. A supported property must still fail
+        // with the original header error, not silently lose its identifier.
+        Some(87) => match exists() {
+            Err(unavailable) if matches!(unavailable.raw_os_error(), Some(1 | 50 | 87)) => Ok(()),
+            Err(other) => Err(query_error("StorageDeviceIdProperty/exists", other)),
+            Ok(()) => Err(query_error("StorageDeviceIdProperty/header", error)),
+        },
+        _ => Err(query_error("StorageDeviceIdProperty/header", error)),
+    }
+}
+
 fn invalid() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -169,6 +191,69 @@ pub(super) fn parse_device_ids(bytes: &[u8]) -> io::Result<Option<StableDeviceId
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn original_os_error(error: &io::Error) -> Option<i32> {
+        error
+            .get_ref()
+            .and_then(std::error::Error::source)
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .and_then(io::Error::raw_os_error)
+    }
+
+    #[test]
+    fn device_id_header_invalid_parameter_accepts_only_confirmed_unavailability() {
+        for status in [1, 50, 87] {
+            let result = device_id_header_failure(io::Error::from_raw_os_error(87), || {
+                Err(io::Error::from_raw_os_error(status))
+            });
+            assert!(
+                result.is_ok(),
+                "negative existence status {status}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn device_id_header_invalid_parameter_keeps_failure_when_property_exists() {
+        let error =
+            device_id_header_failure(io::Error::from_raw_os_error(87), || Ok(())).unwrap_err();
+        assert_eq!(original_os_error(&error), Some(87));
+        assert!(error.to_string().contains("StorageDeviceIdProperty/header"));
+    }
+
+    #[test]
+    fn device_id_header_existence_errors_keep_their_native_cause() {
+        for status in [2, 5, 13, 21, 31, 122, 1117, 1460] {
+            let error = device_id_header_failure(io::Error::from_raw_os_error(87), || {
+                Err(io::Error::from_raw_os_error(status))
+            })
+            .unwrap_err();
+            assert_eq!(original_os_error(&error), Some(status));
+            assert!(error.to_string().contains("StorageDeviceIdProperty/exists"));
+        }
+    }
+
+    #[test]
+    fn device_id_header_other_errors_never_probe_or_become_absence() {
+        for status in [1, 50, 2, 5, 13, 21, 31, 122, 1117, 1460] {
+            let result = device_id_header_failure(io::Error::from_raw_os_error(status), || {
+                panic!("existence query is only valid after header error 87")
+            });
+            if [1, 50].contains(&status) {
+                assert!(result.is_ok());
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(original_os_error(&error), Some(status));
+                assert!(error.to_string().contains("StorageDeviceIdProperty/header"));
+            }
+        }
+        let error = device_id_header_failure(io::Error::other("transport failed"), || {
+            panic!("local errors must not invoke the existence query")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("transport failed"));
+    }
 
     #[test]
     fn query_error_identifies_the_failed_request_and_retains_the_os_error() {
